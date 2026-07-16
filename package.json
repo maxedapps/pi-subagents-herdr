@@ -1,0 +1,73 @@
+{
+  "name": "pi-subagents-herdr",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Safe, visible subagent orchestration for Pi with a Herdr backend",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "herdr",
+    "subagents"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:unit": "tsx --test tests/unit/*.test.ts tests/profiles/*.test.ts tests/artifacts/*.test.ts",
+    "test:integration": "tsx --test tests/integration/*.test.ts",
+    "test:e2e": "tsx --test tests/e2e/*.test.ts",
+    "test": "npm run test:core",
+    "check": "npm run typecheck && npm test && npm run docs:check",
+    "pack:create": "npm pack --json",
+    "pack:inspect": "node scripts/pack-inspect.mjs",
+    "smoke:load": "tsx scripts/smoke-load.ts",
+    "protocol:fixtures": "node scripts/update-herdr-protocol-fixtures.mjs",
+    "conformance:herdr:no-model": "tsx scripts/conformance-herdr-no-model.ts",
+    "conformance:herdr:worktree:no-model": "tsx scripts/conformance-herdr-worktree-no-model.ts",
+    "e2e:herdr:real": "node scripts/e2e-herdr-smoke.mjs",
+    "docs:check": "node scripts/check-doc-links.mjs",
+    "test:core": "tsx --test --test-concurrency=2 tests/unit/*.test.ts tests/profiles/*.test.ts tests/artifacts/*.test.ts tests/herdr/*.test.ts tests/harnesses/*.test.ts tests/runtime/*.test.ts tests/worktrees/*.test.ts tests/tools/*.test.ts tests/skill/*.test.ts tests/ui/*.test.ts tests/integration/clean-load.test.ts tests/integration/fixtures.test.ts tests/integration/lifecycle.test.ts",
+    "skill:check": "skills-ref validate skills/use-subagents",
+    "check:full": "npm run typecheck && npm run test:core && npm run docs:check && npm run test:e2e && npm run pack:inspect && npm run skill:check"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/herdr-subagents/index.ts"
+    ],
+    "skills": [
+      "./skills/use-subagents/SKILL.md"
+    ]
+  },
+  "files": [
+    "extensions/",
+    "src/",
+    "skills/",
+    "agents/",
+    "docs/",
+    "scripts/",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
+    "@types/node": "24.12.0",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3",
+    "skills-ref": "0.1.5"
+  },
+  "dependencies": {
+    "tsx": "4.20.6",
+    "yaml": "2.9.0"
+  }
+}
