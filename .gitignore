@@ -2,6 +2,9 @@ node_modules/
 coverage/
 dist/
 *.tgz
+/.plans/
+/.progress/
+/.subagents/
 .subagents-test/
 .tmp/
 .DS_Store
