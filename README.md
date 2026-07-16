@@ -12,7 +12,9 @@ Private Pi package that exposes safe, visible subagent orchestration through a H
 
 Every child is visible and interactive. Missing/incompatible backend identity fails closed; there is no hidden subprocess, recursive delegation, cross-harness substitution, or fallback. Pi/Claude tool policies are not filesystem sandboxes; Codex uses its documented OS sandbox. Writers require isolated worktrees. Child completion and test claims are evidence, never parent verification.
 
-Control requires agreement between the current Pi session and active branch journal, immutable run nonce, durable `run.json`, stable terminal/native identity, and a fresh backend snapshot. Other-session, orphaned, uncertain, and global records are observational only. Interrupt remains distinct from stop. Force stop can affect only a freshly revalidated owned pane and never authorizes dirty checkout discard.
+Pi children receive no package-specific trust, skill, or prompt-template override flags. Each child independently uses normal Pi trust and resource discovery. Saved trust and global settings are available through the ordinary user environment, but transient parent `--approve` and session-only trust are not inherited by a separate child process.
+
+Control requires agreement between the current Pi session and active branch journal, immutable run nonce, durable `run.json`, stable terminal/native identity, and a fresh backend snapshot. Other-session, orphaned, uncertain, and global records are observational only. Send/interrupt delivery is `confirmed`, `unconfirmed` (Herdr acknowledged but expected evidence did not appear), or `uncertain` (the mutation may have succeeded but its response was lost). Inspect uncertain runs; never retry input or destroy a run automatically. Interrupt remains distinct from stop. Force stop can affect only a freshly revalidated owned pane and never authorizes dirty checkout discard.
 
 ## Install
 
@@ -24,7 +26,7 @@ pi install /absolute/path/to/pi-subagents-herdr
 
 Remove with `pi remove /absolute/path/to/pi-subagents-herdr`. Restart Pi or use `/reload`, then run `/subagents-doctor` and `/subagents`.
 
-For an exact private archive install/load qualification, use `npm run pack:inspect`. It packs once, installs that exact archive under a temporary prefix, loads extension/doctor/skill through isolated Pi RPC, verifies child guards and package-relative resources, and removes the temporary environment.
+For an exact private archive install/load qualification, use `npm run pack:inspect`. It packs once, installs that exact archive under a temporary prefix, verifies the parent-only package skill, verifies ordinary child fixture-skill discovery without `--no-skills`, checks child guards/package-relative resources, and removes the temporary environment.
 
 ## Five tools
 
@@ -49,13 +51,15 @@ subagent_stop({ id: "<run>", mode: "graceful", cleanup: "retain" })
 
 Execution rejects cross-mode combinations: `scope` with `id`; `states`, `timeoutMs`, or `lines` without `id`; and `timeoutMs` with `id` but no `states`. Wait preserves semantic `working`, `blocked`, `done`, `idle`, and `unknown` states, abort propagation, timeout errors, ownership defaults, and 50KB/2000-line output bounds. A successful wait returns detailed inspection/output, not only a matched state.
 
+Every successful start reports `completion.pending` with the exact required `subagent_status` call. Start/list output is never task completion: inspect terminal output for each ID individually, act on blockers, verify claims, and resolve the run. Parent mode emits at most one in-memory follow-up reminder per uninspected start/send generation; it does not poll children or persist an acknowledgement queue.
+
 ## Bundled profiles and skill
 
 - `scout`: Pi, read-only reconnaissance, parent-materialized handoff, no progress file.
 - `researcher`: Pi, read-only sourced research when reviewed external tools are actually exposed, parent-materialized handoff, no progress file.
 - `worker`: Pi, mutation tools, isolated writer worktree, preserved child handoff, parent-owned final wrapper, plus optional configured progress.
 
-Bundled profiles do not pin models and prohibit recursive delegation. The bundled parent-only `use-subagents` skill teaches deliberate bounded delegation, least privilege, fresh context, writer isolation, blocked-flow monitoring, parent verification, and lifecycle resolution without exposing backend architecture. Child guards exclude it.
+Bundled profiles do not pin models and prohibit recursive delegation. Profiles do not configure skills; Pi children discover them normally. The package contributes `use-subagents` dynamically in parent mode only. It teaches deliberate bounded delegation, least privilege, fresh context, writer isolation, blocked-flow monitoring, parent verification, and lifecycle resolution without exposing backend architecture. Child mode contributes neither that skill nor orchestration tools.
 
 ## Settings
 
@@ -112,7 +116,7 @@ Git protection appends anchored `/.subagents/` and explicitly requested `/.progr
 
 ## TUI and operations
 
-`/subagents [current|all-owned|global]` opens the dashboard. Only fresh current-active-branch ownership permits focus/input/interrupt/stop/cleanup; broader scopes and uncertain rows are read-only.
+`/subagents` lists only current-session owned runs. Visible controls are ↑/↓ selection, Enter focus, `x` graceful stop with retained artifacts/worktree, `r` refresh, and Escape close. Focus and stop run only after the overlay is disposed. Use model-facing `subagent_status` for detailed output and broader observational scopes; use explicit `subagent_send`, `subagent_interrupt`, and `subagent_stop` inputs for actions not exposed in the operator dashboard.
 
 `/subagents-doctor` is read-only. It may mention Herdr because it diagnoses the actual backend: versions/protocol, parent identity, integrations, profiles/settings, Git/artifacts, recovery, topology, and retained worktrees. It never adopts, focuses, sends, stops, cleans, or rewrites settings.
 

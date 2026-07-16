@@ -27,8 +27,6 @@ thinking: medium
 permissions: read-only
 tools: [read, grep, find, ls]
 preferredTools: []
-skills: []
-preferredSkills: []
 context:
   project: true
   parent: false
@@ -55,7 +53,6 @@ Optional fields:
 | `permissions` | `read-only` or `write` |
 | `tools` | hard reviewed tool requests; contradictions fail |
 | `preferredTools` | soft preferences intersected with child-exposed tools |
-| `skills` / `preferredSkills` | reviewed explicit Pi skills; unsupported for Claude/Codex |
 | `context.project` | permit project context where supported |
 | `context.parent` | intent only; never transfers transcript or authority |
 | `timeout` | integer 1–86400000 ms |
@@ -71,9 +68,9 @@ Optional fields:
 
 Pi supports explicit child tool allowlists but not filesystem confinement. Claude uses reviewed built-in mappings and native permission policy, also without filesystem confinement. Codex profiles cannot claim an explicit per-tool allowlist; its sandbox/approval policy is used instead.
 
-Pi children start with `--no-skills --no-prompt-templates`. Required/available preferred skills resolve only from actual trusted Pi resources and are revalidated before explicit `--skill` use. The parent-only `use-subagents` skill and orchestration/delegation tools are prohibited in children. Claude/Codex profiles cannot declare Pi skills.
+Pi children receive no trust, skill, or prompt-template override flags. Each separate Pi process resolves project trust normally, then discovers global/project/package/settings skills and prompt templates as an ordinary Pi instance. Saved trust and global settings are shared through the normal user environment; transient parent `--approve` and session-only trust choices are not inherited. The package contributes `use-subagents` dynamically in parent mode only, while child guards still prohibit orchestration/delegation tools.
 
-Bundled researcher preferences count only when a preferred reviewed external-source tool is actually exposed. Otherwise launch blocks rather than presenting memory output as researched.
+Legacy profile `skills` and `preferredSkills` fields are rejected with a migration error; remove them and rely on normal Pi discovery. Bundled researcher preferences count only when a preferred reviewed external-source tool is actually exposed. Otherwise launch blocks rather than presenting memory output as researched.
 
 ## Artifact templates
 

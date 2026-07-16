@@ -26,7 +26,7 @@ export const USED_HERDR_METHOD_RESULTS = {
   "agent.get": "agent_info",
   "agent.list": "agent_list",
   "agent.read": "pane_read",
-  "agent.focus": "ok",
+  "agent.focus": "agent_info",
   "events.subscribe": "subscription_started",
   "events.wait": "wait_matched",
   "worktree.list": "worktree_list",

@@ -28,6 +28,18 @@ test("readiness-time native identity extends the monotonic started journal witho
   assert.throws(() => writer.append(value, "started", {}), /must add immutable resource evidence/);
 });
 
+test("legacy schema-3 policy skills remain readable but malformed legacy values are rejected", () => {
+  const root = "/tmp/legacy-metadata";
+  assert.doesNotThrow(() => parseRuntimeRunMetadata({
+    ...metadata(root),
+    policy: { ...metadata(root).policy, skills: [{ name: "legacy", path: "/tmp/legacy-skill/SKILL.md" }] },
+  }));
+  assert.throws(() => parseRuntimeRunMetadata({
+    ...metadata(root),
+    policy: { ...metadata(root).policy, skills: [{ name: "legacy", path: "relative.md" }] },
+  }), /policy skills are malformed/);
+});
+
 test("operational metadata is containment-checked and must exactly match active-branch nonce, terminal, and native session", async () => {
   const root = await mkdtemp(join(tmpdir(), "p8-runtime-metadata-")); const directory = join(root, ".subagents", "runs", "run-1"); await mkdir(directory, { recursive: true });
   const { value } = journal();

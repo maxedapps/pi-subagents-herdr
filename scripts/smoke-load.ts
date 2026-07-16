@@ -12,7 +12,7 @@ const fakeApi = {
 };
 
 extension(fakeApi as unknown as ExtensionAPI);
-if (events.join(",") !== "session_start,session_shutdown") {
+if (events.join(",") !== "resources_discover,session_start,agent_settled,session_shutdown") {
   throw new Error(`Unexpected clean-load event registrations: ${events.join(",")}`);
 }
 if (tools.join(",") !== "subagent_start,subagent_status,subagent_send,subagent_interrupt,subagent_stop") {

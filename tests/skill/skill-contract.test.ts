@@ -14,6 +14,12 @@ test("use-subagents is parent-only, implementation-neutral, and exposes exactly 
   }
   assert.doesNotMatch(`${skill}\n${reference}`, /\bHerdr\b|herdr_|command -v|child_process|spawn\(|native-and-cli-backends/i);
   assert.doesNotMatch(skill, /subagent_(list|get|wait)\b/);
+  assert.match(skill, /Every successful `subagent_start` creates an outstanding result obligation/i);
+  assert.match(skill, /start result is never task completion/i);
+  assert.match(skill, /List mode never counts as result inspection/i);
+  assert.match(skill, /Inspect every parallel run individually/i);
+  assert.match(reference, /mandatory result obligation/i);
+  assert.match(reference, /Call `subagent_status` for that exact ID/i);
   assert.match(skill, /required tool or ownership proof is unavailable, fail closed/i);
   assert.match(skill, /Do not invent a fallback/i);
   assert.match(skill, /ask a child to delegate/i);
@@ -34,7 +40,8 @@ test("skill covers deliberate delegation, fresh context, least privilege, isolat
     /Child status, claims, artifacts, exit state, or test output are evidence—not parent verification/i,
     /Resolve every owned run before finalizing/i,
   ]) assert.match(skill, contract);
-  assert.match(skill, /subagent_interrupt.*subagent_stop.*not substitutes/is);
+  assert.match(skill, /subagent_interrupt.*cancel the current turn.*subagent_stop.*end the child lifecycle/is);
+  assert.match(skill, /separate interrupt is not an ordinary prerequisite/i);
   assert.match(skill, /Optional progress is supporting evidence, never a prerequisite for safe removal/i);
   assert.match(reference, /Never fire and forget/i);
   assert.match(reference, /observed evidence.*separated from inference/i);

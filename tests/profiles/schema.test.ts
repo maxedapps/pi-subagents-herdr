@@ -24,8 +24,6 @@ thinking: xhigh
 permissions: write
 tools: [read, edit]
 preferredTools: [web_search]
-skills: [code-review]
-preferredSkills: [web-research]
 context: { project: true, parent: false }
 timeout: 60000
 worktree: required-for-concurrency
@@ -74,12 +72,12 @@ test("profile schema rejects artifact templates that normalize away run scoping"
   }
 });
 
-test("legacy Herdr opt-out and runtime fields receive migration-oriented errors", () => {
-  for (const field of ["herdr: false", "herdr: true", "runtime: hidden", "command: pi", "argv: []"]) {
+test("legacy Herdr, runtime, and profile skill fields receive migration-oriented errors", () => {
+  for (const field of ["herdr: false", "herdr: true", "runtime: hidden", "command: pi", "argv: []", "skills: [code-review]", "preferredSkills: [web-research]"]) {
     assert.throws(
       () => parseProfile(document(`name: migration\ndescription: migration\n${field}`), source()),
       (error: unknown) => error instanceof ProfileValidationError
-        && /implicit|mandatory|unsupported runtime field/.test(error.message),
+        && /implicit|mandatory|unsupported runtime field|remove this field; child Pi now uses normal skill discovery/.test(error.message),
     );
   }
 });
@@ -104,7 +102,6 @@ test("bundled scout, researcher, and worker are strict, model-free, non-recursiv
   assert.match(workerText, /\n\s*progress:/);
   const researcher = parseProfile(researcherText, source(join(PACKAGE_ASSETS.agents, "researcher.md")));
   assert.deepEqual(researcher.preferredTools, ["web_search", "fetch_content", "get_search_content"]);
-  assert.deepEqual(researcher.preferredSkills, ["web-research"]);
   assert.deepEqual(researcher.tools, ["read", "grep", "find", "ls"]);
   assert.match(researcher.body, /memory.*not|never.*memory/is);
 });

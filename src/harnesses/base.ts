@@ -50,7 +50,6 @@ export interface LaunchContext {
   /** Pi-only private session directory. Other harnesses must not create one. */
   readonly sessionDirectory?: string;
   readonly systemPromptPath: string;
-  readonly reviewedSkillPaths?: readonly string[];
   readonly integrationPolicy?: HarnessIntegrationPolicy;
   /** Additional Codex write roots already authorized by monotonic policy. */
   readonly writableRoots?: readonly string[];

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { PACKAGE_ASSETS } from "../../src/package-paths.ts";
 import extension from "../../extensions/herdr-subagents/index.ts";
 import {
   registerHerdrSubagentsExtension,
@@ -15,11 +16,13 @@ function fakeApi(): {
   registrations: string[];
   tools: Array<{ name: string }>;
   commands: string[];
+  messages: Array<{ message: unknown; options: unknown }>;
 } {
   const events = new Map<string, Handler>();
   const registrations: string[] = [];
   const tools: Array<{ name: string }> = [];
   const commands: string[] = [];
+  const messages: Array<{ message: unknown; options: unknown }> = [];
   const api = {
     on(event: string, handler: Handler) {
       registrations.push(event);
@@ -28,8 +31,9 @@ function fakeApi(): {
     registerTool(tool: { name: string }) { tools.push(tool); },
     registerCommand(name: string) { commands.push(name); },
     getAllTools() { return tools; },
+    sendMessage(message: unknown, options: unknown) { messages.push({ message, options }); },
   };
-  return { api: api as unknown as ExtensionAPI, events, registrations, tools, commands };
+  return { api: api as unknown as ExtensionAPI, events, registrations, tools, commands, messages };
 }
 
 const context = {} as ExtensionContext;
@@ -37,7 +41,8 @@ const context = {} as ExtensionContext;
 test("lifecycle extension factory registers strict parent tools and lifecycle without starting resources", () => {
   const fake = fakeApi();
   extension(fake.api);
-  assert.deepEqual(fake.registrations, ["session_start", "session_shutdown"]);
+  assert.deepEqual(fake.registrations, ["resources_discover", "session_start", "agent_settled", "session_shutdown"]);
+  assert.deepEqual(fake.events.get("resources_discover")?.({}), { skillPaths: [PACKAGE_ASSETS.skill] });
   assert.deepEqual(fake.tools.map((tool) => tool.name), [
     "subagent_start", "subagent_status", "subagent_send", "subagent_interrupt", "subagent_stop",
   ]);
@@ -146,6 +151,34 @@ test("concurrent shutdown waits for startup and stops the runtime once", async (
   await Promise.all([starting, stopping]);
   await shutdown?.({});
   assert.equal(stopped, 1);
+});
+
+test("agent_settled sends at most one result-inspection follow-up per claimed generation", async () => {
+  const fake = fakeApi();
+  let claims = 0;
+  registerHerdrSubagentsExtension(fake.api, {
+    environment: {},
+    createRuntime() {
+      return {
+        start() {},
+        stop() {},
+        claimResultInspectionReminders() {
+          claims += 1;
+          return claims === 1 ? [
+            { id: "run-1", generation: 1, timeoutMs: 900_000 },
+            { id: "run-2", generation: 1, timeoutMs: 60_000 },
+          ] : [];
+        },
+      };
+    },
+  });
+  await fake.events.get("session_start")?.({}, context);
+  fake.events.get("agent_settled")?.({}, context);
+  fake.events.get("agent_settled")?.({}, context);
+  assert.equal(fake.messages.length, 1);
+  assert.deepEqual(fake.messages[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+  assert.match(JSON.stringify(fake.messages[0]?.message), /run-1.*run-2/);
+  assert.match(JSON.stringify(fake.messages[0]?.message), /list call does not inspect results/);
 });
 
 test("lifecycle child guard omits all parent registrations", () => {

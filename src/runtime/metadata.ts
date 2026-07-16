@@ -24,7 +24,6 @@ export interface RuntimeRunMetadata {
     readonly thinking: ThinkingLevel;
     readonly cwd: string;
     readonly tools: readonly string[];
-    readonly skills?: readonly { readonly name: string; readonly path: string }[];
     readonly mutation: boolean;
     readonly network: boolean;
     readonly requireWorktree: boolean;

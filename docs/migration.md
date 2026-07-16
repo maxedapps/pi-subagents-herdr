@@ -45,13 +45,13 @@ subagent_status({ id: "<id>", states: ["done", "idle", "blocked"], timeoutMs: 90
 
 ## Skill migration
 
-The bundled skill is now `skills/use-subagents/SKILL.md` with command `/skill:use-subagents`. It is implementation-neutral and parent-only. Replace any separately installed global skill deliberately after package qualification; package installation does not modify global skill files.
+The bundled skill is now `skills/use-subagents/SKILL.md` with command `/skill:use-subagents`. It is implementation-neutral and contributed dynamically in parent mode only. Replace any separately installed global skill deliberately after package qualification; package installation does not modify global skill files.
 
 Child guards prohibit `use-subagents` and recursive orchestration tools.
 
 ## Profile migration
 
-Remove `artifacts.prompt` and `artifacts.system`; they are invalid. Remove progress from read-only scout/research profiles unless it is intentionally needed. Progress remains optional evidence even when configured.
+Remove `skills` and `preferredSkills`; child Pi now uses normal skill discovery and these legacy fields produce a migration error. Remove `artifacts.prompt` and `artifacts.system`; they are invalid. Remove progress from read-only scout/research profiles unless it is intentionally needed. Progress remains optional evidence even when configured.
 
 Recommended artifacts:
 

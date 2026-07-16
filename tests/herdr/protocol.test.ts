@@ -10,6 +10,45 @@ import {
 import { agent, layout, pane, snapshot, tab, workspace } from "./fixtures.ts";
 
 const fixturePath = new URL("../fixtures/herdr-protocol-16.schema.json", import.meta.url);
+const methodResultsPath = new URL("../fixtures/herdr-protocol-16.method-results.json", import.meta.url);
+
+function assertSchemaFragment(root: any, section: string, value: any, label: string, seen = new Set<string>()): void {
+  assert.equal(typeof value, "object", `${label} must be a schema object`);
+  assert.notEqual(value, null, `${label} must be a schema object`);
+  if (typeof value.$ref === "string") {
+    const prefix = `#/schemas/${section}/$defs/`;
+    assert.equal(value.$ref.startsWith(prefix), true, `${label} has an unexpected reference ${value.$ref}`);
+    const name = value.$ref.slice(prefix.length);
+    assert.equal(Object.hasOwn(root.$defs ?? {}, name), true, `${label} references missing ${name}`);
+    if (!seen.has(name)) {
+      seen.add(name);
+      assertSchemaFragment(root, section, root.$defs[name], `${label} -> ${name}`, seen);
+    }
+    return;
+  }
+  if (value.type === "object" || value.properties !== undefined) {
+    const properties = value.properties ?? {};
+    assert.equal(typeof properties, "object", `${label}.properties must be an object`);
+    for (const required of value.required ?? []) {
+      assert.equal(Object.hasOwn(properties, required), true, `${label} requires missing property ${required}`);
+    }
+  }
+  if (value.properties && typeof value.properties === "object") {
+    for (const [name, schema] of Object.entries(value.properties)) assertSchemaFragment(root, section, schema, `${label}.properties.${name}`, seen);
+  }
+  if (value.additionalProperties && typeof value.additionalProperties === "object") assertSchemaFragment(root, section, value.additionalProperties, `${label}.additionalProperties`, seen);
+  if (value.items && typeof value.items === "object") assertSchemaFragment(root, section, value.items, `${label}.items`, seen);
+  for (const key of ["oneOf", "anyOf", "allOf"] as const) {
+    if (Array.isArray(value[key])) value[key].forEach((schema: any, index: number) => assertSchemaFragment(root, section, schema, `${label}.${key}[${index}]`, seen));
+  }
+}
+
+function assertDiscriminatedVariant(root: any, section: string, variant: any, discriminator: "method" | "type", expected: string): void {
+  assert.equal(variant.type, "object", `${section} ${expected} must be an object variant`);
+  assert.equal(variant.properties?.[discriminator]?.const, expected, `${section} ${expected} discriminator`);
+  assert.equal(variant.required?.includes(discriminator), true, `${section} ${expected} must require ${discriminator}`);
+  assertSchemaFragment(root, section, variant, `${section} ${expected}`);
+}
 
 test("protocol 16 fixture binds every used method, result, event, and nested decoder definition", async (t) => {
   const fixture = JSON.parse(await readFile(fixturePath, "utf8")) as any;
@@ -30,8 +69,45 @@ test("protocol 16 fixture binds every used method, result, event, and nested dec
   assert.deepEqual(fixture.success_response.definitions.WorktreeInfo.required, ["path", "is_bare", "is_detached", "is_prunable", "is_linked_worktree", "label"]);
   assert.ok(JSON.stringify(fixture.request.definitions.Subscription).includes("worktree.created"));
   let raw: string;
-  try { raw = execFileSync("herdr", ["api", "schema", "--json"], { encoding: "utf8", maxBuffer: 2_000_000 }); } catch { t.diagnostic("installed Herdr CLI unavailable; fixture-to-decoder binding still ran"); return; }
-  assert.equal(Buffer.byteLength(raw), fixture.source.raw_bytes); assert.equal(createHash("sha256").update(raw).digest("hex"), fixture.source.raw_sha256);
+  let installedVersion: string;
+  try {
+    raw = execFileSync("herdr", ["api", "schema", "--json"], { encoding: "utf8", maxBuffer: 2_000_000 });
+    installedVersion = execFileSync("herdr", ["--version"], { encoding: "utf8" }).trim().replace(/^herdr\s+/, "");
+  } catch {
+    t.diagnostic("installed Herdr CLI unavailable; pinned fixture integrity and decoder binding still ran");
+    return;
+  }
+  const live = JSON.parse(raw) as any;
+  assert.equal(live.protocol, 16);
+  const liveMethods = new Map(live.schemas.request.oneOf.map((item: any) => [item.properties?.method?.const, item]));
+  const liveResults = new Map(live.schemas.success_response.$defs.ResponseResult.oneOf.map((item: any) => [item.properties?.type?.const, item]));
+  const liveEvents = new Map(live.schemas.event.$defs.EventData.oneOf.map((item: any) => [item.properties?.type?.const, item]));
+  for (const method of Object.keys(USED_HERDR_METHOD_RESULTS)) {
+    assert.equal(liveMethods.has(method), true, `live method ${method}`);
+    assertDiscriminatedVariant(live.schemas.request, "request", liveMethods.get(method), "method", method);
+  }
+  for (const resultType of USED_HERDR_RESULT_TYPES) {
+    assert.equal(liveResults.has(resultType), true, `live result ${resultType}`);
+    assertDiscriminatedVariant(live.schemas.success_response, "success_response", liveResults.get(resultType), "type", resultType);
+  }
+  for (const eventName of HERDR_EVENT_NAMES) {
+    assert.equal(liveEvents.has(eventName), true, `live event ${eventName}`);
+    assertDiscriminatedVariant(live.schemas.event, "event", liveEvents.get(eventName), "type", eventName);
+  }
+  if (installedVersion === fixture.source.herdr_version) {
+    assert.equal(Buffer.byteLength(raw), fixture.source.raw_bytes);
+    assert.equal(createHash("sha256").update(raw).digest("hex"), fixture.source.raw_sha256);
+  } else {
+    t.diagnostic(`installed Herdr ${installedVersion} shares protocol 16 but differs from pinned ${fixture.source.herdr_version}; structural conformance replaced byte identity`);
+  }
+});
+
+test("tagged Herdr behavior fixture binds each used method to its actual success result", async () => {
+  const behavior = JSON.parse(await readFile(methodResultsPath, "utf8")) as { source: { herdr_version: string; commit: string }; associations: Record<string, string> };
+  assert.equal(behavior.source.herdr_version, "0.7.4");
+  assert.equal(behavior.source.commit, "50aaa2ec046ee26ff407c20f49de496f522512a8");
+  assert.deepEqual(USED_HERDR_METHOD_RESULTS, behavior.associations);
+  assert.equal(behavior.associations["agent.focus"], "agent_info");
 });
 
 test("protocol decoders preserve unknown fields and done versus idle", () => {

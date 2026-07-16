@@ -1,6 +1,6 @@
 import type { NativeSessionIdentity } from "../contracts/ownership.ts";
 import { revalidateLaunchFilesystemBoundary } from "../policy/capabilities.ts";
-import type { AgentInfo } from "../herdr/protocol.ts";
+import { HerdrApiError, type AgentInfo } from "../herdr/protocol.ts";
 import type { HerdrRequestClient } from "../herdr/client.ts";
 import { assertPreparedHarnessLaunch, validateResolvedExecutable, type PreparedHarnessLaunch } from "../harnesses/index.ts";
 import {
@@ -215,7 +215,16 @@ export async function startSubagent(input: StartSubagentInput): Promise<StartSub
       };
     }
     const baseline = await captureTurnBaseline(input.client, target, input.signal);
-    await input.client.sendInput(readiness.agent.pane_id, input.instructions, ["enter"], input.signal);
+    try {
+      await input.client.sendInput(readiness.agent.pane_id, input.instructions, ["enter"], input.signal);
+    } catch (error) {
+      if (error instanceof HerdrApiError) throw error;
+      throw new TurnSubmissionUncertainError(
+        "Task submission outcome is uncertain after pane.send_input was attempted; child retained for inspection and input must not be retried automatically",
+        target,
+        { cause: error },
+      );
+    }
     try {
       const turn = await waitForTurnEvidence({
         client: input.client,
@@ -228,7 +237,7 @@ export async function startSubagent(input: StartSubagentInput): Promise<StartSub
       return { started: true, submitted: true, target, agent: turn.agent, output: turn.output };
     } catch (error) {
       throw new TurnSubmissionUncertainError(
-        "Task was submitted atomically but a new working cycle could not be proven; child retained for inspection",
+        "Task was accepted but a new working cycle could not be proven; child retained for inspection and input must not be retried automatically",
         target,
         { cause: error },
       );

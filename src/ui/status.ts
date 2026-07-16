@@ -1,11 +1,8 @@
 import type { RunLifecycle } from "../contracts/state.ts";
 import type { ListToolResult, RunSummary } from "../tools/contracts.ts";
 
-export type DashboardScope = "current_session" | "all_owned" | "global";
-
-export interface DashboardRun extends RunSummary {
-  readonly changedOutput: boolean;
-}
+export type DashboardScope = "current_session";
+export type DashboardRun = RunSummary;
 
 export interface DashboardSummary {
   readonly total: number;
@@ -51,8 +48,7 @@ export function isDashboardVisible(run: RunSummary): boolean {
 }
 
 export function summarizeDashboardRuns(runs: readonly RunSummary[]): DashboardSummary {
-  const summary = emptyDashboardSummary();
-  const mutable = { ...summary };
+  const mutable = { ...emptyDashboardSummary() };
   for (const run of runs) {
     mutable.total += 1;
     if (isFailure(run)) {
@@ -79,18 +75,10 @@ export function statusSummaryLabel(summary: DashboardSummary): string {
 }
 
 export class DashboardProjector {
-  readonly #seenRevisions = new Map<string, number>();
-  readonly #knownRevisions = new Map<string, number>();
-
-  markSeen(id: string, revision?: number): void {
-    const value = revision ?? this.#knownRevisions.get(id);
-    if (value !== undefined) this.#seenRevisions.set(id, value);
-  }
-
-  project(scope: DashboardScope, result: ListToolResult, now = Date.now()): DashboardState {
+  project(result: ListToolResult, now = Date.now()): DashboardState {
     if (!result.ok) {
       return {
-        scope,
+        scope: "current_session",
         connection: "unavailable",
         runs: [],
         summary: emptyDashboardSummary(),
@@ -98,27 +86,13 @@ export class DashboardProjector {
         error: result.reason,
       };
     }
-    const liveIds = new Set<string>();
-    const runs = result.runs.filter(isDashboardVisible).map((run): DashboardRun => {
-      liveIds.add(run.id);
-      const revision = run.outputRevision;
-      if (revision !== undefined) {
-        this.#knownRevisions.set(run.id, revision);
-        if (!this.#seenRevisions.has(run.id)) this.#seenRevisions.set(run.id, revision);
-      }
-      const seen = this.#seenRevisions.get(run.id);
-      return { ...run, changedOutput: revision !== undefined && seen !== undefined && revision > seen };
-    });
-    for (const id of this.#knownRevisions.keys()) {
-      if (!liveIds.has(id)) { this.#knownRevisions.delete(id); this.#seenRevisions.delete(id); }
-    }
-    runs.sort((left, right) =>
+    const runs = result.runs.filter(isDashboardVisible).sort((left, right) =>
       LIFECYCLE_ORDER[left.lifecycle] - LIFECYCLE_ORDER[right.lifecycle]
       || STATUS_ORDER[left.herdrStatus] - STATUS_ORDER[right.herdrStatus]
       || left.profile.localeCompare(right.profile)
       || left.id.localeCompare(right.id));
     return {
-      scope,
+      scope: "current_session",
       connection: "connected",
       runs,
       summary: summarizeDashboardRuns(runs),

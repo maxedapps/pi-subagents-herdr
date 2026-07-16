@@ -1,16 +1,17 @@
 import type { HerdrRequestClient } from "../herdr/client.ts";
+import { HerdrApiError } from "../herdr/protocol.ts";
 import {
   captureTurnBaseline,
   readBoundedOutput,
   resolveOwnedPaneFresh,
   waitForTurnEvidence,
   type BoundedOutput,
+  type Delivery,
   type OwnedRunTarget,
 } from "./control.ts";
 
 export interface SendSubagentResult {
-  readonly sent: true;
-  readonly confirmed: boolean;
+  readonly delivery: Delivery;
   readonly state: "working" | "blocked" | "done" | "idle" | "unknown";
   readonly output: BoundedOutput;
   readonly reason?: string;
@@ -32,7 +33,25 @@ export async function sendToSubagent(input: {
   // Pane IDs are mutable. Resolve terminal/native/active-branch ownership again
   // immediately before the input mutation rather than reusing baseline topology.
   const resolved = await resolveOwnedPaneFresh(input.client, input.target, input.signal);
-  await input.client.sendInput(resolved.pane.pane_id, message, ["enter"], input.signal);
+  const beforeOutput = await readBoundedOutput(input.client, input.target, input.signal);
+  try {
+    await input.client.sendInput(resolved.pane.pane_id, message, ["enter"], input.signal);
+  } catch (error) {
+    if (error instanceof HerdrApiError) throw error;
+    let state = resolved.agent.agent_status;
+    let output = beforeOutput;
+    try {
+      const latest = await resolveOwnedPaneFresh(input.client, input.target);
+      state = latest.agent.agent_status;
+      output = await readBoundedOutput(input.client, input.target);
+    } catch { /* Preserve the last proven pre-request state/output. */ }
+    return {
+      delivery: "uncertain",
+      state,
+      output,
+      reason: `Input mutation response was lost or aborted after pane.send_input was attempted; it may have been accepted and must not be retried automatically: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
   try {
     const evidence = await waitForTurnEvidence({
       client: input.client,
@@ -42,15 +61,20 @@ export async function sendToSubagent(input: {
       ...(input.pollIntervalMs === undefined ? {} : { pollIntervalMs: input.pollIntervalMs }),
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
-    return { sent: true, confirmed: true, state: evidence.agent.agent_status, output: evidence.output };
+    return { delivery: "confirmed", state: evidence.agent.agent_status, output: evidence.output };
   } catch (error) {
-    const latest = await resolveOwnedPaneFresh(input.client, input.target, input.signal);
+    let state = resolved.agent.agent_status;
+    let output = beforeOutput;
+    try {
+      const latest = await resolveOwnedPaneFresh(input.client, input.target);
+      state = latest.agent.agent_status;
+      output = await readBoundedOutput(input.client, input.target);
+    } catch { /* Preserve the last proven state/output. */ }
     return {
-      sent: true,
-      confirmed: false,
-      state: latest.agent.agent_status,
-      output: await readBoundedOutput(input.client, input.target, input.signal),
-      reason: `Input was sent but a new turn could not be proven: ${error instanceof Error ? error.message : String(error)}`,
+      delivery: "unconfirmed",
+      state,
+      output,
+      reason: `Herdr accepted the input mutation but bounded follow-up evidence did not appear: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
 }

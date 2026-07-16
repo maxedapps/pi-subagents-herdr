@@ -23,7 +23,7 @@ test("PI_HERDR_SUBAGENT code guard omits parent tools, events, commands, and UI 
   assert.deepEqual(registrations, []);
 });
 
-test("Pi child resource metadata disables discovered skills/templates and excludes the parent skill and orchestration tools", async () => {
+test("Pi child uses normal resource discovery without package parent resources or orchestration tools", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "p6-child-resources-")));
   const cwd = join(root, "checkout"); const sessions = join(root, "sessions"); const system = join(root, "system.md");
   await mkdir(cwd, { mode: 0o700 }); await mkdir(sessions, { mode: 0o700 }); await writeFile(system, "boundary", { mode: 0o600 }); await chmod(system, 0o600);
@@ -35,9 +35,9 @@ test("Pi child resource metadata disables discovered skills/templates and exclud
     assert.equal(prepared.launch.env.PI_HERDR_SUBAGENT, "1");
     assert.equal(prepared.launch.env.PI_SUBAGENT_CHILD, "1");
     assert.equal(prepared.launch.env.HERDR_SUBAGENT_NO_RECURSION, "1");
-    assert.equal(prepared.launch.argv.includes("--no-skills"), true);
-    assert.equal(prepared.launch.argv.includes("--no-prompt-templates"), true);
-    assert.equal(prepared.launch.argv.includes("--skill"), false);
+    for (const removed of ["--approve", "--no-approve", "--no-skills", "--skill", "--no-prompt-templates"]) {
+      assert.equal(prepared.launch.argv.includes(removed), false);
+    }
     assert.doesNotMatch(prepared.launch.argv.join(" "), /use-subagents\/SKILL\.md|subagent_start/);
   } finally { await cli.cleanup(); await rm(root, { recursive: true, force: true }); }
 });

@@ -40,7 +40,7 @@ Isolation does not replace review, conflict resolution, integration, tests, or c
 
 ## Monitoring and blocked flow
 
-Set a bounded timeout before launch. Confirm a new work cycle rather than inferring success from resource existence. Track each run to completion, failure, cancellation, or deliberate retention.
+Set a bounded timeout before launch. Confirm a new work cycle rather than inferring success from resource existence. A successful `subagent_start` only proves submission/start; it creates a mandatory result obligation. Call `subagent_status` for that exact ID with terminal/attention states, inspect the returned output, and resolve the run. List mode does not satisfy this obligation, and every parallel run must be inspected individually.
 
 On timeout, `blocked`, `unknown`, or failure:
 
@@ -52,7 +52,7 @@ On timeout, `blocked`, `unknown`, or failure:
 
 Use `subagent_send` only for a narrow same-assignment clarification. Never send credentials, approvals, bypass flags, expanded permissions, a new root, or recursive-delegation instructions. After two failures with one cause, stop repeating the same approach.
 
-Never fire and forget. A terminal/attention state requires output inspection. Reuse context only for same-assignment follow-up; use fresh context for new roles or independent judgment.
+Never fire and forget. A terminal/attention state requires ID-specific output inspection. Reuse context only for same-assignment follow-up; use fresh context for new roles or independent judgment.
 
 ## Handoff and parent verification
 

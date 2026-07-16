@@ -26,9 +26,12 @@ function run(id: string, status: RunSummary["herdrStatus"], overrides: Partial<R
     taskSynopsis: `Task for ${id}`,
     terminalId: `term-${id}`,
     agentRevision: 1,
-    outputRevision: 1,
     ...overrides,
   };
+}
+
+function project(runs: readonly RunSummary[]) {
+  return new DashboardProjector().project({ ok: true, scope: "current_session", runs, counts: {} });
 }
 
 test("dashboard summary preserves done and idle attention semantics while grouping ready", () => {
@@ -41,23 +44,17 @@ test("dashboard summary preserves done and idle attention semantics while groupi
   assert.deepEqual(semanticStyle("running", "idle"), { icon: "○", label: "idle", color: "muted" });
 });
 
-test("revision hints remain marked until details are seen", () => {
-  const projector = new DashboardProjector();
-  const first = projector.project("current_session", { ok: true, scope: "current_session", runs: [run("a", "working")], counts: {} });
-  assert.equal(first.runs[0]?.changedOutput, false);
-  const changedRun = run("a", "working", { agentRevision: 2, outputRevision: 2 });
-  const changed = projector.project("current_session", { ok: true, scope: "current_session", runs: [changedRun], counts: {} });
-  assert.equal(changed.runs[0]?.changedOutput, true);
-  projector.markSeen("a", 2);
-  const seen = projector.project("current_session", { ok: true, scope: "current_session", runs: [changedRun], counts: {} });
-  assert.equal(seen.runs[0]?.changedOutput, false);
+test("dashboard projects current owned summaries without output-revision state", () => {
+  const state = project([run("a", "working", { agentRevision: 2 })]);
+  assert.deepEqual(state.runs.map((item) => item.id), ["a"]);
+  assert.equal("changedOutput" in state.runs[0]!, false);
+  assert.equal("outputRevision" in state.runs[0]!, false);
 });
 
 test("injected themes are evaluated independently without color-only semantics", () => {
   const light = { ...theme, fg: (_color: string, text: string) => `\x1b[30m${text}\x1b[0m` } as unknown as Theme;
   const dark = { ...theme, fg: (_color: string, text: string) => `\x1b[97m${text}\x1b[0m` } as unknown as Theme;
-  const projector = new DashboardProjector();
-  const state = projector.project("current_session", { ok: true, scope: "current_session", runs: [run("done", "done")], counts: {} });
+  const state = project([run("done", "done")]);
   const lightText = new SubagentsWidget(() => state, light).render(60).join("\n");
   const darkText = new SubagentsWidget(() => state, dark).render(60).join("\n");
   assert.notEqual(lightText, darkText);
@@ -68,17 +65,11 @@ test("injected themes are evaluated independently without color-only semantics",
 });
 
 test("widget and rows are ANSI-visible-width safe at narrow and wide widths", () => {
-  const projector = new DashboardProjector();
-  const state = projector.project("current_session", {
-    ok: true,
-    scope: "current_session",
-    runs: [
-      run("very-long-run-identifier", "blocked", { customStatus: "approval needed" }),
-      run("done", "done"),
-      run("idle", "idle"),
-    ],
-    counts: {},
-  });
+  const state = project([
+    run("very-long-run-identifier", "blocked", { customStatus: "approval needed" }),
+    run("done", "done"),
+    run("idle", "idle"),
+  ]);
   const widget = new SubagentsWidget(() => state, theme);
   for (const width of [1, 8, 20, 35, 63, 100]) {
     for (const line of widget.render(width)) assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${line}`);

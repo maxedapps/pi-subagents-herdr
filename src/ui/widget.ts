@@ -28,14 +28,13 @@ export function renderDashboardRow(run: DashboardRun, width: number, theme: Them
   const semantic = semanticStyle(run.lifecycle, run.herdrStatus);
   const icon = theme.fg(semantic.color, semantic.icon);
   const status = theme.fg(semantic.color, semantic.label);
-  const changed = run.changedOutput ? theme.fg("warning", "◆") : " ";
   const elapsed = theme.fg("dim", formatElapsed(run.elapsedMs));
   const label = theme.fg("text", runLabel(run));
   const custom = run.customStatus ? ` ${theme.fg("warning", run.customStatus)}` : "";
   let content: string;
-  if (width < 36) content = `${icon} ${label} ${status} ${changed}`;
-  else if (width < 64) content = `${icon} ${label} ${status}${custom} ${elapsed} ${changed}`;
-  else content = `${icon} ${label}  ${theme.fg("muted", run.harness)}  ${status}${custom}  ${elapsed}  ${changed}`;
+  if (width < 36) content = `${icon} ${label} ${status}`;
+  else if (width < 64) content = `${icon} ${label} ${status}${custom} ${elapsed}`;
+  else content = `${icon} ${label}  ${theme.fg("muted", run.harness)}  ${status}${custom}  ${elapsed}`;
   const fitted = padToWidth(content, width);
   return selected ? theme.bg("selectedBg", fitted) : fitted;
 }
@@ -54,7 +53,7 @@ export class SubagentsWidget implements Component {
   render(width: number): string[] {
     const state = this.getState();
     if (width <= 0 || state.runs.length === 0) return [];
-    const fingerprint = JSON.stringify(state.runs.map((run) => [run.id, run.lifecycle, run.herdrStatus, run.customStatus, run.elapsedMs, run.changedOutput]));
+    const fingerprint = JSON.stringify(state.runs.map((run) => [run.id, run.lifecycle, run.herdrStatus, run.customStatus, run.elapsedMs]));
     if (this.#cachedLines && this.#cachedWidth === width && this.#cachedFingerprint === fingerprint) return this.#cachedLines;
     const title = width < 28 ? `Subagents ${state.summary.total}` : `Subagents · ${statusSummaryLabel(state.summary)}`;
     const lines = [truncateToWidth(this.theme.fg("accent", this.theme.bold(title)), width, "")];

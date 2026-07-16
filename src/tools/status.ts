@@ -28,10 +28,12 @@ export function registerStatusTool(pi: ExtensionAPI, runtime: HerdrToolRuntimeCo
         }, signal);
         if (!waited.ok) return { content: [{ type: "text", text: boundedResultText(waited) }], details: waited };
         const inspected = await runtime.get({ id: params.id!, ...(params.lines === undefined ? {} : { lines: params.lines }) }, signal);
+        if (inspected.ok) runtime.recordModelResultInspection(params.id!, inspected.run.herdrStatus);
         const result = inspected.ok ? { ...inspected, observation: { mode: "wait" as const, wait: waited.result } } : inspected;
         return { content: [{ type: "text", text: boundedResultText(result) }], details: result };
       }
       const result = await runtime.get({ id: params.id!, ...(params.lines === undefined ? {} : { lines: params.lines }) }, signal);
+      if (result.ok) runtime.recordModelResultInspection(params.id!, result.run.herdrStatus);
       const details = result.ok ? { ...result, observation: { mode: "inspect" as const } } : result;
       return { content: [{ type: "text", text: boundedResultText(details) }], details };
     },

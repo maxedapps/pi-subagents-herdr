@@ -19,7 +19,7 @@ Invariants:
 
 `session_start` loads namespaced settings/profiles, validates backend parent identity, recovers active-branch runs/worktrees, and starts subscriptions. `/tree` changes authority in place, so actions reread the active branch. `session_shutdown` is idempotent and non-destructive.
 
-`PI_HERDR_SUBAGENT=1` returns child mode immediately: no parent tools, commands, dashboard, lifecycle runtime, or skill metadata. Pi children use `--no-skills --no-prompt-templates`; only explicitly reviewed child-eligible skills may be added. The parent-only `use-subagents` skill is prohibited.
+Parent mode contributes `use-subagents` through Pi's dynamic `resources_discover` event. `PI_HERDR_SUBAGENT=1` returns child mode immediately: no parent tools, commands, dashboard, lifecycle runtime, or package-provided orchestration skill. Pi children receive no trust, skill, or prompt-template override flags and use ordinary independent Pi trust/resource discovery. Saved trust and global settings remain available normally; transient parent `--approve` and session-only trust do not transfer to a separate child process.
 
 ## Five-tool surface
 
@@ -31,7 +31,11 @@ Only `subagent_start`, `subagent_status`, `subagent_send`, `subagent_interrupt`,
 - `id` without `states`: detailed inspect/output;
 - `id` with `states`: bounded abortable wait followed by detailed inspect/output.
 
-Internal list/get/wait runtime methods remain implementation details used by TUI and status dispatch; they are not registered tools or aliases. Output is bounded to 50KB/2000 lines and preserves backend semantic `working`, `blocked`, `done`, `idle`, and `unknown` states.
+Internal list/get/wait runtime methods remain implementation details; status dispatch uses all three, while the TUI projects only current-session `list` results and performs no per-run output reads. They are not registered tools or aliases. Output is bounded to 50KB/2000 lines and preserves backend semantic `working`, `blocked`, `done`, `idle`, and `unknown` states.
+
+The `/subagents` overlay lists only current-session owned runs and exposes selection, focus, graceful retained stop, refresh, and close. Focus/stop are terminal overlay results, so the overlay is disposed before either mutation. Detailed output, broader observational scopes, send, interrupt, force stop, and safe worktree cleanup remain available only through the explicit model-facing tools. Normal focus validates the returned post-focus `agent_info` identity/state without a second snapshot; a lost response gets one fresh reconciliation snapshot and otherwise reports that focus may have succeeded.
+
+A successful start and each accepted follow-up create a small in-memory per-run result generation. Only model-facing, ID-specific status returning `done`/`idle` output consumes it; list/UI observations do not, blocked remains unresolved, and proven stop clears it. On parent `agent_settled`, the extension may inject one follow-up reminder per uninspected generation and trigger one turn. There is no polling loop, durable acknowledgement state, delivery queue, or child message bus.
 
 ## Ownership and recovery
 
@@ -60,7 +64,9 @@ Adapters validate executable identity, canonical cwd/trusted roots, capabilities
 7. Readiness/native identity is proven.
 8. Assembled instructions are submitted atomically and a new work cycle is proven.
 
-Pi and Claude tool policies are not filesystem sandboxes. Codex uses its documented sandbox. Capability overrides are monotonic unless trusted configuration and interactive human confirmation authorize broadening before resource creation. Recursive orchestration tools are rejected for all children.
+After any input mutation is attempted, a lost/aborted response is treated as submission/delivery uncertainty and the child is retained. Send/interrupt results use `confirmed`, `unconfirmed` (acknowledged request without bounded state/revision evidence), or `uncertain` (request may have applied before response loss). No automatic retry, message ID, deduplication ledger, or destructive uncertainty cleanup exists. Confirmed interrupt output is reread before graceful exit so stop/handoff uses the newest available pre-exit output.
+
+Pi children independently resolve ordinary project trust and resource discovery; this is not parent trust inheritance. Pi and Claude tool policies are not filesystem sandboxes. Codex uses its documented sandbox. Capability overrides are monotonic unless trusted configuration and interactive human confirmation authorize broadening before resource creation. Recursive orchestration tools are rejected for all children.
 
 ## Artifacts
 

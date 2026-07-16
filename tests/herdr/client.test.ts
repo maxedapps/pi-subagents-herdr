@@ -27,6 +27,7 @@ function resultFor(method: string | undefined) {
     case "pane.process_info": return { type: "pane_process_info", process_info: { pane_id: "w1:p1", shell_pid: 42, foreground_processes: [] } };
     case "agent.start": return { type: "agent_started", agent: childAgent, argv: ["pi"] };
     case "agent.get": return { type: "agent_info", agent };
+    case "agent.focus": return { type: "agent_info", agent: { ...agent, focused: true, agent_status: "idle" } };
     case "agent.list": return { type: "agent_list", agents: [agent] };
     case "agent.read": return { type: "pane_read", read: { pane_id: "w1:p1", workspace_id: "w1", tab_id: "w1:t1", source: "recent_unwrapped", format: "text", text: "output", revision: 5, truncated: false } };
     case "events.wait": return { type: "wait_matched", event: { event: "pane_agent_status_changed", data: { type: "pane_agent_status_changed", pane_id: "w1:p1", workspace_id: "w1", agent_status: "done" } } };
@@ -48,7 +49,8 @@ test("typed client emits every Phase 3 method with exact wire enum/fields", asyn
     await client.currentPane("w1:p1"); await client.getPane("w1:p1"); await client.listPanes("w1"); await client.getPaneLayout("w1:p1"); await client.getPaneProcessInfo("w1:p1");
     await client.startAgent({ name: "worker", argv: ["pi"], tab_id: "w1:t1", focus: false }); await client.getAgent("term_parent"); await client.listAgents();
     const read = await client.readAgent("term_parent", { source: "recent_unwrapped", lines: 20 }); assert.equal(read.source, "recent_unwrapped");
-    await client.sendInput("w1:p1", "hello", ["enter"]); await client.sendKeys("w1:p1", ["ctrl+c"]); await client.focusAgent("term_parent");
+    await client.sendInput("w1:p1", "hello", ["enter"]); await client.sendKeys("w1:p1", ["ctrl+c"]);
+    const focused = await client.focusAgent("term_parent"); assert.equal(focused.focused, true); assert.equal(focused.agent_status, "idle");
     await client.waitForEvent({ event: "pane_agent_status_changed", pane_id: "w1:p1", agent_status: "done" }, undefined, 100);
     const stream = await client.subscribe([{ type: "pane.moved" }, { type: "pane.agent_status_changed", pane_id: "w1:p1" }]); stream.close();
     await client.closePane("w1:p1"); await client.closeTab("w1:t1");

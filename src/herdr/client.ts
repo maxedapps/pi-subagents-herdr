@@ -31,7 +31,7 @@ export interface HerdrRequestClient {
   sendKeys(paneId: string, keys: readonly string[], signal?: AbortSignal): Promise<void>;
   waitForEvent(input: EventMatch, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrEvent>;
   subscribe(input: readonly Subscription[], signal?: AbortSignal): Promise<HerdrSubscriptionStream>;
-  focusAgent(target: string, signal?: AbortSignal): Promise<void>;
+  focusAgent(target: string, signal?: AbortSignal): Promise<AgentInfo>;
   closePane(paneId: string, signal?: AbortSignal): Promise<void>;
   closeTab(tabId: string, signal?: AbortSignal): Promise<void>;
   listWorktrees(input: WorktreeSelector, signal?: AbortSignal): Promise<{ source: WorktreeSourceInfo; worktrees: readonly WorktreeInfo[] }>;
@@ -99,7 +99,7 @@ export class HerdrClient implements HerdrRequestClient {
   async sendKeys(paneId: string, keys: readonly string[], signal?: AbortSignal) { await this.#result("pane.send_keys", { pane_id: paneId, keys }, "ok", signal); }
   async waitForEvent(input: EventMatch, signal?: AbortSignal, timeoutMs?: number): Promise<HerdrEvent> { const result = await this.#result("events.wait", { match_event: input, ...(timeoutMs === undefined ? {} : { timeout_ms: timeoutMs }) }, "wait_matched", signal, timeoutMs === undefined ? undefined : timeoutMs + 1_000); return decodeEvent(result.event) as HerdrEvent; }
   subscribe(input: readonly Subscription[], signal?: AbortSignal) { return this.transport.subscribe(toWireRecord({ subscriptions: input }), signal === undefined ? {} : { signal }); }
-  async focusAgent(target: string, signal?: AbortSignal) { await this.#result("agent.focus", { target }, "ok", signal); }
+  async focusAgent(target: string, signal?: AbortSignal) { return decodeAgent((await this.#result("agent.focus", { target }, "agent_info", signal)).agent); }
   async closePane(paneId: string, signal?: AbortSignal) { await this.#result("pane.close", { pane_id: paneId }, "ok", signal); }
   async closeTab(tabId: string, signal?: AbortSignal) { await this.#result("tab.close", { tab_id: tabId }, "ok", signal); }
   async listWorktrees(input: WorktreeSelector, signal?: AbortSignal) {

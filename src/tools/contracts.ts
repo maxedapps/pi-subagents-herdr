@@ -22,8 +22,6 @@ export interface RunSummary {
   readonly elapsedMs: number;
   readonly taskSynopsis: string;
   readonly agentRevision?: number;
-  /** Recent-output revision, populated by UI-specific observational refreshes. */
-  readonly outputRevision?: number;
   readonly customStatus?: string;
   readonly focused?: boolean;
   readonly terminalId?: string;
@@ -31,6 +29,16 @@ export interface RunSummary {
   readonly tabId?: string;
   readonly workspaceId?: string;
   readonly worktree?: WorktreeStateView;
+}
+
+export interface StartCompletionPending {
+  readonly pending: true;
+  readonly requiredTool: "subagent_status";
+  readonly suggestedInput: {
+    readonly id: string;
+    readonly states: readonly ["done", "idle", "blocked"];
+    readonly timeoutMs: number;
+  };
 }
 
 export interface StartToolSuccess {
@@ -43,13 +51,12 @@ export interface StartToolSuccess {
     readonly thinking: ThinkingLevel;
     readonly cwd: string;
     readonly tools: readonly string[];
-    readonly skills: readonly string[];
-    readonly skillDiagnostics: readonly string[];
     readonly permissions: { readonly mutation: boolean; readonly network: boolean };
     readonly isolatedWorktree: boolean;
     readonly broadeningReasons: readonly string[];
   };
   readonly output: BoundedOutput;
+  readonly completion?: StartCompletionPending;
   readonly reason?: string;
 }
 
@@ -71,7 +78,6 @@ export interface GetToolSuccess {
     readonly thinking: ThinkingLevel;
     readonly cwd: string;
     readonly tools: readonly string[];
-    readonly skills: readonly string[];
   };
   readonly ownership: {
     readonly runNonce: string;

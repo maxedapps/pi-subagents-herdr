@@ -35,9 +35,6 @@
   "pi": {
     "extensions": [
       "./extensions/herdr-subagents/index.ts"
-    ],
-    "skills": [
-      "./skills/use-subagents/SKILL.md"
     ]
   },
   "files": [

@@ -170,7 +170,7 @@ function profileChecks(discovery: ProfileDiscoveryResult, activeTools: readonly 
   const researcher = discovery.winners.find((profile) => profile.name === "researcher");
   if (researcher) {
     const exposed = activeTools.filter((name) => RESEARCH_TOOLS.has(name));
-    const soft = resolveSoftCapabilities(researcher, { tools: activeTools, skills: [], reviewedExternalResearchTools: exposed });
+    const soft = resolveSoftCapabilities(researcher, { tools: activeTools, reviewedExternalResearchTools: exposed });
     checks.push(check("capabilities.research", "capabilities", soft.research.available ? "pass" : "warning", soft.research.available ? `Researcher has reviewed optional external capability: ${soft.tools.filter((name) => RESEARCH_TOOLS.has(name)).join(", ")}` : "Researcher external-source capability is currently unavailable; research starts will block rather than claim memory-only research", soft.diagnostics.map((item) => item.message)));
   }
   return checks;

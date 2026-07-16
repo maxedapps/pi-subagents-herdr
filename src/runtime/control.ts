@@ -61,6 +61,13 @@ export class RuntimeTimeoutError extends Error {
   }
 }
 
+export class FocusOutcomeUncertainError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "FocusOutcomeUncertainError";
+  }
+}
+
 function sameNative(actual: AgentInfo["agent_session"], expected: NativeSessionIdentity): boolean {
   return actual !== undefined && actual !== null
     && actual.kind === expected.kind && actual.value === expected.value && actual.source === expected.source;
@@ -116,17 +123,42 @@ export async function revalidateRecordedOwnershipFresh(
   return snapshot;
 }
 
+function validateFocusedAgent(after: AgentInfo, target: OwnedRunTarget): void {
+  if (after.terminal_id !== target.terminalId) {
+    throw new RuntimeIdentityError("Post-focus agent terminal identity does not match the freshly authorized target");
+  }
+  if (after.agent !== undefined && after.agent !== null && after.agent !== target.harness) {
+    throw new RuntimeIdentityError(`Post-focus terminal harness changed from ${target.harness} to ${after.agent}`);
+  }
+  if (target.nativeSession !== undefined && !sameNativeIdentity(nativeIdentityFromAgent(after), target.nativeSession)) {
+    throw new RuntimeIdentityError("Post-focus native session identity changed or disappeared");
+  }
+  if (after.focused !== true) throw new RuntimeIdentityError("Post-focus agent response did not confirm focused:true");
+}
+
 /** Terminal-preferred focus after immediate active-branch and live identity proof. */
 export async function focusOwnedPaneFresh(
   client: HerdrRequestClient,
   target: OwnedRunTarget,
   signal?: AbortSignal,
-): Promise<{ readonly before: ResolvedOwnedPane; readonly after?: AgentInfo }> {
+): Promise<{ readonly before: ResolvedOwnedPane; readonly after: AgentInfo; readonly reconciled: boolean }> {
   const before = await resolveOwnedPaneFresh(client, target, signal);
-  await client.focusAgent(target.terminalId, signal);
-  const snapshot = await client.snapshot(signal);
-  const after = snapshot.agents.find((agent) => agent.terminal_id === target.terminalId);
-  return { before, ...(after === undefined ? {} : { after }) };
+  try {
+    const after = await client.focusAgent(target.terminalId, signal);
+    validateFocusedAgent(after, target);
+    return { before, after, reconciled: false };
+  } catch (error) {
+    try {
+      const reconciled = await resolveOwnedPaneFresh(client, target);
+      validateFocusedAgent(reconciled.agent, target);
+      return { before, after: reconciled.agent, reconciled: true };
+    } catch {
+      throw new FocusOutcomeUncertainError(
+        `Focus outcome uncertain; it may have succeeded: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
 }
 
 export function abortError(signal: AbortSignal): Error {
@@ -199,10 +231,13 @@ export async function captureTurnBaseline(client: HerdrRequestClient, target: Ow
   return { agentRevision: resolved.agent.revision, status: resolved.agent.agent_status, outputRevision: read.revision };
 }
 
+export type Delivery = "confirmed" | "unconfirmed" | "uncertain";
+
 export function hasUnambiguousTurnEvidence(agent: AgentInfo, outputRevision: number, baseline: TurnBaseline): boolean {
-  if (agent.agent_status === "working" && (agent.revision >= baseline.agentRevision || outputRevision >= baseline.outputRevision)) return true;
+  const revisionAdvanced = agent.revision > baseline.agentRevision || outputRevision > baseline.outputRevision;
+  if (agent.agent_status === "working") return baseline.status !== "working" || revisionAdvanced;
   return (agent.agent_status === "done" || agent.agent_status === "idle" || agent.agent_status === "blocked")
-    && (agent.revision > baseline.agentRevision || outputRevision > baseline.outputRevision);
+    && revisionAdvanced;
 }
 
 export async function waitForTurnEvidence(input: {

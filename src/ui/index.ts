@@ -5,7 +5,7 @@ import type { HerdrSubagentsSettings } from "../config/settings.ts";
 import type { HerdrToolRuntimeController } from "../tools/service.ts";
 import { OverlayActions, type UiRuntimeApi } from "./actions.ts";
 import { SubagentsOverlay, type OverlayAction } from "./overlay.ts";
-import { adaptiveRefreshDelay, DashboardProjector, type DashboardScope, type DashboardState } from "./status.ts";
+import { adaptiveRefreshDelay, DashboardProjector, type DashboardState } from "./status.ts";
 import { statusSummaryLabel } from "./status.ts";
 import { SubagentsWidget } from "./widget.ts";
 
@@ -17,20 +17,15 @@ interface UiRuntime extends UiRuntimeApi {
   doctor?: () => ReturnType<HerdrToolRuntimeController["doctor"]>;
 }
 
-type OverlayResult = { readonly type: "close" } | { readonly type: "focus"; readonly id: string };
-
-function parseScope(args: string): DashboardScope | undefined {
-  const value = args.trim().toLowerCase();
-  if (!value || value === "current" || value === "current-session") return "current_session";
-  if (value === "all" || value === "all-owned" || value === "all_owned") return "all_owned";
-  if (value === "global") return "global";
-  return undefined;
-}
+type OverlayResult =
+  | { readonly type: "close" }
+  | { readonly type: "focus"; readonly id: string }
+  | { readonly type: "stop"; readonly id: string };
 
 export class HerdrSubagentsUiSession {
   readonly #mainProjector = new DashboardProjector();
   #context: ExtensionContext | undefined;
-  #state: DashboardState = this.#mainProjector.project("current_session", { ok: true, scope: "current_session", runs: [], counts: {} });
+  #state: DashboardState = this.#mainProjector.project({ ok: true, scope: "current_session", runs: [], counts: {} });
   #unsubscribe: (() => void) | undefined;
   #timer: NodeJS.Timeout | undefined;
   #widgetRequestRender: (() => void) | undefined;
@@ -85,16 +80,14 @@ export class HerdrSubagentsUiSession {
       context.ui.notify("/subagents is available only in Pi's interactive terminal TUI; lifecycle tools remain available in this mode.", "warning");
       return;
     }
-    const scope = parseScope(args);
-    if (!scope) {
-      context.ui.notify("Usage: /subagents [current|all-owned|global]", "warning");
+    if (args.trim().length > 0) {
+      context.ui.notify("Usage: /subagents (current-session owned runs only)", "warning");
       return;
     }
     const actions = new OverlayActions(this.runtime, context);
     const overlayProjector = new DashboardProjector();
     let overlay: SubagentsOverlay | undefined;
-    let currentScope = scope;
-    const initial = await this.#loadScope(currentScope, overlayProjector);
+    const initial = await this.#loadCurrent(overlayProjector);
     this.#overlayOpen = true;
     this.#scheduleTimer();
     const result = await context.ui.custom<OverlayResult>((tui, theme, _keybindings, done) => {
@@ -103,56 +96,26 @@ export class HerdrSubagentsUiSession {
         done(value);
       };
       this.#overlayDone = () => close({ type: "close" });
-      const inspect = async (id: string) => {
-        try {
-          const details = await this.runtime.inspectUi(currentScope, id);
-          overlayProjector.markSeen(id, details.run.outputRevision ?? details.output?.revision);
-          overlay?.setDetails({ ...details, run: { ...details.run, changedOutput: false } });
-        } catch (error) {
-          overlay?.setMessage(error instanceof Error ? error.message : String(error));
-        }
-      };
-      let overlayRefreshing = false;
-      let overlayRefreshQueued = false;
-      const refresh = async (nextScope = currentScope) => {
-        currentScope = nextScope;
-        if (overlayRefreshing) { overlayRefreshQueued = true; return; }
-        overlayRefreshing = true;
-        try {
-          overlay?.setState(await this.#loadScope(currentScope, overlayProjector));
-          const id = overlay?.selection.selectedId;
-          if (id) await inspect(id);
-        } catch (error) {
-          overlay?.setMessage(error instanceof Error ? error.message : String(error));
-        } finally {
-          overlayRefreshing = false;
-          if (overlayRefreshQueued) { overlayRefreshQueued = false; void refresh(); }
-        }
-      };
-      const perform = async (action: OverlayAction) => {
-        try {
-          if (action.type === "send") await actions.send(action.id);
-          else if (action.type === "interrupt") await actions.interrupt(action.id);
-          else if (action.type === "stop") await actions.stop(action.id, action.force);
-          else if (action.type === "cleanup") await actions.cleanup(action.id);
-          await refresh();
-        } catch (error) {
-          context.ui.notify(error instanceof Error ? error.message : String(error), "error");
-          await refresh();
+      let refreshing = false;
+      let queued = false;
+      const refresh = async () => {
+        if (refreshing) { queued = true; return; }
+        refreshing = true;
+        try { overlay?.setState(await this.#loadCurrent(overlayProjector)); }
+        catch (error) { overlay?.setMessage(error instanceof Error ? error.message : String(error)); }
+        finally {
+          refreshing = false;
+          if (queued) { queued = false; void refresh(); }
         }
       };
       const onAction = (action: OverlayAction) => {
         if (action.type === "close") close({ type: "close" });
         else if (action.type === "focus") close({ type: "focus", id: action.id });
-        else if (action.type === "refresh") void refresh();
-        else if (action.type === "scope") void refresh(action.scope);
-        else if (action.type === "inspect") void inspect(action.id);
-        else void perform(action);
+        else if (action.type === "stop") close({ type: "stop", id: action.id });
+        else void refresh();
       };
       overlay = new SubagentsOverlay(initial, theme, onAction, () => tui.requestRender());
       this.#overlayRefresh = () => { void refresh(); };
-      const id = overlay.selection.selectedId;
-      if (id) void inspect(id);
       return overlay;
     }, {
       overlay: true,
@@ -162,29 +125,26 @@ export class HerdrSubagentsUiSession {
     this.#overlayRefresh = undefined;
     this.#overlayOpen = false;
     this.#scheduleTimer();
-    if (result.type === "focus") {
-      // ctx.ui.custom has resolved and disposed the overlay before this mutation.
-      await actions.focusAfterOverlayClosed(result.id);
-      this.requestRefresh();
-    }
+    if (result.type === "focus") await actions.focusAfterOverlayClosed(result.id);
+    else if (result.type === "stop") await actions.stopAfterOverlayClosed(result.id);
+    this.requestRefresh();
   }
 
-  async #loadScope(scope: DashboardScope, projector = this.#mainProjector): Promise<DashboardState> {
-    const result = this.runtime.listUi ? await this.runtime.listUi({ scope }) : await this.runtime.list({ scope });
-    return projector.project(scope, result);
+  async #loadCurrent(projector = this.#mainProjector): Promise<DashboardState> {
+    return projector.project(await this.runtime.list({ scope: "current_session" }));
   }
 
   async #refreshMain(generation: number): Promise<void> {
     if (!this.#context || generation !== this.#generation || this.#refreshing) return;
     const operation = (async () => {
       try {
-        const state = await this.#loadScope("current_session");
+        const state = await this.#loadCurrent();
         if (!this.#context || generation !== this.#generation) return;
         this.#state = state;
         this.#renderPersistentUi(this.#context);
       } catch (error) {
         if (this.#context && generation === this.#generation) {
-          this.#state = this.#mainProjector.project("current_session", { ok: false, status: "unavailable", reason: error instanceof Error ? error.message : String(error) });
+          this.#state = this.#mainProjector.project({ ok: false, status: "unavailable", reason: error instanceof Error ? error.message : String(error) });
           this.#renderPersistentUi(this.#context);
         }
       } finally {
@@ -219,9 +179,7 @@ export class HerdrSubagentsUiSession {
         return new SubagentsWidget(() => this.#state, theme);
       }, { placement: "aboveEditor" });
       this.#widgetInstalled = true;
-    } else {
-      this.#widgetRequestRender?.();
-    }
+    } else this.#widgetRequestRender?.();
   }
 
   #scheduleTimer(): void {
@@ -242,7 +200,7 @@ export class HerdrSubagentsUiSession {
 export function registerHerdrSubagentsUi(pi: ExtensionAPI, runtime: HerdrToolRuntimeController): HerdrSubagentsUiSession {
   const session = new HerdrSubagentsUiSession(runtime);
   pi.registerCommand("subagents", {
-    description: "Inspect subagents in a safe TUI overlay (current, all-owned, or global observational scope)",
+    description: "Focus or gracefully stop a current-session owned subagent",
     handler: (args, context) => session.command(args, context),
   });
   pi.registerCommand("subagents-doctor", {
@@ -269,7 +227,6 @@ export function registerHerdrSubagentsUi(pi: ExtensionAPI, runtime: HerdrToolRun
 }
 
 export * from "./actions.ts";
-export * from "./details.ts";
 export * from "./overlay.ts";
 export * from "./status.ts";
 export * from "./theme.ts";

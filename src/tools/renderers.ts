@@ -39,7 +39,10 @@ export function renderToolResult(result: unknown, expanded: boolean, theme: Them
   }
   const run = value.run as RunSummary | undefined;
   const runs = value.runs as readonly RunSummary[] | undefined;
-  let text = run ? runLine(run, theme) : runs ? theme.fg("accent", `${runs.length} subagent${runs.length === 1 ? "" : "s"}`) : theme.fg("success", "✓ Subagent operation complete");
+  const completion = value.completion as { pending?: boolean } | undefined;
+  let text = run && completion?.pending === true
+    ? `${theme.fg("accent", "●")} ${theme.fg("accent", run.id)} ${theme.fg("muted", `${run.profile}/${run.harness}`)} ${theme.fg("warning", "started · result pending · call subagent_status")}`
+    : run ? runLine(run, theme) : runs ? theme.fg("accent", `${runs.length} subagent${runs.length === 1 ? "" : "s"}`) : theme.fg("success", "✓ Subagent operation complete");
   if (expanded) {
     const details = run ? {
       ownership: run.ownership,

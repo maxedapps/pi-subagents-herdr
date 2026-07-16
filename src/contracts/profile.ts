@@ -34,8 +34,6 @@ export interface AgentProfile {
   readonly permissions?: ProfilePermission;
   readonly tools?: readonly string[];
   readonly preferredTools?: readonly string[];
-  readonly skills?: readonly string[];
-  readonly preferredSkills?: readonly string[];
   readonly context?: ProfileContextSettings;
   readonly timeout?: number;
   readonly worktree?: ProfileWorktreePolicy;

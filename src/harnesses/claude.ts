@@ -47,9 +47,6 @@ function assertClaudePolicy(input: AdapterCheckInput, tools: readonly string[]):
   if (network && !input.policy.permissions.network) {
     throw new HarnessConfigurationError("Claude network-disabled policy contradicts a network-capable Bash/Web tool");
   }
-  if ((input.reviewedSkillPaths?.length ?? 0) !== 0 || (input.profile.skills?.length ?? 0) !== 0 || (input.profile.preferredSkills?.length ?? 0) !== 0) {
-    throw new HarnessConfigurationError("Claude profile skills/preferredSkills are not loaded by this adapter; use a Claude-native reviewed policy instead");
-  }
 }
 
 export class ClaudeHarnessAdapter implements HarnessAdapter {

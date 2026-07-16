@@ -19,6 +19,12 @@ npm run smoke:load
 
 Herdr CLI commands are for diagnosis, not bypassing extension ownership or lifecycle controls.
 
+## Pi child trust and resources
+
+Pi children receive neither `--approve` nor `--no-approve`, and no skill/prompt-template suppression or explicit-skill flags. Each child process resolves project trust normally. Persisted trust and global settings/resources are available in the ordinary user environment; a transient parent `--approve` or session-only trust decision is not inherited. If a child shows the standard trust prompt, resolve it as an ordinary Pi trust decision before expecting project settings, skills, or templates to load.
+
+The package contributes `use-subagents` only to the parent through dynamic resource discovery. Child mode still contributes no orchestration skill, tools, commands, UI, or lifecycle handlers.
+
 ## Start and monitor
 
 ```text
@@ -51,7 +57,13 @@ Interrupt preserves the session:
 subagent_interrupt({ id: "<id>", timeoutMs: 15000 })
 ```
 
-Unconfirmed interruption is uncertain, not success.
+Mutation delivery reports one of:
+
+- `confirmed`: Herdr acknowledged and the expected state/revision evidence appeared;
+- `unconfirmed`: Herdr acknowledged, but bounded follow-up evidence did not appear;
+- `uncertain`: the mutation may have applied before its response was lost or aborted.
+
+Inspect `unconfirmed`/`uncertain` runs and their output. Never resend uncertain input, repeat interrupt automatically, or destroy the run merely to resolve ambiguity.
 
 ## Parent verification and stop
 
@@ -64,6 +76,12 @@ subagent_stop({ id: "<id>", mode: "graceful", cleanup: "retain" })
 Force mode only permits freshly identity-verified pane termination. It never discards worktree changes or artifacts.
 
 `remove_if_safe` additionally requires a parent review note and objective `no_changes`, `commit_contained`, or `tree_matches` evidence. Removal still refuses unless current ownership agrees, child/unknown panes are gone, the required parent wrapper/handoff is captured and verified, checkout is clean, and exact backend/Git provenance agrees. Optional progress is captured when present but not required. Branches are never deleted.
+
+## Operator dashboard
+
+`/subagents` shows current-session owned runs only. Controls are ↑/↓ selection, Enter focus, `x` graceful stop with artifacts/worktree retained, `r` refresh, and Escape close. The overlay closes before focus or stop. A stop timeout/refusal is reported as not stopped with its reason, never as completion. Use `subagent_status` for detailed output or `all_owned`/`global` observation.
+
+Interrupt cancels only the current turn and keeps the child reusable. Graceful stop ends the child and already interrupts first when necessary, so interrupt is not an ordinary prerequisite for stop. Send, interrupt, force stop, and safe worktree cleanup remain explicit model-facing tool operations rather than dashboard hotkeys.
 
 ## Recovery
 

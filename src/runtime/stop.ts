@@ -93,7 +93,7 @@ export async function stopSubagent(input: {
   const mode = input.mode ?? "graceful";
   const pollIntervalMs = input.pollIntervalMs ?? 50;
   let resolved = await resolveOwnedPaneFresh(input.client, input.target, input.signal);
-  const output = await readBoundedOutput(input.client, input.target, input.signal);
+  let output = await readBoundedOutput(input.client, input.target, input.signal);
   if (resolved.agent.agent_status === "working") {
     const interrupted = await interruptSubagent({
       client: input.client,
@@ -102,7 +102,7 @@ export async function stopSubagent(input: {
       pollIntervalMs,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
-    if (!interrupted.confirmed && mode === "graceful") {
+    if (interrupted.delivery !== "confirmed" && mode === "graceful") {
       return {
         stopped: false,
         forced: false,
@@ -112,7 +112,11 @@ export async function stopSubagent(input: {
         output: interrupted.output,
       };
     }
+    output = interrupted.output;
     resolved = await resolveOwnedPaneFresh(input.client, input.target, input.signal);
+    if (interrupted.delivery === "confirmed") {
+      output = await readBoundedOutput(input.client, input.target, input.signal);
+    }
   }
 
   const adapter = harnessAdapter(input.target.harness);

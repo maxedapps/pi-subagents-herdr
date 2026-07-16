@@ -40,8 +40,9 @@ test("subagent_status dispatches list, inspect, and bounded wait-then-inspect", 
   const summary = { id: "run-1", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "done", ownership: "current_session", live: true, elapsedMs: 1, taskSynopsis: "task" } as const;
   const runtime = {
     async list(input: unknown) { calls.push(`list:${JSON.stringify(input)}`); return { ok: true, scope: "current_session", runs: [summary], counts: { done: 1 } }; },
-    async get(input: unknown) { calls.push(`get:${JSON.stringify(input)}`); return { ok: true, run: summary, effectiveProfile: { description: "x", harness: "pi", thinking: "low", cwd: "/x", tools: [], skills: [] }, ownership: { runNonce: "n", parentSessionId: "p", branchEntryId: "b" }, topology: {}, output: { text: "done" }, artifacts: {}, runtime: { ephemeralFiles: "retained", piSessionData: "retained" }, createdAt: 1, updatedAt: 2 }; },
+    async get(input: unknown) { calls.push(`get:${JSON.stringify(input)}`); return { ok: true, run: summary, effectiveProfile: { description: "x", harness: "pi", thinking: "low", cwd: "/x", tools: [] }, ownership: { runNonce: "n", parentSessionId: "p", branchEntryId: "b" }, topology: {}, output: { text: "done" }, artifacts: {}, runtime: { ephemeralFiles: "retained", piSessionData: "retained" }, createdAt: 1, updatedAt: 2 }; },
     async wait(input: unknown) { calls.push(`wait:${JSON.stringify(input)}`); return { ok: true, action: "wait", run: summary, result: { matched: true, state: "done" } }; },
+    recordModelResultInspection(id: string, state: string) { calls.push(`inspect:${id}:${state}`); },
   };
   const pi = { registerTool(value: typeof definition) { definition = value; } } as unknown as ExtensionAPI;
   registerStatusTool(pi, runtime as never, "subagent_status");
@@ -51,8 +52,10 @@ test("subagent_status dispatches list, inspect, and bounded wait-then-inspect", 
   assert.deepEqual(calls, [
     "list:{\"scope\":\"current_session\"}",
     "get:{\"id\":\"run-1\",\"lines\":20}",
+    "inspect:run-1:done",
     "wait:{\"id\":\"run-1\",\"states\":[\"done\"],\"timeoutMs\":100}",
     "get:{\"id\":\"run-1\",\"lines\":40}",
+    "inspect:run-1:done",
   ]);
   assert.equal(waited.details.observation.mode, "wait");
   assert.equal(waited.details.output.text, "done");
@@ -72,6 +75,18 @@ test("LLM-facing serialized results remain below the tool output convention", ()
   assert.ok(Buffer.byteLength(result, "utf8") < 50 * 1024);
   assert.match(result, /truncated/);
   assert.equal(result.includes("�"), false);
+});
+
+test("successful start renderer shows result pending instead of an unqualified completion check", () => {
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+  const component = renderToolResult({
+    ok: true,
+    status: "started",
+    run: { id: "run-1", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "working", ownership: "current_session", live: true, elapsedMs: 5, taskSynopsis: "Map auth" },
+    completion: { pending: true, requiredTool: "subagent_status", suggestedInput: { id: "run-1", states: ["done", "idle", "blocked"], timeoutMs: 900_000 } },
+  }, false, theme);
+  assert.match(component.render(120).join("\n"), /started · result pending · call subagent_status/);
+  assert.doesNotMatch(component.render(120).join("\n"), /✓/);
 });
 
 test("compact renderer preserves semantic status text and bounded expanded metadata", () => {

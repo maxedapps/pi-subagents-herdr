@@ -1,0 +1,36 @@
+{
+  "source": {
+    "herdr_version": "0.7.4",
+    "commit": "50aaa2ec046ee26ff407c20f49de496f522512a8",
+    "note": "Method-to-success-result associations audited against tagged Herdr handlers; generated JSON Schemas expose methods and result variants independently."
+  },
+  "associations": {
+    "ping": "pong",
+    "session.snapshot": "session_snapshot",
+    "workspace.get": "workspace_info",
+    "workspace.list": "workspace_list",
+    "tab.create": "tab_created",
+    "tab.get": "tab_info",
+    "tab.list": "tab_list",
+    "tab.close": "ok",
+    "pane.current": "pane_current",
+    "pane.get": "pane_info",
+    "pane.list": "pane_list",
+    "pane.layout": "pane_layout",
+    "pane.process_info": "pane_process_info",
+    "pane.send_input": "ok",
+    "pane.send_keys": "ok",
+    "pane.close": "ok",
+    "agent.start": "agent_started",
+    "agent.get": "agent_info",
+    "agent.list": "agent_list",
+    "agent.read": "pane_read",
+    "agent.focus": "agent_info",
+    "events.subscribe": "subscription_started",
+    "events.wait": "wait_matched",
+    "worktree.list": "worktree_list",
+    "worktree.create": "worktree_created",
+    "worktree.open": "worktree_opened",
+    "worktree.remove": "worktree_removed"
+  }
+}

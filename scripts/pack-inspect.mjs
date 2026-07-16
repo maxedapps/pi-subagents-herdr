@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,7 +27,6 @@ const required = [
   "package/src/policy/capabilities.ts",
   "package/src/profiles/discovery.ts",
   "package/src/profiles/parser.ts",
-  "package/src/profiles/skills.ts",
   "package/src/artifacts/store.ts",
   "package/src/tools/index.ts",
   "package/src/tools/service.ts",
@@ -108,24 +107,27 @@ const lifecyclePath = join(packageRoot, "src", "lifecycle", "extension.ts");
 const contractsPath = join(packageRoot, "src", "contracts", "index.ts");
 const policyPath = join(packageRoot, "src", "policy", "capabilities.ts");
 const profilesPath = join(packageRoot, "src", "profiles", "parser.ts");
-const profileSkillsPath = join(packageRoot, "src", "profiles", "skills.ts");
 const artifactsPath = join(packageRoot, "src", "artifacts", "index.ts");
 const worktreesPath = join(packageRoot, "src", "worktrees", "index.ts");
 const entry = await import(pathToFileURL(entryPath).href);
 const packagePaths = await import(pathToFileURL(packagePathsPath).href);
 const lifecycle = await import(pathToFileURL(lifecyclePath).href);
 const profiles = await import(pathToFileURL(profilesPath).href);
-const profileSkills = await import(pathToFileURL(profileSkillsPath).href);
 await import(pathToFileURL(contractsPath).href);
 await import(pathToFileURL(policyPath).href);
 await import(pathToFileURL(artifactsPath).href);
 await import(pathToFileURL(worktreesPath).href);
 const registrations = [];
+const handlers = new Map();
 const tools = [];
 const commands = [];
-entry.default({ on(event) { registrations.push(event); }, registerTool(tool) { tools.push(tool.name); }, registerCommand(name) { commands.push(name); }, getAllTools() { return []; } });
-if (registrations.join(",") !== "session_start,session_shutdown") {
+entry.default({ on(event, handler) { registrations.push(event); handlers.set(event, handler); }, registerTool(tool) { tools.push(tool.name); }, registerCommand(name) { commands.push(name); }, getAllTools() { return []; } });
+if (registrations.join(",") !== "resources_discover,session_start,agent_settled,session_shutdown") {
   throw new Error(\`Unexpected packed-extension registrations: \${registrations.join(",")}\`);
+}
+const discovered = handlers.get("resources_discover")?.({});
+if (discovered?.skillPaths?.length !== 1 || realpathSync(discovered.skillPaths[0]) !== realpathSync(packagePaths.PACKAGE_ASSETS.skill)) {
+  throw new Error("Packed parent resource handler did not expose the exact archive skill");
 }
 if (tools.join(",") !== "subagent_start,subagent_status,subagent_send,subagent_interrupt,subagent_stop") {
   throw new Error(\`Unexpected packed-extension tools: \${tools.join(",")}\`);
@@ -144,12 +146,6 @@ for (const name of ["scout", "researcher", "worker"]) {
   const parsed = profiles.parseProfile(source, { path: profilePath, scope: "bundled", namespace: "shared", priority: 0 });
   if (parsed.name !== name || parsed.model !== undefined) throw new Error("Packed bundled profile contract failed: " + name);
 }
-const packedSkillResolution = await profileSkills.resolveProfileSkills(
-  { name: "packed-skill-check", description: "packed skill check", body: "check", harness: "pi", skills: ["use-subagents"], source: { path: "<packed-check>", scope: "bundled", namespace: "shared", priority: 0 } },
-  "pi",
-  { cwd: packageRoot, agentDir: packageRoot, projectTrusted: false, prohibitedNames: [], commands: [{ name: "skill:use-subagents", source: "skill", sourceInfo: { path: packagePaths.PACKAGE_ASSETS.skill, source: "packed-check", scope: "user", origin: "package", baseDir: join(packageRoot, "skills", "use-subagents") } }] },
-);
-if (packedSkillResolution.paths.length !== 1 || packedSkillResolution.paths[0] !== packagePaths.PACKAGE_ASSETS.skill) throw new Error("Packed skill resolver did not retain the canonical archive path");
 const childRegistrations = [];
 const child = lifecycle.registerHerdrSubagentsExtension(
   { on(event) { childRegistrations.push(event); } },
@@ -183,6 +179,9 @@ process.stdout.write("packed-isolated-load ok: extension import closure + contra
   mkdirSync(isolatedAgentDir, { recursive: true });
   mkdirSync(isolatedHome, { recursive: true });
   writeFileSync(join(isolatedAgentDir, "settings.json"), `${JSON.stringify({ packages: [installedPackage], enableSkillCommands: true }, null, 2)}\n`);
+  const fixtureSkill = join(isolatedAgentDir, "skills", "ordinary-fixture", "SKILL.md");
+  mkdirSync(dirname(fixtureSkill), { recursive: true });
+  writeFileSync(fixtureSkill, "---\nname: ordinary-fixture\ndescription: Ordinary child discovery fixture\n---\nUse this fixture only to prove normal skill discovery.\n");
   const environment = {
     ...process.env,
     HOME: isolatedHome,
@@ -212,7 +211,7 @@ process.stdout.write("packed-isolated-load ok: extension import closure + contra
   const rpc = (extraEnvironment, extraArgs = []) => {
     const output = execFileSync(
       "pi",
-      ["--mode", "rpc", "--no-session", "--no-builtin-tools", "--no-context-files", "--no-prompt-templates", ...extraArgs],
+      ["--mode", "rpc", "--no-session", "--no-builtin-tools", "--no-context-files", ...extraArgs],
       { cwd: temporaryRoot, env: { ...environment, ...extraEnvironment }, input: '{"id":"commands","type":"get_commands"}\n', encoding: "utf8", timeout: 20_000, stdio: ["pipe", "pipe", "pipe"] },
     );
     const response = output.trim().split("\n").map((line) => JSON.parse(line)).find((item) => item.id === "commands");
@@ -226,11 +225,12 @@ process.stdout.write("packed-isolated-load ok: extension import closure + contra
   const packageCommands = parentCommands.filter((command) => ["subagents", "subagents-doctor", "skill:use-subagents"].includes(command.name));
   for (const command of packageCommands) {
     const sourcePath = command.sourceInfo?.path ?? command.path;
-    if (typeof sourcePath !== "string" || !resolve(sourcePath).startsWith(`${resolve(installedPackage)}${sep}`)) throw new Error(`Pi loaded ${command.name} outside the exact archive install: ${String(sourcePath)}`);
+    if (typeof sourcePath !== "string" || !realpathSync(sourcePath).startsWith(`${realpathSync(installedPackage)}${sep}`)) throw new Error(`Pi loaded ${command.name} outside the exact archive install: ${String(sourcePath)}`);
   }
-  const childCommands = rpc({ PI_HERDR_SUBAGENT: "1" }, ["--no-skills"]);
+  const childCommands = rpc({ PI_HERDR_SUBAGENT: "1" });
   if (childCommands.some((command) => command.name === "subagents" || command.name === "subagents-doctor" || command.name === "skill:use-subagents")) throw new Error("Actual isolated Pi child-mode load exposed parent orchestration resources");
-  isolatedLoadOutput += "; actual Pi RPC loaded extension+doctor+skill from exact archive and child guard hid them";
+  if (!childCommands.some((command) => command.name === "skill:ordinary-fixture")) throw new Error("Actual isolated Pi child-mode load failed to discover an ordinary fixture skill");
+  isolatedLoadOutput += "; actual Pi RPC loaded parent extension+doctor+skill from the exact archive, child mode hid parent resources, and child normal discovery loaded ordinary-fixture";
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });
 }

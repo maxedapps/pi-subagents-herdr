@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { HerdrRequestClient } from "../../src/herdr/client.ts";
 import type { SessionSnapshot } from "../../src/herdr/protocol.ts";
-import { focusOwnedPaneFresh, revalidateRecordedOwnershipFresh, RuntimeIdentityError, type OwnedRunTarget } from "../../src/runtime/control.ts";
+import { FocusOutcomeUncertainError, focusOwnedPaneFresh, revalidateRecordedOwnershipFresh, RuntimeIdentityError, type OwnedRunTarget } from "../../src/runtime/control.ts";
 import { sendToSubagent } from "../../src/runtime/send.ts";
 
 function snapshot(status: "done" | "idle" = "done", paneId = "moved:p9"): SessionSnapshot {
@@ -22,18 +22,46 @@ function target(verify: OwnedRunTarget["authorization"]["verify"]): OwnedRunTarg
   };
 }
 
-test("focus accepts a moved pane only by stable terminal/native identity and targets terminal id", async () => {
-  const snapshots = [snapshot("done", "moved:p9"), snapshot("idle", "moved:p9")];
+test("focus validates returned post-focus identity/state without a redundant normal-path snapshot", async () => {
+  const snapshots = [snapshot("done", "moved:p9")];
   const focused: string[] = [];
   const client = {
     snapshot: async () => snapshots.shift()!,
-    focusAgent: async (id: string) => { focused.push(id); },
+    focusAgent: async (id: string) => { focused.push(id); return snapshot("idle", "moved:p9").agents[0]!; },
   } as unknown as HerdrRequestClient;
   const result = await focusOwnedPaneFresh(client, target(() => true));
   assert.equal(result.before.pane.pane_id, "moved:p9");
   assert.equal(result.before.agent.agent_status, "done");
-  assert.equal(result.after?.agent_status, "idle");
+  assert.equal(result.after.agent_status, "idle");
+  assert.equal(result.reconciled, false);
   assert.deepEqual(focused, ["term-owned"]);
+  assert.equal(snapshots.length, 0);
+});
+
+test("lost focus response performs one fresh reconciliation without retrying focus", async () => {
+  const snapshots = [snapshot("done", "moved:p9"), snapshot("idle", "moved:p9")];
+  let focusCalls = 0;
+  const client = {
+    snapshot: async () => snapshots.shift()!,
+    focusAgent: async () => { focusCalls += 1; throw new Error("response lost"); },
+  } as unknown as HerdrRequestClient;
+  const result = await focusOwnedPaneFresh(client, target(() => true));
+  assert.equal(result.reconciled, true);
+  assert.equal(result.after.focused, true);
+  assert.equal(focusCalls, 1);
+  assert.equal(snapshots.length, 0);
+});
+
+test("unreconciled focus response loss reports uncertainty without retry", async () => {
+  const snapshots = [snapshot("done", "moved:p9"), snapshot("done", "moved:p9")];
+  let focusCalls = 0;
+  const client = {
+    snapshot: async () => snapshots.shift()!,
+    focusAgent: async () => { focusCalls += 1; throw new Error("response lost"); },
+  } as unknown as HerdrRequestClient;
+  await assert.rejects(focusOwnedPaneFresh(client, target(() => true)), FocusOutcomeUncertainError);
+  assert.equal(focusCalls, 1);
+  assert.equal(snapshots.length, 0);
 });
 
 test("focus rejects stale active-branch authorization before mutating Herdr", async () => {
@@ -56,7 +84,7 @@ test("send re-resolves a moved pane immediately before input", async () => {
     sendInput: async (paneId: string) => { sent.push(paneId); },
   } as unknown as HerdrRequestClient;
   const result = await sendToSubagent({ client, target: target(() => true), message: "continue", timeoutMs: 50, pollIntervalMs: 1 });
-  assert.equal(result.confirmed, true);
+  assert.equal(result.delivery, "confirmed");
   assert.deepEqual(sent, ["moved:p9"]);
 });
 

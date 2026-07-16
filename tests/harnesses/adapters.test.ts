@@ -55,15 +55,10 @@ function context(input: {
   integrationPolicy?: "integrated" | "safe-mode";
   writableRoots?: readonly string[];
   model?: string;
-  profileSkills?: readonly string[];
-  profilePreferredSkills?: readonly string[];
-  reviewedSkillPaths?: readonly string[];
 }): LaunchContext {
   const profile: AgentProfile = {
     name: "test-profile", description: "test", body: "Do only the bounded task.", harness: input.harness,
     permissions: input.mutation ? "write" : "read-only",
-    ...(input.profileSkills === undefined ? {} : { skills: input.profileSkills }),
-    ...(input.profilePreferredSkills === undefined ? {} : { preferredSkills: input.profilePreferredSkills }),
     source: { path: "/fixture/profile.md", scope: "bundled", namespace: "shared", priority: 0 },
   };
   const policy: EffectiveLaunchPolicy = {
@@ -84,7 +79,6 @@ function context(input: {
     sessionName: "run-test",
     ...(input.harness === "pi" ? { sessionDirectory: input.fixture.sessions } : {}),
     systemPromptPath: input.fixture.system,
-    ...(input.reviewedSkillPaths === undefined ? {} : { reviewedSkillPaths: input.reviewedSkillPaths }),
     ...(input.integrationPolicy === undefined ? {} : { integrationPolicy: input.integrationPolicy }),
     ...(input.writableRoots === undefined ? {} : { writableRoots: input.writableRoots }),
     metadata: { runId: "run-test", runNonce: "nonce-test", profileName: "test-profile", parentSessionId: "parent-session" },
@@ -114,7 +108,7 @@ test("Pi adapter builds exact prompt-free argv/env and fake CLI observes child g
     assert.deepEqual(prepared.launch.argv, [
       cli.executable, "--session-id", "550e8400-e29b-41d4-a716-446655440000",
       "--session-dir", fx.sessions, "--name", "run-test", "--thinking", "medium",
-      "--append-system-prompt", fx.system, "--no-skills", "--no-prompt-templates", "--no-approve",
+      "--append-system-prompt", fx.system,
       "--model", "anthropic/sonnet", "--tools", "read,grep", "--no-context-files",
     ]);
     assert.equal(prepared.launch.argv.includes("TOP SECRET TASK"), false);
@@ -207,14 +201,6 @@ test("adapters reject contradictions, unsupported mappings, dangerous values, an
     await assert.rejects(
       prepareHarnessLaunch(context({ harness: "codex", fixture: fx, executable: cli.executable, model: "--dangerously-bypass-approvals-and-sandbox" })),
       HarnessConfigurationError,
-    );
-    await assert.rejects(
-      prepareHarnessLaunch(context({ harness: "claude", fixture: fx, executable: cli.executable, profilePreferredSkills: ["web-research"] })),
-      /skills\/preferredSkills are not loaded/,
-    );
-    await assert.rejects(
-      prepareHarnessLaunch(context({ harness: "codex", fixture: fx, executable: cli.executable, profilePreferredSkills: ["web-research"] })),
-      /skills\/preferredSkills are not loaded/,
     );
     const mismatch = context({ harness: "pi", fixture: fx, executable: cli.executable });
     await assert.rejects(prepareHarnessLaunch({ ...mismatch, profile: { ...mismatch.profile, harness: "claude" } }), /No cross-harness fallback/);

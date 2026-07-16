@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { JsonValue } from "../../src/contracts/protocol.ts";
 import { HerdrToolRuntimeController } from "../../src/tools/service.ts";
 import { startFakeHerdrServer, type FakeHerdrRequest } from "../support/fake-herdr-server.ts";
@@ -14,7 +14,7 @@ const parentNative = { source: "herdr:pi", agent: "pi", kind: "id" as const, val
 const childNative = { source: "herdr:pi", agent: "pi", kind: "id" as const, value: "550e8400-e29b-41d4-a716-446655440001" };
 const execFileAsync = promisify(execFile);
 
-function fixtureApi(commands: readonly SlashCommandInfo[] = []) {
+function fixtureApi() {
   const branch: Array<Record<string, unknown>> = [{ type: "message", id: "entry-0", parentId: null }];
   let entry = 0;
   const tools = ["read", "grep", "find", "ls", "bash", "edit", "write"].map((name) => ({ name, description: name, parameters: {}, promptGuidelines: [], sourceInfo: { path: `<builtin:${name}>`, source: "builtin", scope: "temporary", origin: "top-level" } }));
@@ -24,7 +24,6 @@ function fixtureApi(commands: readonly SlashCommandInfo[] = []) {
       branch.push({ type: "custom", id: `custom-${++entry}`, parentId: previous.id, customType, data });
     },
     getAllTools() { return tools; },
-    getCommands() { return commands; },
   } as unknown as ExtensionAPI;
   const context = (cwd: string) => ({
     cwd, mode: "tui", hasUI: true,
@@ -44,7 +43,7 @@ function reply(request: FakeHerdrRequest, result: JsonValue): JsonValue {
   return { id: request.id ?? "", result };
 }
 
-test("real tool runtime handles protected starts, explicit skills, bounded slots, and start → stop → start through the typed Herdr client", async () => {
+test("real tool runtime handles protected starts, normal Pi resources, bounded slots, and start → stop → start through the typed Herdr client", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "p6-runtime-flow-")));
   await execFileAsync("git", ["-C", root, "init", "-q"]);
   await mkdir(join(root, ".pi", "agents"), { recursive: true });
@@ -53,16 +52,6 @@ test("real tool runtime handles protected starts, explicit skills, bounded slots
   await writeFile(join(root, ".progress", "existing.md"), "pre-existing untracked progress\n");
   await writeFile(join(root, ".pi", "herdr-subagents", "settings.json"), `${JSON.stringify({ concurrency: { maxRunning: 1, maxWriters: 1 } }, null, 2)}\n`);
   await writeFile(join(root, ".pi", "agents", "progress-scout.md"), `---\nname: progress-scout\ndescription: progress protection fixture\nharness: pi\npermissions: read-only\ntools: [read]\nartifacts:\n  progress: .progress/{id}.md\n---\nInspect only; do not delegate.\n`);
-  await writeFile(join(root, ".pi", "agents", "skilled-scout.md"), `---\nname: skilled-scout\ndescription: reviewed skill fixture\nharness: pi\npermissions: read-only\ntools: [read]\nskills: [required-fixture]\npreferredSkills: [preferred-fixture, missing-fixture]\n---\nUse only the explicitly exposed reviewed skills.\n`);
-  await writeFile(join(root, ".pi", "agents", "missing-skill-scout.md"), `---\nname: missing-skill-scout\ndescription: missing required skill fixture\nharness: pi\npermissions: read-only\ntools: [read]\nskills: [not-installed]\n---\nThis launch must be rejected before topology.\n`);
-  const requiredSkill = join(root, ".pi", "skills", "required-fixture", "SKILL.md");
-  const preferredSkill = join(root, ".pi", "skills", "preferred-fixture", "SKILL.md");
-  await mkdir(join(root, ".pi", "skills", "required-fixture"), { recursive: true });
-  await mkdir(join(root, ".pi", "skills", "preferred-fixture"), { recursive: true });
-  await writeFile(requiredSkill, "---\nname: required-fixture\ndescription: required fixture\n---\nUse the required fixture.\n");
-  await writeFile(preferredSkill, "---\nname: preferred-fixture\ndescription: preferred fixture\n---\nUse the preferred fixture.\n");
-  const canonicalRequired = await realpath(requiredSkill);
-  const canonicalPreferred = await realpath(preferredSkill);
   let groupLive = false;
   let childLive = false;
   let childStatus: "idle" | "working" | "done" | "blocked" = "idle";
@@ -118,8 +107,7 @@ test("real tool runtime handles protected starts, explicit skills, bounded slots
       default: throw new Error(`Unexpected method ${String(request.method)}`);
     }
   });
-  const skillCommand = (name: string, path: string): SlashCommandInfo => ({ name: `skill:${name}`, description: name, source: "skill", sourceInfo: { path, source: "local", scope: "project", origin: "top-level", baseDir: join(path, "..") } });
-  const fake = fixtureApi([skillCommand("required-fixture", canonicalRequired), skillCommand("preferred-fixture", canonicalPreferred)]);
+  const fake = fixtureApi();
   const environment = { HERDR_ENV: "1", HERDR_SOCKET_PATH: server.socketPath, HERDR_PANE_ID: "w1:p1", HERDR_TAB_ID: "w1:t1", HERDR_WORKSPACE_ID: "w1" };
   let runtime = new HerdrToolRuntimeController(fake.api, { environment });
   try {
@@ -130,10 +118,6 @@ test("real tool runtime handles protected starts, explicit skills, bounded slots
     assert.equal(research.ok, false);
     if (!research.ok) assert.equal(research.status, "blocked");
     await assert.rejects(
-      runtime.start("tool-required-skill-missing", { profile: "missing-skill-scout", task: "Do not launch" }),
-      /Required Pi profile skill is unavailable.*not-installed/,
-    );
-    await assert.rejects(
       runtime.start("tool-progress-unprotected", { profile: "progress-scout", task: "Write progress safely" }),
       /Git-ignore protection is incomplete.*progress-ignore-confirmation-required/,
     );
@@ -142,36 +126,37 @@ test("real tool runtime handles protected starts, explicit skills, bounded slots
 
     const fullAssignment = `Map every public package export to its defining source and explain any conditional export behavior.\n\n${"Preserve this detailed delegated assignment across runtime reload. ".repeat(8)}`;
     assert.equal(fullAssignment.length > 240, true);
-    const started = await runtime.start("tool-start-1", { profile: "skilled-scout", task: fullAssignment });
+    const started = await runtime.start("tool-start-1", { profile: "scout", task: fullAssignment });
     assert.equal(started.ok, true);
     if (!started.ok) return;
     assert.equal(started.status, "started");
     assert.equal(started.run.ownership, "current_session");
     assert.equal(started.effective.harness, "pi");
     assert.equal(started.effective.isolatedWorktree, false);
-    assert.deepEqual(started.effective.skills, ["required-fixture", "preferred-fixture"]);
-    assert.equal(started.effective.skillDiagnostics.some((message) => message.includes("missing-fixture")), true);
+    assert.deepEqual(started.completion, {
+      pending: true,
+      requiredTool: "subagent_status",
+      suggestedInput: { id: started.run.id, states: ["done", "idle", "blocked"], timeoutMs: 900_000 },
+    });
     const launchRequest = server.requests.find((request) => request.method === "agent.start")!;
     const launchArgv = (launchRequest.params as { argv: string[] }).argv;
-    assert.equal(launchArgv.includes("--no-skills"), true);
-    assert.deepEqual(launchArgv.flatMap((value, index) => value === "--skill" ? [launchArgv[index + 1]!] : []), [canonicalRequired, canonicalPreferred]);
+    for (const removed of ["--approve", "--no-approve", "--no-skills", "--skill", "--no-prompt-templates"]) {
+      assert.equal(launchArgv.includes(removed), false);
+    }
 
     const listed = await runtime.list({});
     assert.equal(listed.ok, true);
     if (listed.ok) assert.deepEqual(listed.runs.map((run) => run.id), [started.run.id]);
-    const uiListed = await runtime.listUi({});
-    assert.equal(uiListed.ok, true);
-    if (uiListed.ok) assert.equal(uiListed.runs[0]?.outputRevision, outputRevision);
     const inspected = await runtime.get({ id: started.run.id, lines: 20 });
     assert.equal(inspected.ok, true);
     if (inspected.ok) {
       assert.equal(inspected.output.returnedLines <= 20, true); assert.equal("systemPrompt" in inspected, false);
       assert.deepEqual(Object.keys(inspected.artifacts).sort(), ["handoff", "metadata"]);
       assert.deepEqual(inspected.runtime, { ephemeralFiles: "retained", piSessionData: "retained" });
-      const metadata = JSON.parse(await readFile(inspected.artifacts.metadata!, "utf8")) as { runId: string; runNonce: string; terminalId: string; assignment: string; nativeSession?: { value: string }; policy: { skills: Array<{ name: string; path: string }> }; artifacts: Record<string, string>; runtime: { ephemeralFiles: string; directory: string; systemPrompt: string; sessionDirectory: string } };
+      const metadata = JSON.parse(await readFile(inspected.artifacts.metadata!, "utf8")) as { runId: string; runNonce: string; terminalId: string; assignment: string; nativeSession?: { value: string }; policy: Record<string, unknown>; artifacts: Record<string, string>; runtime: { ephemeralFiles: string; directory: string; systemPrompt: string; sessionDirectory: string } };
       assert.deepEqual({ runId: metadata.runId, terminalId: metadata.terminalId, native: metadata.nativeSession?.value }, { runId: started.run.id, terminalId: "term-child", native: childNative.value });
       assert.equal(metadata.assignment, fullAssignment);
-      assert.deepEqual(metadata.policy.skills, [{ name: "required-fixture", path: canonicalRequired }, { name: "preferred-fixture", path: canonicalPreferred }]);
+      assert.equal("skills" in metadata.policy, false);
       assert.deepEqual(Object.keys(metadata.artifacts).sort(), ["handoff", "metadata"]);
       assert.equal(metadata.runtime.ephemeralFiles, "retained");
       assert.equal((await lstat(metadata.runtime.systemPrompt)).isFile(), true);
@@ -181,6 +166,9 @@ test("real tool runtime handles protected starts, explicit skills, bounded slots
     childStatus = "blocked"; childRevision += 1; outputRevision += 1; output += "\nneeds clarification";
     const blocked = await runtime.wait({ id: started.run.id, states: ["blocked"], timeoutMs: 2_000 });
     assert.equal(blocked.ok, true);
+    runtime.recordModelResultInspection(started.run.id, "blocked");
+    assert.deepEqual(runtime.claimResultInspectionReminders().map((item) => ({ id: item.id, generation: item.generation })), [{ id: started.run.id, generation: 1 }], "list/UI/direct get and blocked status must not consume the model result obligation");
+    assert.deepEqual(runtime.claimResultInspectionReminders(), [], "one reminder is claimed at most once per generation");
     const sent = await runtime.send({ id: started.run.id, message: "Limit the map to exported symbols", timeoutMs: 2_000 });
     assert.equal(sent.ok, true);
     if (sent.ok) assert.equal((sent.result as { state: string }).state, "working");
@@ -190,6 +178,8 @@ test("real tool runtime handles protected starts, explicit skills, bounded slots
     childStatus = "done"; childRevision += 1; outputRevision += 1; output += "\ncompleted";
     const waited = await runtime.wait({ id: started.run.id, states: ["done"], timeoutMs: 2_000 });
     assert.equal(waited.ok, true);
+    runtime.recordModelResultInspection(started.run.id, "done");
+    assert.deepEqual(runtime.claimResultInspectionReminders(), [], "terminal ID-specific inspection consumes the latest send generation");
     if (waited.ok) assert.equal((waited.result as { state: string }).state, "done");
     const repeatedWait = await runtime.wait({ id: started.run.id, states: ["done"], timeoutMs: 2_000 });
     assert.equal(repeatedWait.ok, true);
@@ -282,6 +272,7 @@ test("real tool runtime handles protected starts, explicit skills, bounded slots
       childStatus = "done"; childRevision += 1;
       const sequentialStop = await runtime.stop({ id: sequential.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 });
       assert.equal(sequentialStop.ok, true);
+      assert.deepEqual(runtime.claimResultInspectionReminders(), [], "proven stop clears the live result obligation");
       if (sequentialStop.ok) assert.equal((sequentialStop.result as { tabClosed: boolean }).tabClosed, true);
     }
     assert.equal(server.requests.filter((request) => request.method === "tab.create").length, 3, "a freshly closed exact delegation group must be recreated for every sequential run");
@@ -289,7 +280,7 @@ test("real tool runtime handles protected starts, explicit skills, bounded slots
     induceSubmissionUncertain = true;
     await assert.rejects(
       runtime.start("tool-submission-uncertain", { profile: "scout", task: "Retain this child when turn evidence fails" }),
-      /Task was submitted atomically but a new working cycle could not be proven/,
+      /Task was accepted but a new working cycle could not be proven/,
     );
     assert.equal(childLive, true, "submission-uncertain failed child must remain retained");
     const blockedByRetained = await runtime.start("tool-after-retained-failure", { profile: "scout", task: "Must not exceed capacity" });

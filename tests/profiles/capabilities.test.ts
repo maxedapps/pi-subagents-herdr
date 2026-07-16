@@ -10,32 +10,26 @@ function researcher(): AgentProfile {
     body: "Use external sources.",
     permissions: "read-only",
     preferredTools: ["web_search", "fetch_content", "get_search_content"],
-    preferredSkills: ["web-research"],
     source: { path: "/profiles/researcher.md", scope: "bundled", namespace: "shared", priority: 0 },
   };
 }
 
-test("soft capability resolution intersects with actual child-exposed resources, never parent resources", () => {
+test("soft capability resolution intersects with actual child-exposed tools, never parent resources", () => {
   const resolved = resolveSoftCapabilities(researcher(), {
     tools: ["fetch_content"],
-    skills: [],
     reviewedExternalResearchTools: ["fetch_content"],
   });
   assert.deepEqual(resolved.tools, ["fetch_content"]);
-  assert.deepEqual(resolved.skills, []);
   assert.deepEqual(resolved.missingTools, ["web_search", "get_search_content"]);
-  assert.deepEqual(resolved.missingSkills, ["web-research"]);
   assert.equal(resolved.research.state, "available");
   assert.equal(resolved.research.canClaimExternalResearch, true);
 });
 
-test("research is blocked when the child exposes no preferred external research tool even if a skill or parent could have one", () => {
+test("research is blocked when the child exposes no preferred reviewed external research tool", () => {
   const resolved = resolveSoftCapabilities(researcher(), {
     tools: ["read"],
-    skills: ["web-research"],
     reviewedExternalResearchTools: [],
   });
-  assert.deepEqual(resolved.skills, ["web-research"]);
   assert.equal(resolved.research.state, "blocked");
   assert.equal(resolved.research.available, false);
   assert.equal(resolved.research.canClaimExternalResearch, false);
@@ -47,7 +41,6 @@ test("a profile cannot turn an arbitrary preferred tool into external-research p
   const profile = { ...researcher(), preferredTools: ["read"] };
   const resolved = resolveSoftCapabilities(profile, {
     tools: ["read"],
-    skills: [],
     reviewedExternalResearchTools: [],
   });
   assert.deepEqual(resolved.tools, ["read"]);
@@ -55,14 +48,13 @@ test("a profile cannot turn an arbitrary preferred tool into external-research p
   assert.equal(resolved.research.canClaimExternalResearch, false);
 });
 
-test("non-research assignments warn for missing preferences without becoming blocked", () => {
+test("non-research assignments warn for missing tool preferences without becoming blocked", () => {
   const profile = { ...researcher(), name: "scout" };
   const resolved = resolveSoftCapabilities(profile, {
     tools: [],
-    skills: [],
     reviewedExternalResearchTools: [],
   });
   assert.equal(resolved.research.state, "not-applicable");
   assert.equal(resolved.research.available, true);
-  assert.equal(resolved.diagnostics.filter((item) => item.severity === "warning").length, 4);
+  assert.equal(resolved.diagnostics.filter((item) => item.severity === "warning").length, 3);
 });

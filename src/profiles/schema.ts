@@ -19,8 +19,6 @@ export const PROFILE_FIELDS = Object.freeze([
   "permissions",
   "tools",
   "preferredTools",
-  "skills",
-  "preferredSkills",
   "context",
   "timeout",
   "worktree",
@@ -159,6 +157,8 @@ export function validateProfile(
           ? "herdr: false is no longer supported; Herdr is mandatory and implicit—remove this field"
           : "herdr is implicit and mandatory—remove this legacy field",
       );
+    } else if (key === "skills" || key === "preferredSkills") {
+      issues.push(`${key}: remove this field; child Pi now uses normal skill discovery`);
     } else if (key === "runtime" || key === "command" || key === "argv") {
       issues.push(`${key} is an unsupported runtime field; select harness/profile policy instead`);
     } else if (!PROFILE_FIELDS.includes(key as (typeof PROFILE_FIELDS)[number])) {
@@ -189,10 +189,6 @@ export function validateProfile(
   const preferredTools = frontmatter.preferredTools === undefined
     ? undefined
     : stringList(frontmatter.preferredTools, "preferredTools", issues);
-  const skills = frontmatter.skills === undefined ? undefined : stringList(frontmatter.skills, "skills", issues);
-  const preferredSkills = frontmatter.preferredSkills === undefined
-    ? undefined
-    : stringList(frontmatter.preferredSkills, "preferredSkills", issues);
   const context = frontmatter.context === undefined ? undefined : contextSettings(frontmatter.context, issues);
 
   let timeout: number | undefined;
@@ -225,8 +221,6 @@ export function validateProfile(
     ...(permissions === undefined ? {} : { permissions }),
     ...(tools === undefined ? {} : { tools }),
     ...(preferredTools === undefined ? {} : { preferredTools }),
-    ...(skills === undefined ? {} : { skills }),
-    ...(preferredSkills === undefined ? {} : { preferredSkills }),
     ...(context === undefined ? {} : { context }),
     ...(timeout === undefined ? {} : { timeout }),
     ...(worktree === undefined ? {} : { worktree }),

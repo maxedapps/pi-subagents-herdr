@@ -3,17 +3,17 @@ import { chmod, mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentInfo, AgentStartInput, PaneInfo, PaneProcessInfo, ReadResult, SessionSnapshot, TabInfo, WorkspaceInfo } from "../../src/herdr/protocol.ts";
+import { HerdrApiError, type AgentInfo, type AgentStartInput, type PaneInfo, type PaneProcessInfo, type ReadResult, type SessionSnapshot, type TabInfo, type WorkspaceInfo } from "../../src/herdr/protocol.ts";
 import type { HerdrRequestClient } from "../../src/herdr/client.ts";
 import type { EffectiveLaunchPolicy } from "../../src/contracts/harness.ts";
 import type { AgentProfile } from "../../src/contracts/profile.ts";
 import { assembleChildInstructions } from "../../src/harnesses/prompt.ts";
 import { prepareHarnessLaunch, type PreparedHarnessLaunch } from "../../src/harnesses/index.ts";
-import { boundRecentOutput, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, type OwnedRunTarget } from "../../src/runtime/control.ts";
+import { boundRecentOutput, hasUnambiguousTurnEvidence, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, type OwnedRunTarget, type TurnBaseline } from "../../src/runtime/control.ts";
 import { processBaseline, type DelegationGroup } from "../../src/runtime/groups.ts";
 import { interruptSubagent } from "../../src/runtime/interrupt.ts";
 import { sendToSubagent } from "../../src/runtime/send.ts";
-import { StartCleanupError, startSubagent } from "../../src/runtime/start.ts";
+import { StartCleanupError, TurnSubmissionUncertainError, startSubagent } from "../../src/runtime/start.ts";
 import { stopSubagent } from "../../src/runtime/stop.ts";
 import { waitForSubagent } from "../../src/runtime/wait.ts";
 import { createFakeCliFixture } from "../support/fake-cli.ts";
@@ -44,6 +44,9 @@ class FakeLifecycleClient {
   taskTransition: AgentInfo["agent_status"] = "working";
   replaceOnGraceful = false;
   exitBeforeReady = false;
+  inputMutationChangesEvidence = true;
+  failNextInputResponse = false;
+  failNextKeysResponse = false;
 
   childAgent(): AgentInfo {
     return {
@@ -66,13 +69,18 @@ class FakeLifecycleClient {
   }
   async sendInput(paneId: string, text: string, keys: readonly string[]): Promise<void> {
     this.inputs.push({ paneId, text, keys });
-    if (text === "/exit") { this.graceful(); return; }
-    this.childStatus = this.taskTransition; this.childRevision += 1; this.outputRevision += 1; this.output += `\nsubmitted:${text.slice(0, 30)}`;
+    if (text === "/exit") this.graceful();
+    else if (this.inputMutationChangesEvidence) {
+      this.childStatus = this.taskTransition; this.childRevision += 1; this.outputRevision += 1; this.output += `\nsubmitted:${text.slice(0, 30)}`;
+    }
+    if (this.failNextInputResponse) { this.failNextInputResponse = false; throw new Error("input response lost"); }
   }
   async sendKeys(paneId: string, keys: readonly string[]): Promise<void> {
     this.keyInputs.push({ paneId, keys });
-    if (keys.includes("ctrl+c") || keys.includes("escape")) { if (this.interruptWorks) { this.childStatus = "idle"; this.childRevision += 1; } return; }
-    if (keys.includes("ctrl+d")) this.graceful();
+    if (keys.includes("ctrl+c") || keys.includes("escape")) {
+      if (this.interruptWorks) { this.childStatus = "idle"; this.childRevision += 1; this.outputRevision += 1; this.output += "\ninterrupted-final"; }
+    } else if (keys.includes("ctrl+d")) this.graceful();
+    if (this.failNextKeysResponse) { this.failNextKeysResponse = false; throw new Error("keys response lost"); }
   }
   graceful(): void {
     if (this.replaceOnGraceful) { this.childTerminal = "term_replacement"; this.initialNative = false; this.childStatus = "idle"; return; }
@@ -125,6 +133,31 @@ test("fake lifecycle starts without task argv, waits for readiness, submits atom
   } finally { await fx.cleanup(); }
 });
 
+test("initial send response loss is submission-uncertain and retains the child without pre-submit cleanup", async () => {
+  const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.failNextInputResponse = true;
+  try {
+    await assert.rejects(
+      startSubagent({ client: client(fake), prepared: fx.prepared, workspaceId: "w1", tabId: "w1:t1", instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, turnStartTimeoutMs: 20, pollIntervalMs: 1 }),
+      (error: unknown) => error instanceof TurnSubmissionUncertainError && /must not be retried automatically/.test(error.message),
+    );
+    assert.equal(fake.childLive, true);
+    assert.deepEqual(fake.closedPanes, []);
+    assert.equal(fake.inputs.length, 1);
+  } finally { await fx.cleanup(); }
+});
+
+test("explicit initial input rejection remains a pre-submit failure and permits proven cleanup", async () => {
+  const fx = await preparedFixture(); const fake = new FakeLifecycleClient();
+  fake.sendInput = async () => { throw new HerdrApiError("request-1", "invalid_params", "rejected"); };
+  try {
+    await assert.rejects(
+      startSubagent({ client: client(fake), prepared: fx.prepared, workspaceId: "w1", tabId: "w1:t1", instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, turnStartTimeoutMs: 20, pollIntervalMs: 1 }),
+      (error: unknown) => error instanceof StartCleanupError && error.cleanup === "closed",
+    );
+    assert.deepEqual(fake.closedPanes, ["w1:p1"]);
+  } finally { await fx.cleanup(); }
+});
+
 test("initial blocked state preserves pane and never submits the task", async () => {
   const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.childStatus = "blocked";
   try {
@@ -162,24 +195,63 @@ test("pre-submit harness exit reports bounded root-cause output and truthful alr
   } finally { await fx.cleanup(); }
 });
 
-test("send and semantic wait verify a new cycle and inspect bounded post-wait output", async () => {
-  const fake = new FakeLifecycleClient(); fake.childLive = true;
+test("turn evidence requires a state transition or strict revision advance", () => {
+  const baseline: TurnBaseline = { status: "working", agentRevision: 4, outputRevision: 7 };
+  const working = { ...new FakeLifecycleClient().childAgent(), agent_status: "working" as const, revision: 4 };
+  assert.equal(hasUnambiguousTurnEvidence(working, 7, baseline), false);
+  assert.equal(hasUnambiguousTurnEvidence({ ...working, revision: 5 }, 7, baseline), true);
+  assert.equal(hasUnambiguousTurnEvidence(working, 8, baseline), true);
+  assert.equal(hasUnambiguousTurnEvidence(working, 7, { ...baseline, status: "idle" }), true);
+});
+
+test("send reports confirmed, unconfirmed, and uncertain delivery without retrying", async () => {
   const target: OwnedRunTarget = { runId: "run-life", runNonce: "nonce-life", harness: "pi", terminalId: "term_child", nativeSession: { kind: native.kind, value: native.value, source: native.source }, activeBranchOwned: true, authorization };
-  const sent = await sendToSubagent({ client: client(fake), target, message: "Focus on exports", timeoutMs: 50, pollIntervalMs: 1 });
-  assert.equal(sent.confirmed, true); assert.equal(sent.state, "working"); assert.deepEqual(fake.inputs[0]!.keys, ["enter"]);
+  const confirmedFake = new FakeLifecycleClient(); confirmedFake.childLive = true;
+  const sent = await sendToSubagent({ client: client(confirmedFake), target, message: "Focus on exports", timeoutMs: 50, pollIntervalMs: 1 });
+  assert.equal(sent.delivery, "confirmed"); assert.equal(sent.state, "working"); assert.deepEqual(confirmedFake.inputs[0]!.keys, ["enter"]);
+
+  const unconfirmedFake = new FakeLifecycleClient(); unconfirmedFake.childLive = true; unconfirmedFake.childStatus = "working"; unconfirmedFake.inputMutationChangesEvidence = false;
+  const unconfirmed = await sendToSubagent({ client: client(unconfirmedFake), target, message: "Do not duplicate", timeoutMs: 5, pollIntervalMs: 1 });
+  assert.equal(unconfirmed.delivery, "unconfirmed"); assert.equal(unconfirmedFake.inputs.length, 1);
+
+  const uncertainFake = new FakeLifecycleClient(); uncertainFake.childLive = true; uncertainFake.failNextInputResponse = true;
+  const uncertain = await sendToSubagent({ client: client(uncertainFake), target, message: "May be accepted", timeoutMs: 5, pollIntervalMs: 1 });
+  assert.equal(uncertain.delivery, "uncertain"); assert.equal(uncertainFake.inputs.length, 1); assert.match(uncertain.reason ?? "", /must not be retried automatically/);
+
+  const rejectedFake = new FakeLifecycleClient(); rejectedFake.childLive = true;
+  rejectedFake.sendInput = async () => { throw new HerdrApiError("request-2", "invalid_params", "rejected"); };
+  await assert.rejects(sendToSubagent({ client: client(rejectedFake), target, message: "Rejected", timeoutMs: 5, pollIntervalMs: 1 }), HerdrApiError);
+
+  const fake = confirmedFake;
   setTimeout(() => { fake.childStatus = "done"; fake.childRevision += 1; fake.outputRevision += 1; fake.output += "\ncomplete"; }, 2);
   const waited = await waitForSubagent({ client: client(fake), target, states: ["done", "blocked"], timeoutMs: 100, pollIntervalMs: 1 });
   assert.equal(waited.state, "done"); assert.match(waited.output.text, /complete/);
 });
 
-test("adapter interrupts are verified; uncertainty never claims success", async () => {
-  const fake = new FakeLifecycleClient(); fake.childLive = true; fake.childStatus = "working";
+test("adapter interrupts report confirmed, unconfirmed, and uncertain delivery", async () => {
   const target: OwnedRunTarget = { runId: "run-life", runNonce: "nonce-life", harness: "pi", terminalId: "term_child", nativeSession: { kind: native.kind, value: native.value, source: native.source }, activeBranchOwned: true, authorization };
-  const confirmed = await interruptSubagent({ client: client(fake), target, timeoutMs: 20, pollIntervalMs: 1 });
-  assert.equal(confirmed.confirmed, true); assert.deepEqual(fake.keyInputs[0]!.keys, ["ctrl+c"]);
-  fake.childStatus = "working"; fake.interruptWorks = false;
-  const uncertain = await interruptSubagent({ client: client(fake), target, timeoutMs: 5, pollIntervalMs: 1 });
-  assert.equal(uncertain.confirmed, false); assert.equal(uncertain.state, "working");
+  const confirmedFake = new FakeLifecycleClient(); confirmedFake.childLive = true; confirmedFake.childStatus = "working";
+  const confirmed = await interruptSubagent({ client: client(confirmedFake), target, timeoutMs: 20, pollIntervalMs: 1 });
+  assert.equal(confirmed.delivery, "confirmed"); assert.deepEqual(confirmedFake.keyInputs[0]!.keys, ["ctrl+c"]);
+
+  const unconfirmedFake = new FakeLifecycleClient(); unconfirmedFake.childLive = true; unconfirmedFake.childStatus = "working"; unconfirmedFake.interruptWorks = false;
+  const unconfirmed = await interruptSubagent({ client: client(unconfirmedFake), target, timeoutMs: 5, pollIntervalMs: 1 });
+  assert.equal(unconfirmed.delivery, "unconfirmed"); assert.equal(unconfirmed.state, "working");
+
+  const uncertainFake = new FakeLifecycleClient(); uncertainFake.childLive = true; uncertainFake.childStatus = "working"; uncertainFake.failNextKeysResponse = true;
+  const uncertain = await interruptSubagent({ client: client(uncertainFake), target, timeoutMs: 5, pollIntervalMs: 1 });
+  assert.equal(uncertain.delivery, "uncertain"); assert.equal(uncertain.state, "idle"); assert.equal(uncertainFake.keyInputs.length, 1);
+
+  const rejectedFake = new FakeLifecycleClient(); rejectedFake.childLive = true; rejectedFake.childStatus = "working";
+  rejectedFake.sendKeys = async () => { throw new HerdrApiError("request-3", "invalid_params", "rejected"); };
+  await assert.rejects(interruptSubagent({ client: client(rejectedFake), target, timeoutMs: 5, pollIntervalMs: 1 }), HerdrApiError);
+});
+
+test("graceful stop captures fresh post-interrupt output before exiting", async () => {
+  const fake = new FakeLifecycleClient(); fake.childLive = true; fake.childStatus = "working"; fake.output = "before-interrupt";
+  const target: OwnedRunTarget = targetWithGroup({ runId: "run-life", runNonce: "nonce-life", harness: "pi", terminalId: "term_child", nativeSession: { kind: native.kind, value: native.value, source: native.source }, activeBranchOwned: true, authorization });
+  const result = await stopSubagent({ client: client(fake), target, mode: "graceful", timeoutMs: 30, pollIntervalMs: 1 });
+  assert.equal(result.stopped, true); assert.match(result.output.text, /interrupted-final/);
 });
 
 test("graceful stop exits first and closes a dedicated tab only with untouched anchor", async () => {

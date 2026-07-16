@@ -46,9 +46,6 @@ function assertCodexPolicy(input: AdapterCheckInput): void {
   if (input.policy.tools.length !== 0) {
     throw new HarnessConfigurationError("Codex has no equivalent explicit tool allowlist; profiles with tools must be rejected rather than inferred across harnesses");
   }
-  if ((input.reviewedSkillPaths?.length ?? 0) !== 0 || (input.profile.skills?.length ?? 0) !== 0 || (input.profile.preferredSkills?.length ?? 0) !== 0) {
-    throw new HarnessConfigurationError("Codex profile skills/preferredSkills are not loaded by this adapter");
-  }
   if (input.integrationPolicy !== undefined && input.integrationPolicy !== "integrated") {
     throw new HarnessConfigurationError("Codex does not support the Claude safe-mode integration policy");
   }

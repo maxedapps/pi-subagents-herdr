@@ -7,9 +7,9 @@ export function registerStartTool(pi: ExtensionAPI, runtime: HerdrToolRuntimeCon
   pi.registerTool({
     name,
     label: "Subagent Start",
-    description: "Start one visible subagent after strict profile, ownership, capability, cwd, and worktree validation. Returns after a new turn is proven, not after task completion. There is no hidden or cross-harness fallback.",
+    description: "Start one visible subagent after strict profile, ownership, capability, cwd, and worktree validation. A successful start creates an outstanding result obligation: it is never task completion, and the parent must call subagent_status with the exact returned ID to wait/inspect output and resolve the run. There is no hidden or cross-harness fallback.",
     promptSnippet: "Start one bounded, ownership-tracked subagent",
-    promptGuidelines: [`Use ${name} only for deliberate bounded delegation with least privilege, a clear output, and a stopping condition.`],
+    promptGuidelines: [`Use ${name} only for deliberate bounded delegation with least privilege, a clear output, and a stopping condition. After every successful ${name}, call subagent_status with that exact ID; list mode does not inspect results.`],
     parameters: StartToolSchema,
     executionMode: "parallel",
     async execute(toolCallId, params, signal) {

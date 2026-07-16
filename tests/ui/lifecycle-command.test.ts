@@ -11,18 +11,19 @@ import { adaptiveRefreshDelay, type DashboardRun } from "../../src/ui/status.ts"
 const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
 const owned: DashboardRun = {
   id: "run-owned", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "working", ownership: "current_session",
-  live: true, elapsedMs: 2_000, taskSynopsis: "Inspect UI", terminalId: "term-owned", agentRevision: 2, changedOutput: false,
+  live: true, elapsedMs: 2_000, taskSynopsis: "Inspect UI", terminalId: "term-owned", agentRevision: 2,
 };
 const listed: ListToolResult = { ok: true, scope: "current_session", runs: [owned], counts: { working: 1 } };
+
+function stopSuccess(): ActionToolResult {
+  return { ok: true, action: "stop", run: { ...owned, lifecycle: "stopped", live: false }, result: { stopped: true, reason: "stopped" } };
+}
 
 function runtime(overrides: Partial<UiRuntimeApi & { subscribeUi(listener: () => void): () => void; widgetVisibility(): "auto" | "always" | "never" }> = {}) {
   let listener: (() => void) | undefined;
   const base = {
     list: async () => listed,
-    inspectUi: async () => ({ run: owned }),
-    send: async () => ({ ok: false, status: "blocked", reason: "unused" } as ActionToolResult),
-    interrupt: async () => ({ ok: false, status: "blocked", reason: "unused" } as ActionToolResult),
-    stop: async () => ({ ok: false, status: "blocked", reason: "unused" } as ActionToolResult),
+    stop: async () => stopSuccess(),
     focusUi: async () => ({ ok: true }),
     subscribeUi: (next: () => void) => { listener = next; return () => { listener = undefined; }; },
     widgetVisibility: () => "auto" as const,
@@ -57,6 +58,23 @@ test("persistent UI installs only for owned visible runs and cleans up idempoten
   assert.equal(widgets.at(-1), undefined);
 });
 
+function commandContext(key: string, onClosed?: () => void, confirm = true): ExtensionCommandContext {
+  return {
+    mode: "tui", cwd: "/tmp", signal: undefined,
+    ui: {
+      theme,
+      notify: () => undefined,
+      confirm: async () => confirm,
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+      custom: <T>(factory: (tui: { requestRender(): void }, theme: Theme, kb: unknown, done: (value: T) => void) => Component) => new Promise<T>((resolve) => {
+        const component = factory({ requestRender() {} }, theme, {}, (value) => { onClosed?.(); resolve(value); });
+        component.handleInput?.(key);
+      }),
+    },
+  } as unknown as ExtensionCommandContext;
+}
+
 test("focus runs only after the overlay promise has closed", async () => {
   let overlayClosed = false;
   let focused = false;
@@ -67,31 +85,30 @@ test("focus runs only after the overlay promise has closed", async () => {
       return { ok: true, attentionChanged: true };
     },
   });
-  const notifications: string[] = [];
-  const context = {
-    mode: "tui", cwd: "/tmp", signal: undefined,
-    ui: {
-      theme,
-      notify: (message: string) => notifications.push(message),
-      input: async () => undefined,
-      confirm: async () => false,
-      select: async () => undefined,
-      setStatus: () => undefined,
-      setWidget: () => undefined,
-      custom: <T>(factory: (tui: { requestRender(): void }, theme: Theme, kb: unknown, done: (value: T) => void) => Component) => new Promise<T>((resolve) => {
-        const component = factory({ requestRender() {} }, theme, {}, (value) => { overlayClosed = true; resolve(value); });
-        component.handleInput?.("\r");
-      }),
-    },
-  } as unknown as ExtensionCommandContext;
   const session = new HerdrSubagentsUiSession(fake.value);
-  await session.command("", context);
+  await session.command("", commandContext("\r", () => { overlayClosed = true; }));
   assert.equal(focused, true);
-  assert.match(notifications.join("\n"), /unseen done attention to idle/);
   await session.stop();
 });
 
-test("subscription changes live-refresh the overlay while preserving selection by run id", async () => {
+test("graceful stop confirmation and mutation run only after the overlay closes", async () => {
+  let overlayClosed = false;
+  let stopped = false;
+  const fake = runtime({
+    stop: async (input) => {
+      assert.equal(overlayClosed, true, "stop must not run while overlay owns input");
+      assert.deepEqual(input, { id: "run-owned", mode: "graceful", cleanup: "retain" });
+      stopped = true;
+      return stopSuccess();
+    },
+  });
+  const session = new HerdrSubagentsUiSession(fake.value);
+  await session.command("", commandContext("x", () => { overlayClosed = true; }));
+  assert.equal(stopped, true);
+  await session.stop();
+});
+
+test("subscription changes refresh the current-owned overlay while preserving selection by run id", async () => {
   const second = { ...owned, id: "run-second", terminalId: "term-second" };
   let runs: DashboardRun[] = [owned, second];
   let listener: (() => void) | undefined;
@@ -99,11 +116,7 @@ test("subscription changes live-refresh the overlay while preserving selection b
   let close: (() => void) | undefined;
   const value = {
     list: async () => ({ ok: true, scope: "current_session", runs, counts: {} } as ListToolResult),
-    listUi: async () => ({ ok: true, scope: "current_session", runs, counts: {} } as ListToolResult),
-    inspectUi: async (_scope: string, id: string) => ({ run: { ...runs.find((item) => item.id === id)!, changedOutput: false } }),
-    send: async () => ({ ok: false, status: "blocked", reason: "unused" } as ActionToolResult),
-    interrupt: async () => ({ ok: false, status: "blocked", reason: "unused" } as ActionToolResult),
-    stop: async () => ({ ok: false, status: "blocked", reason: "unused" } as ActionToolResult),
+    stop: async () => stopSuccess(),
     focusUi: async () => ({ ok: true }),
     subscribeUi: (next: () => void) => { listener = next; return () => { listener = undefined; }; },
     widgetVisibility: () => "auto" as const,
@@ -111,7 +124,7 @@ test("subscription changes live-refresh the overlay while preserving selection b
   const context = {
     mode: "tui", cwd: "/tmp", signal: undefined,
     ui: {
-      theme, notify: () => undefined, input: async () => undefined, confirm: async () => false, select: async () => undefined,
+      theme, notify: () => undefined, confirm: async () => false,
       setStatus: () => undefined, setWidget: () => undefined,
       custom: <T>(factory: (tui: { requestRender(): void }, theme: Theme, kb: unknown, done: (result: T) => void) => Component) => new Promise<T>((resolve) => {
         component = factory({ requestRender() {} }, theme, {}, resolve) as SubagentsOverlay;
@@ -134,7 +147,7 @@ test("subscription changes live-refresh the overlay while preserving selection b
   await session.stop();
 });
 
-test("/subagents has a clear non-TUI fallback and adaptive refresh suspends when empty", async () => {
+test("/subagents rejects scopes, has a clear non-TUI fallback, and adaptive refresh suspends when empty", async () => {
   const fake = runtime();
   const notifications: string[] = [];
   const context = { mode: "json", ui: { notify: (message: string) => notifications.push(message) } } as unknown as ExtensionCommandContext;
@@ -144,4 +157,9 @@ test("/subagents has a clear non-TUI fallback and adaptive refresh suspends when
   const empty = { scope: "current_session", connection: "connected", runs: [], summary: { total: 0, blocked: 0, working: 0, ready: 0, done: 0, idle: 0, unknown: 0, failures: 0 }, updatedAt: 0 } as const;
   assert.equal(adaptiveRefreshDelay(empty), undefined);
   assert.equal(adaptiveRefreshDelay({ ...empty, runs: [owned], summary: { ...empty.summary, total: 1, working: 1 } }), 1_500);
+
+  const tuiNotifications: string[] = [];
+  const tui = { mode: "tui", ui: { notify: (message: string) => tuiNotifications.push(message) } } as unknown as ExtensionCommandContext;
+  await session.command("global", tui);
+  assert.match(tuiNotifications[0] ?? "", /current-session owned runs only/);
 });

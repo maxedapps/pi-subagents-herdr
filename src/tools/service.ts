@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ensureRuntimeGitExcludes } from "../artifacts/git-ignore.ts";
 import { materializeHandoff, parentHandoffWrapperPath } from "../artifacts/handoff.ts";
 import {
@@ -33,10 +33,10 @@ import { prepareHarnessLaunch } from "../harnesses/index.ts";
 import { resolveMonotonicOverrides } from "../policy/capabilities.ts";
 import { discoverProfilesForContext } from "../profiles/discovery.ts";
 import { resolveSoftCapabilities } from "../profiles/diagnostics.ts";
-import { resolveProfileSkills, type ProfileSkillResolution } from "../profiles/skills.ts";
 import { createDoctorReport, type DoctorReport } from "../doctor/report.ts";
 import {
   boundRecentOutput,
+  FocusOutcomeUncertainError,
   focusOwnedPaneFresh,
   readBoundedOutput,
   revalidateRecordedOwnershipFresh,
@@ -63,8 +63,6 @@ import { waitForSubagent } from "../runtime/wait.ts";
 import type { WorktreeRecord } from "../worktrees/contracts.ts";
 import { WorktreeCleanupManager, type IntegrationVerificationRequest } from "../worktrees/cleanup.ts";
 import { WorktreeManager, WorktreeRegistry } from "../worktrees/manager.ts";
-import type { UiRunDetails } from "../ui/details.ts";
-import type { DashboardScope } from "../ui/status.ts";
 import type {
   ActionToolResult,
   GetToolResult,
@@ -163,7 +161,6 @@ interface ManagedRun {
   herdrStatus: HerdrStatus;
   policy: EffectiveLaunchPolicy;
   readonly parentBranchEntryId: string;
-  readonly reviewedSkills: ProfileSkillResolution;
   journal: OwnershipJournalData;
   target?: OwnedRunTarget;
   group?: DelegationGroup;
@@ -171,12 +168,22 @@ interface ManagedRun {
   ephemeral?: EphemeralRuntimeFiles;
   worktreeId?: string;
   lastOutput: BoundedOutput;
+  resultGeneration: number;
+  inspectedResultGeneration: number;
+  remindedResultGeneration: number;
   failure?: string;
+}
+
+export interface ResultInspectionReminder {
+  readonly id: string;
+  readonly generation: number;
+  readonly timeoutMs: number;
 }
 
 export interface SessionToolRuntime {
   start(context: ExtensionContext): Promise<void>;
   stop(): Promise<void>;
+  claimResultInspectionReminders(): readonly ResultInspectionReminder[];
 }
 
 export interface ToolRuntimeOptions {
@@ -284,7 +291,6 @@ function runtimeMetadata(run: ManagedRun, terminalId: string, nativeSession = ru
       thinking: run.policy.thinking,
       cwd: run.policy.cwd,
       tools: run.policy.tools.map((tool) => tool.name),
-      skills: run.reviewedSkills.resources.map((skill) => ({ name: skill.name, path: skill.path })),
       mutation: run.policy.permissions.mutation,
       network: run.policy.permissions.network,
       requireWorktree: run.policy.requireWorktree,
@@ -328,7 +334,29 @@ export class HerdrToolRuntimeController {
   }
 
   createSessionRuntime(): SessionToolRuntime {
-    return { start: (context) => this.startSession(context), stop: () => this.stopSession() };
+    return {
+      start: (context) => this.startSession(context),
+      stop: () => this.stopSession(),
+      claimResultInspectionReminders: () => this.claimResultInspectionReminders(),
+    };
+  }
+
+  recordModelResultInspection(id: string, state: HerdrStatus): void {
+    const run = this.#runs.get(id);
+    if (!run || (state !== "done" && state !== "idle")) return;
+    run.inspectedResultGeneration = run.resultGeneration;
+  }
+
+  claimResultInspectionReminders(): readonly ResultInspectionReminder[] {
+    const reminders: ResultInspectionReminder[] = [];
+    for (const run of this.#runs.values()) {
+      if (run.resultGeneration <= run.inspectedResultGeneration
+        || run.resultGeneration <= run.remindedResultGeneration
+        || run.lifecycle === "stopped") continue;
+      run.remindedResultGeneration = run.resultGeneration;
+      reminders.push({ id: run.id, generation: run.resultGeneration, timeoutMs: run.profile.timeout ?? 900_000 });
+    }
+    return reminders;
   }
 
   async startSession(context: ExtensionContext): Promise<void> {
@@ -515,12 +543,6 @@ export class HerdrToolRuntimeController {
         herdrStatus: agent.agent_status,
         policy,
         parentBranchEntryId: journal.parent.branchEntryId,
-        reviewedSkills: {
-          resources: (metadata.policy.skills ?? []).map((skill) => ({ ...skill, required: true })),
-          names: (metadata.policy.skills ?? []).map((skill) => skill.name),
-          paths: (metadata.policy.skills ?? []).map((skill) => skill.path),
-          diagnostics: [],
-        },
         journal,
         target,
         ...(group === undefined ? {} : { group }),
@@ -528,6 +550,9 @@ export class HerdrToolRuntimeController {
         ...(ephemeral === undefined ? {} : { ephemeral }),
         ...(this.#worktrees?.get(journal.runId) === undefined ? {} : { worktreeId: journal.runId }),
         lastOutput: metadata.output,
+        resultGeneration: 0,
+        inspectedResultGeneration: 0,
+        remindedResultGeneration: 0,
       });
     }
 
@@ -668,7 +693,7 @@ export class HerdrToolRuntimeController {
     );
   }
 
-  async #resolvePolicy(input: StartToolInput, profile: AgentProfile, context: ExtensionContext, settings: HerdrSubagentsSettings): Promise<{ profile: AgentProfile; policy: EffectiveLaunchPolicy; reviewedSkills: ProfileSkillResolution } | ToolUnavailableResult> {
+  async #resolvePolicy(input: StartToolInput, profile: AgentProfile, context: ExtensionContext, settings: HerdrSubagentsSettings): Promise<{ profile: AgentProfile; policy: EffectiveLaunchPolicy } | ToolUnavailableResult> {
     const harness = input.harness ?? profile.harness ?? settings.defaultHarness;
     const selectedProfile = actualProfile(profile, harness);
     const tools = profileTools(this.#pi, selectedProfile);
@@ -717,20 +742,13 @@ export class HerdrToolRuntimeController {
     if (!mutation && resolution.policy.requireWorktree) {
       throw new Error("Isolated worktrees are reserved for mutation-capable profiles; read-only children share the verified checkout");
     }
-    const reviewedSkills = await resolveProfileSkills(selectedProfile, harness, {
-      cwd: context.cwd,
-      agentDir: getAgentDir(),
-      projectTrusted: context.isProjectTrusted(),
-      commands: this.#pi.getCommands(),
-    });
     const childTools = resolution.policy.tools.map((tool) => tool.name);
     const soft = resolveSoftCapabilities(selectedProfile, {
       tools: childTools,
-      skills: reviewedSkills.names,
       reviewedExternalResearchTools: childTools.filter((name) => REVIEWED_RESEARCH_TOOLS.has(name)),
     });
-    if (soft.research.state === "blocked") return unavailable([...reviewedSkills.diagnostics, ...soft.diagnostics].map((item) => item.message).join("; "), "blocked");
-    return { profile: selectedProfile, policy: resolution.policy, reviewedSkills };
+    if (soft.research.state === "blocked") return unavailable(soft.diagnostics.map((item) => item.message).join("; "), "blocked");
+    return { profile: selectedProfile, policy: resolution.policy };
   }
 
   start(toolCallId: string, input: StartToolInput, signal?: AbortSignal): Promise<StartToolResult> {
@@ -766,7 +784,7 @@ export class HerdrToolRuntimeController {
     if (!discovered) throw new Error(`Unknown or disabled subagent profile: ${input.profile}`);
     const resolved = await this.#resolvePolicy(input, discovered, ready.context, ready.settings);
     if ("ok" in resolved) return resolved;
-    const { profile, policy: parentPolicy, reviewedSkills } = resolved;
+    const { profile, policy: parentPolicy } = resolved;
     const runId = safeRunId();
     await this.#validateArtifactPlan(ready.context.cwd, profile, runId, parentPolicy.harness);
     const runNonce = randomUUID();
@@ -795,9 +813,11 @@ export class HerdrToolRuntimeController {
       herdrStatus: "unknown",
       policy: parentPolicy,
       parentBranchEntryId: branchEntryId,
-      reviewedSkills,
       journal: journalState,
       lastOutput: EMPTY_OUTPUT,
+      resultGeneration: 0,
+      inspectedResultGeneration: 0,
+      remindedResultGeneration: 0,
     };
     this.#runs.set(runId, managed);
 
@@ -817,7 +837,6 @@ export class HerdrToolRuntimeController {
           sessionName: `sub-${runId}`,
           ...(validationRuntime.sessionDirectory === undefined ? {} : { sessionDirectory: validationRuntime.sessionDirectory }),
           systemPromptPath: validationRuntime.systemPrompt,
-          reviewedSkillPaths: reviewedSkills.paths,
           metadata: { runId, runNonce, profileName: profile.name, parentSessionId: parent.sessionId, ...(parent.sessionPath === undefined ? {} : { parentSessionPath: parent.sessionPath }) },
         });
       } finally {
@@ -899,7 +918,6 @@ export class HerdrToolRuntimeController {
         sessionName: `sub-${runId}`,
         ...(managed.ephemeral.sessionDirectory === undefined ? {} : { sessionDirectory: managed.ephemeral.sessionDirectory }),
         systemPromptPath: managed.ephemeral.systemPrompt,
-        reviewedSkillPaths: reviewedSkills.paths,
         metadata: { runId, runNonce, profileName: profile.name, parentSessionId: parent.sessionId, ...(parent.sessionPath === undefined ? {} : { parentSessionPath: parent.sessionPath }) },
       });
       const authorization = this.#authorization(runId, runNonce);
@@ -940,6 +958,7 @@ export class HerdrToolRuntimeController {
       managed.updatedAt = Date.now();
       managed.lastOutput = started.output;
       managed.policy = policy;
+      if (started.started) managed.resultGeneration += 1;
       await this.#persistMetadata(managed);
       if (worktree && target.nativeSession) ready.worktrees.bindWriter(worktree.id, { terminalId: target.terminalId, nativeSession: target.nativeSession });
       this.#subscriptions?.ownershipChanged(); this.#notifyUi();
@@ -953,14 +972,22 @@ export class HerdrToolRuntimeController {
           thinking: policy.thinking,
           cwd: policy.cwd,
           tools: policy.tools.map((tool) => tool.name),
-          skills: reviewedSkills.names,
-          skillDiagnostics: reviewedSkills.diagnostics.map((item) => item.message),
           permissions: policy.permissions,
           isolatedWorktree: policy.requireWorktree,
           broadeningReasons: policy.broadeningReasons,
         },
         output: started.output,
-        ...(started.started ? {} : { reason: started.reason }),
+        ...(started.started ? {
+          completion: {
+            pending: true,
+            requiredTool: "subagent_status",
+            suggestedInput: {
+              id: runId,
+              states: ["done", "idle", "blocked"],
+              timeoutMs: profile.timeout ?? 900_000,
+            },
+          },
+        } : { reason: started.reason }),
       };
     } catch (error) {
       managed.lifecycle = "failed";
@@ -1069,46 +1096,6 @@ export class HerdrToolRuntimeController {
     return { ok: true, scope, runs, counts };
   }
 
-  async inspectUi(scope: DashboardScope, id: string): Promise<UiRunDetails> {
-    const listed = await this.list({ scope });
-    if (!listed.ok) throw new Error(listed.reason);
-    const summary = listed.runs.find((candidate) => candidate.id === id);
-    if (!summary) throw new Error(`Run ${id} is no longer visible in ${scope} scope`);
-    let output: BoundedOutput | undefined;
-    if (summary.terminalId && summary.live && this.#client) {
-      const snapshot = await this.#client.snapshot();
-      const pane = snapshot.panes.find((candidate) => candidate.terminal_id === summary.terminalId);
-      const agent = snapshot.agents.find((candidate) => candidate.terminal_id === summary.terminalId);
-      if (pane && agent && pane.pane_id === agent.pane_id && pane.tab_id === agent.tab_id && pane.workspace_id === agent.workspace_id) {
-        const read = await this.#client.readAgent(summary.terminalId, { source: "recent_unwrapped", lines: 12, strip_ansi: true, format: "text" });
-        output = boundRecentOutput(read.text, read.truncated, read.revision);
-      }
-    }
-    const managed = this.#runs.get(id);
-    if (!output && managed) output = managed.lastOutput;
-    return {
-      run: { ...summary, ...(output === undefined ? {} : { outputRevision: output.revision }), changedOutput: false },
-      ...(output === undefined ? {} : { output }),
-      ...(managed?.artifacts === undefined ? {} : { artifacts: managed.artifacts.paths }),
-    };
-  }
-
-  async listUi(input: ListToolInput): Promise<ListToolResult> {
-    const listed = await this.list(input);
-    if (!listed.ok || !this.#client) return listed;
-    const runs = await Promise.all(listed.runs.map(async (summary): Promise<RunSummary> => {
-      if (!summary.live || !summary.terminalId) return summary;
-      try {
-        const read = await this.#client!.readAgent(summary.terminalId, { source: "recent_unwrapped", lines: 1, strip_ansi: true, format: "text" });
-        return { ...summary, outputRevision: read.revision };
-      } catch (error) {
-        if (!isUnavailableError(error)) throw error;
-        return summary;
-      }
-    }));
-    return { ...listed, runs };
-  }
-
   async doctor(): Promise<DoctorReport> {
     const context = this.#context;
     if (!context) throw new Error("Subagent session runtime has not started");
@@ -1162,7 +1149,6 @@ export class HerdrToolRuntimeController {
         thinking: run.policy.thinking,
         cwd: run.policy.cwd,
         tools: run.policy.tools.map((tool) => tool.name),
-        skills: run.reviewedSkills.names,
       },
       ownership: {
         runNonce: run.runNonce,
@@ -1197,11 +1183,16 @@ export class HerdrToolRuntimeController {
       // Mutation boundary: terminal/native identity and active Pi branch are
       // resolved from a fresh snapshot immediately before terminal-preferred focus.
       const focused = await focusOwnedPaneFresh(ready.client, target, signal);
-      if (focused.after) { run.herdrStatus = focused.after.agent_status; run.updatedAt = Date.now(); }
+      run.herdrStatus = focused.after.agent_status; run.updatedAt = Date.now();
       this.#notifyUi();
-      return { ok: true, attentionChanged: focused.before.agent.agent_status === "done" && focused.after?.agent_status === "idle" };
+      return { ok: true, attentionChanged: focused.before.agent.agent_status === "done" && focused.after.agent_status === "idle" };
     } catch (error) {
-      return { ok: false, reason: `Focus failed without changing ownership: ${error instanceof Error ? error.message : String(error)}` };
+      return {
+        ok: false,
+        reason: error instanceof FocusOutcomeUncertainError
+          ? error.message
+          : `Focus refused before a confirmed mutation: ${error instanceof Error ? error.message : String(error)}`,
+      };
     }
   }
 
@@ -1211,6 +1202,7 @@ export class HerdrToolRuntimeController {
     try {
       const result = await sendToSubagent({ client: ready.client, target: this.#ownedTarget(run), message: input.message, ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }), ...(signal === undefined ? {} : { signal }) });
       run.herdrStatus = result.state; run.lastOutput = result.output; run.updatedAt = Date.now();
+      run.resultGeneration += 1;
       await this.#persistMetadata(run); this.#notifyUi();
       return { ok: true, action: "send", run: await this.#summary(run), result };
     } catch (error) { if (isUnavailableError(error)) return unavailable(error instanceof Error ? error.message : String(error)); throw error; }
@@ -1261,6 +1253,7 @@ export class HerdrToolRuntimeController {
         const result = await stopSubagent({ client: ready.client, target: this.#ownedTarget(run), ...(input.mode === undefined ? {} : { mode: input.mode }), ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }), ...(signal === undefined ? {} : { signal }) });
         if (result.output.text.trim().length > 0) run.lastOutput = result.output;
         provenStopped = result.stopped;
+        if (result.stopped) run.inspectedResultGeneration = run.resultGeneration;
         if (result.tabClosed && !run.worktreeId && run.group) {
           const cached = ready.groups.get(run.group.workspaceId, run.group.group);
           if (cached) ready.groups.forgetClosed(run.group);

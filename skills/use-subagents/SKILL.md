@@ -20,6 +20,8 @@ This is a parent-only orchestration skill. Use only the provided lifecycle tools
 
 If a required tool or ownership proof is unavailable, fail closed: keep the work in the parent when delegation is optional, or report delegation blocked when it is required. Do not invent a fallback, launch agents through shell/process mechanisms, ask a child to delegate, or transfer control of an unknown run.
 
+Every successful `subagent_start` creates an outstanding result obligation; its start result is never task completion. For that exact ID, call `subagent_status` with terminal/attention states, inspect the returned output, act on blockers, verify material claims, and resolve the run. List mode never counts as result inspection. Inspect every parallel run individually.
+
 Before any write-enabled, parallel, sensitive, broad/expensive assignment, or blocked/failure intervention, read [prompt and safety guidance](references/prompt-and-safety.md). Read its cleanup section again before removing a writer lane.
 
 ## Decide deliberately
@@ -39,11 +41,11 @@ Use a fresh child for a new assignment or independent judgment. Reuse a retained
 ## Orchestrate
 
 1. Define the role, exact task and starting context, requirements and non-goals, permissions and forbidden operations, evidence and validation, concise handoff shape, stopping condition, and bounded timeout.
-2. Call `subagent_start`. Record the run ID and returned ownership/worktree facts. A blocked or unavailable result is not permission to fall back.
-3. Monitor every run with `subagent_status` using `id`, explicit terminal/attention `states`, and a bounded `timeoutMs`. Never fire and forget.
+2. Call `subagent_start`. Record the run ID and returned ownership/worktree facts. Treat `completion.pending: true` as a mandatory next action, never as completion. A blocked or unavailable result is not permission to fall back.
+3. Monitor every run with `subagent_status` using that exact `id`, explicit terminal/attention `states`, and a bounded `timeoutMs`; inspect its returned output. Never fire and forget, and never substitute an aggregate list call.
 4. On `blocked`, `unknown`, timeout, or failure, inspect with `subagent_status({ id })` before deciding. Use `subagent_send` only for a narrow same-assignment clarification. Ask the human for credentials, approval, ambiguity, privacy, or material-risk decisions; never weaken policy or send approval data.
 5. Do not retry blindly. Extend only after observed progress justifies the cost. After two failures with the same cause, change the bounded approach, continue in the parent, or request a human decision.
-6. Use `subagent_interrupt` to stop the current turn while preserving the session. An unconfirmed interrupt remains uncertain. Use `subagent_stop` to resolve the run lifecycle; interrupt and stop are not substitutes.
+6. Use `subagent_interrupt` only to cancel the current turn while preserving the reusable child session. An unconfirmed interrupt remains uncertain. Use `subagent_stop` to end the child lifecycle; graceful stop already interrupts first when needed, so a separate interrupt is not an ordinary prerequisite.
 7. Require an evidence-bound terminal handoff. Child status, claims, artifacts, exit state, or test output are evidence—not parent verification.
 8. Resolve every owned run before finalizing: stop it or deliberately retain it with reason and useful identifiers. Never act destructively on observational, orphaned, uncertain, other-session, or unknown resources.
 
