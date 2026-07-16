@@ -2,65 +2,76 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const skillPath = new URL("../../skills/use-subagents/SKILL.md", import.meta.url);
-const referencePath = new URL("../../skills/use-subagents/references/prompt-and-safety.md", import.meta.url);
+const skillPath = new URL("../../skills/use-herdr-subagents/SKILL.md", import.meta.url);
+const referencePath = new URL("../../skills/use-herdr-subagents/references/prompt-and-safety.md", import.meta.url);
 
-test("use-subagents is parent-only, implementation-neutral, and exposes exactly five lifecycle tools", async () => {
+test("use-herdr-subagents is a distinct parent-only runtime skill with exactly five lifecycle tools", async () => {
   const [skill, reference] = await Promise.all([readFile(skillPath, "utf8"), readFile(referencePath, "utf8")]);
-  assert.match(skill, /^name: use-subagents$/m);
+  assert.match(skill, /^name: use-herdr-subagents$/m);
   assert.match(skill, /parent-only/i);
+  assert.match(skill, /Use other applicable subagent skills in conjunction with this skill when they are available and possible/i);
+  assert.match(skill, /broader delegation strategy or decomposition.*this extension's exact lifecycle/is);
+  assert.doesNotMatch(`${skill}\n${reference}`, /(?:^|[^-])\buse-subagents\b/i, "the runtime skill must not name a separate subagent skill");
   for (const name of ["subagent_start", "subagent_status", "subagent_send", "subagent_interrupt", "subagent_stop"]) {
     assert.match(skill, new RegExp(`\\b${name}\\b`));
   }
-  assert.doesNotMatch(`${skill}\n${reference}`, /\bHerdr\b|herdr_|command -v|child_process|spawn\(|native-and-cli-backends/i);
   assert.doesNotMatch(skill, /subagent_(list|get|wait)\b/);
-  assert.match(skill, /Every successful `subagent_start` creates an outstanding result obligation/i);
-  assert.match(skill, /start result is never task completion/i);
-  assert.match(skill, /List mode never counts as result inspection/i);
-  assert.match(skill, /Inspect every parallel run individually/i);
-  assert.match(reference, /mandatory result obligation/i);
-  assert.match(reference, /Call `subagent_status` for that exact ID/i);
-  assert.match(skill, /required tool or ownership proof is unavailable, fail closed/i);
-  assert.match(skill, /Do not invent a fallback/i);
-  assert.match(skill, /ask a child to delegate/i);
+  assert.match(skill, /required tool or ownership proof is unavailable/i);
+  assert.match(skill, /Do not invent shell\/process fallbacks/i);
 });
 
-test("skill covers deliberate delegation, fresh context, least privilege, isolation, monitoring, verification, and lifecycle resolution", async () => {
-  const [skill, reference] = await Promise.all([readFile(skillPath, "utf8"), readFile(referencePath, "utf8")]);
+test("skill provides a compact standalone baseline and extension-specific profile guidance", async () => {
+  const skill = await readFile(skillPath, "utf8");
   for (const contract of [
     /one bounded role, scope, output, and stopping condition/i,
-    /fresh context or expertise, independent judgment, context isolation, or meaningful parallelism/i,
-    /exceeds startup, monitoring, synthesis, parent verification, and cleanup cost/i,
-    /Default to read-only and least privilege/i,
-    /fresh child for a new assignment or independent judgment/i,
-    /One writer owns one isolated lane/i,
-    /must not mutate an active writer's checkout/i,
-    /blocked`, `unknown`, timeout, or failure/i,
-    /After two failures with the same cause/i,
-    /Child status, claims, artifacts, exit state, or test output are evidence—not parent verification/i,
-    /Resolve every owned run before finalizing/i,
+    /materially exceeds coordination and verification cost/i,
+    /Default to read-only/i,
+    /Parallelize only separable work/i,
+    /writer owns one isolated lane/i,
+    /`scout`.*Read-only repository reconnaissance/is,
+    /`researcher`.*launch blocks/is,
+    /`worker`.*isolated writer worktree/is,
+    /Prefer the selected profile's defaults/i,
+    /Broadening can block or require interactive human confirmation/i,
   ]) assert.match(skill, contract);
-  assert.match(skill, /subagent_interrupt.*cancel the current turn.*subagent_stop.*end the child lifecycle/is);
-  assert.match(skill, /separate interrupt is not an ordinary prerequisite/i);
-  assert.match(skill, /Optional progress is supporting evidence, never a prerequisite for safe removal/i);
-  assert.match(reference, /Never fire and forget/i);
-  assert.match(reference, /observed evidence.*separated from inference/i);
-  assert.match(reference, /capture optional progress when present, without requiring it/i);
-  assert.match(reference, /Never delete durable run metadata or handoff evidence/i);
+  assert.doesNotMatch(skill, /independent fan-out|staged pipeline|select a runtime|non-interactive agent CLI/i);
 });
 
-test("skill uses concise progressive disclosure with complete safety routing", async () => {
+test("skill teaches the mandatory start, inspect, follow-up, stop, and verification lifecycle", async () => {
+  const [skill, reference] = await Promise.all([readFile(skillPath, "utf8"), readFile(referencePath, "utf8")]);
+  for (const contract of [
+    /completion\.pending: true.*mandatory next action/is,
+    /List mode never satisfies result inspection/i,
+    /inspect every parallel run individually/i,
+    /accepted follow-up creates another exact-ID result obligation/i,
+    /confirmed.*unconfirmed.*uncertain/is,
+    /never resend uncertain input automatically/i,
+    /interrupt.*current turn.*preserving the session/is,
+    /Check `result\.stopped`.*outer tool success does not prove/is,
+    /Resolve each owned run before finalizing/i,
+    /Child output, status, artifacts, exit state, and test claims are evidence, not proof/i,
+  ]) assert.match(skill, contract);
+  assert.match(reference, /Use `subagent_status` in exactly one mode/i);
+  assert.match(reference, /scope.*list-only/i);
+  assert.match(reference, /timeoutMs.*explicit `states`/i);
+  assert.match(reference, /Graceful stop may return `stopped: false`/i);
+});
+
+test("skill uses concise progressive disclosure for runtime safety and cleanup", async () => {
   const [skill, reference] = await Promise.all([readFile(skillPath, "utf8"), readFile(referencePath, "utf8")]);
   assert.match(skill, /references\/prompt-and-safety\.md/);
   assert.ok(skill.split("\n").length <= 100);
   assert.ok(reference.split("\n").length <= 120);
   for (const contract of [
-    /absolute checkout path and starting files\/questions/i,
-    /permission.*forbidden operations/i,
-    /evidence and validation required/i,
-    /stopping condition and explicit timeout\/budget/i,
-    /unconditional prohibition on recursive delegation/i,
+    /absolute checkout path.*starting files\/questions/i,
+    /allowed tools\/paths.*forbidden operations/i,
+    /no recursive delegation/i,
     /must not edit, format, install into, stash, restore, clean/i,
-    /Child claims, status, exit codes, and artifacts are not proof/i,
+    /cleanup: "remove_if_safe"/i,
+    /Provide `parentReview`/i,
+    /no_changes.*commit_contained.*tree_matches/is,
+    /optional progress.*never require it/i,
+    /Safe worktree removal never deletes its branch/i,
+    /Dirty discard.*human-only/i,
   ]) assert.match(reference, contract);
 });

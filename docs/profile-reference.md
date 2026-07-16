@@ -68,7 +68,7 @@ Optional fields:
 
 Pi supports explicit child tool allowlists but not filesystem confinement. Claude uses reviewed built-in mappings and native permission policy, also without filesystem confinement. Codex profiles cannot claim an explicit per-tool allowlist; its sandbox/approval policy is used instead.
 
-Pi children receive no trust, skill, or prompt-template override flags. Each separate Pi process resolves project trust normally, then discovers global/project/package/settings skills and prompt templates as an ordinary Pi instance. Saved trust and global settings are shared through the normal user environment; transient parent `--approve` and session-only trust choices are not inherited. The package contributes `use-subagents` dynamically in parent mode only, while child guards still prohibit orchestration/delegation tools.
+Pi children receive no trust, skill, or prompt-template override flags. Each separate Pi process resolves project trust normally, then discovers global/project/package/settings skills and prompt templates as an ordinary Pi instance. Saved trust and global settings are shared through the normal user environment; transient parent `--approve` and session-only trust choices are not inherited. The package contributes `use-herdr-subagents` dynamically in parent mode only, while child guards still prohibit orchestration/delegation tools.
 
 Legacy profile `skills` and `preferredSkills` fields are rejected with a migration error; remove them and rely on normal Pi discovery. Bundled researcher preferences count only when a preferred reviewed external-source tool is actually exposed. Otherwise launch blocks rather than presenting memory output as researched.
 

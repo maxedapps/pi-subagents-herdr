@@ -59,7 +59,7 @@ Every successful start reports `completion.pending` with the exact required `sub
 - `researcher`: Pi, read-only sourced research when reviewed external tools are actually exposed, parent-materialized handoff, no progress file.
 - `worker`: Pi, mutation tools, isolated writer worktree, preserved child handoff, parent-owned final wrapper, plus optional configured progress.
 
-Bundled profiles do not pin models and prohibit recursive delegation. Profiles do not configure skills; Pi children discover them normally. The package contributes `use-subagents` dynamically in parent mode only. It teaches deliberate bounded delegation, least privilege, fresh context, writer isolation, blocked-flow monitoring, parent verification, and lifecycle resolution without exposing backend architecture. Child mode contributes neither that skill nor orchestration tools.
+Bundled profiles do not pin models and prohibit recursive delegation. Profiles do not configure skills; Pi children discover them normally. The package contributes `use-herdr-subagents` dynamically in parent mode only. It teaches the extension's exact five-tool lifecycle, profile selection, least privilege, result inspection, blocked/uncertain handling, writer isolation, parent verification, and cleanup. It also tells agents to pair other applicable subagent skills with it when available and possible, without requiring or naming one. Child mode contributes neither that skill nor orchestration tools.
 
 ## Settings
 

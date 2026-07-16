@@ -59,7 +59,7 @@ test("contracts reject conflicting stable identity proof", () => {
 });
 
 test("contracts resolve assets relative to the package and block escapes", () => {
-  assert.equal(PACKAGE_ASSETS.skill, resolve(getPackageRoot(), "skills/use-subagents/SKILL.md"));
+  assert.equal(PACKAGE_ASSETS.skill, resolve(getPackageRoot(), "skills/use-herdr-subagents/SKILL.md"));
   assert.equal(PACKAGE_ASSETS.agents, resolve(getPackageRoot(), "agents"));
   assert.throws(() => resolvePackagePath("..", "outside"), /escapes/);
   assert.throws(() => resolvePackagePath(resolve("/tmp")), /must be relative/);

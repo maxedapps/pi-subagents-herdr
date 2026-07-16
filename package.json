@@ -29,7 +29,7 @@
     "e2e:herdr:real": "node scripts/e2e-herdr-smoke.mjs",
     "docs:check": "node scripts/check-doc-links.mjs",
     "test:core": "tsx --test --test-concurrency=2 tests/unit/*.test.ts tests/profiles/*.test.ts tests/artifacts/*.test.ts tests/herdr/*.test.ts tests/harnesses/*.test.ts tests/runtime/*.test.ts tests/worktrees/*.test.ts tests/tools/*.test.ts tests/skill/*.test.ts tests/ui/*.test.ts tests/integration/clean-load.test.ts tests/integration/fixtures.test.ts tests/integration/lifecycle.test.ts",
-    "skill:check": "skills-ref validate skills/use-subagents",
+    "skill:check": "skills-ref validate skills/use-herdr-subagents",
     "check:full": "npm run typecheck && npm run test:core && npm run docs:check && npm run test:e2e && npm run pack:inspect && npm run skill:check"
   },
   "pi": {

@@ -20,6 +20,6 @@ export function resolvePackagePath(...segments: readonly string[]): string {
 }
 
 export const PACKAGE_ASSETS = Object.freeze({
-  skill: resolvePackagePath("skills", "use-subagents", "SKILL.md"),
+  skill: resolvePackagePath("skills", "use-herdr-subagents", "SKILL.md"),
   agents: resolvePackagePath("agents"),
 });

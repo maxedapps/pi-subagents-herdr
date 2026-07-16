@@ -38,6 +38,6 @@ test("Pi child uses normal resource discovery without package parent resources o
     for (const removed of ["--approve", "--no-approve", "--no-skills", "--skill", "--no-prompt-templates"]) {
       assert.equal(prepared.launch.argv.includes(removed), false);
     }
-    assert.doesNotMatch(prepared.launch.argv.join(" "), /use-subagents\/SKILL\.md|subagent_start/);
+    assert.doesNotMatch(prepared.launch.argv.join(" "), /use-herdr-subagents\/SKILL\.md|subagent_start/);
   } finally { await cli.cleanup(); await rm(root, { recursive: true, force: true }); }
 });

@@ -19,7 +19,7 @@ Invariants:
 
 `session_start` loads namespaced settings/profiles, validates backend parent identity, recovers active-branch runs/worktrees, and starts subscriptions. `/tree` changes authority in place, so actions reread the active branch. `session_shutdown` is idempotent and non-destructive.
 
-Parent mode contributes `use-subagents` through Pi's dynamic `resources_discover` event. `PI_HERDR_SUBAGENT=1` returns child mode immediately: no parent tools, commands, dashboard, lifecycle runtime, or package-provided orchestration skill. Pi children receive no trust, skill, or prompt-template override flags and use ordinary independent Pi trust/resource discovery. Saved trust and global settings remain available normally; transient parent `--approve` and session-only trust do not transfer to a separate child process.
+Parent mode contributes `use-herdr-subagents` through Pi's dynamic `resources_discover` event. `PI_HERDR_SUBAGENT=1` returns child mode immediately: no parent tools, commands, dashboard, lifecycle runtime, or package-provided orchestration skill. Pi children receive no trust, skill, or prompt-template override flags and use ordinary independent Pi trust/resource discovery. Saved trust and global settings remain available normally; transient parent `--approve` and session-only trust do not transfer to a separate child process.
 
 ## Five-tool surface
 

@@ -14,7 +14,7 @@ const archivePath = resolve(projectRoot, filename);
 const listing = execFileSync("tar", ["-tzf", archivePath], { encoding: "utf8" }).trim().split("\n");
 const required = [
   "package/extensions/herdr-subagents/index.ts",
-  "package/skills/use-subagents/SKILL.md",
+  "package/skills/use-herdr-subagents/SKILL.md",
   "package/agents/README.md",
   "package/agents/scout.md",
   "package/agents/researcher.md",
@@ -31,7 +31,7 @@ const required = [
   "package/src/tools/index.ts",
   "package/src/tools/service.ts",
   "package/src/tools/schemas.ts",
-  "package/skills/use-subagents/references/prompt-and-safety.md",
+  "package/skills/use-herdr-subagents/references/prompt-and-safety.md",
   "package/src/artifacts/git-ignore.ts",
   "package/src/artifacts/handoff.ts",
   "package/scripts/conformance-herdr-no-model.ts",
@@ -182,6 +182,9 @@ process.stdout.write("packed-isolated-load ok: extension import closure + contra
   const fixtureSkill = join(isolatedAgentDir, "skills", "ordinary-fixture", "SKILL.md");
   mkdirSync(dirname(fixtureSkill), { recursive: true });
   writeFileSync(fixtureSkill, "---\nname: ordinary-fixture\ndescription: Ordinary child discovery fixture\n---\nUse this fixture only to prove normal skill discovery.\n");
+  const genericSubagentSkill = join(isolatedAgentDir, "skills", "use-subagents", "SKILL.md");
+  mkdirSync(dirname(genericSubagentSkill), { recursive: true });
+  writeFileSync(genericSubagentSkill, "---\nname: use-subagents\ndescription: Generic subagent strategy fixture\n---\nUse this fixture only to prove that a generic subagent skill can coexist with the package runtime skill.\n");
   const environment = {
     ...process.env,
     HOME: isolatedHome,
@@ -219,18 +222,23 @@ process.stdout.write("packed-isolated-load ok: extension import closure + contra
     return response.data.commands;
   };
   const parentCommands = rpc({ PI_HERDR_SUBAGENT: "0" });
-  for (const name of ["subagents", "subagents-doctor", "skill:use-subagents"]) {
+  for (const name of ["subagents", "subagents-doctor", "skill:use-herdr-subagents", "skill:use-subagents"]) {
     if (!parentCommands.some((command) => command.name === name)) throw new Error(`Actual isolated Pi package load omitted ${name}`);
   }
-  const packageCommands = parentCommands.filter((command) => ["subagents", "subagents-doctor", "skill:use-subagents"].includes(command.name));
+  const packageCommands = parentCommands.filter((command) => ["subagents", "subagents-doctor", "skill:use-herdr-subagents"].includes(command.name));
   for (const command of packageCommands) {
     const sourcePath = command.sourceInfo?.path ?? command.path;
     if (typeof sourcePath !== "string" || !realpathSync(sourcePath).startsWith(`${realpathSync(installedPackage)}${sep}`)) throw new Error(`Pi loaded ${command.name} outside the exact archive install: ${String(sourcePath)}`);
   }
+  const genericCommand = parentCommands.find((command) => command.name === "skill:use-subagents");
+  const genericSourcePath = genericCommand?.sourceInfo?.path ?? genericCommand?.path;
+  if (typeof genericSourcePath !== "string" || realpathSync(genericSourcePath) !== realpathSync(genericSubagentSkill)) throw new Error("Generic subagent fixture did not coexist with the package runtime skill");
   const childCommands = rpc({ PI_HERDR_SUBAGENT: "1" });
-  if (childCommands.some((command) => command.name === "subagents" || command.name === "subagents-doctor" || command.name === "skill:use-subagents")) throw new Error("Actual isolated Pi child-mode load exposed parent orchestration resources");
-  if (!childCommands.some((command) => command.name === "skill:ordinary-fixture")) throw new Error("Actual isolated Pi child-mode load failed to discover an ordinary fixture skill");
-  isolatedLoadOutput += "; actual Pi RPC loaded parent extension+doctor+skill from the exact archive, child mode hid parent resources, and child normal discovery loaded ordinary-fixture";
+  if (childCommands.some((command) => command.name === "subagents" || command.name === "subagents-doctor" || command.name === "skill:use-herdr-subagents")) throw new Error("Actual isolated Pi child-mode load exposed parent orchestration resources");
+  for (const name of ["skill:ordinary-fixture", "skill:use-subagents"]) {
+    if (!childCommands.some((command) => command.name === name)) throw new Error(`Actual isolated Pi child-mode load failed to discover ${name}`);
+  }
+  isolatedLoadOutput += "; actual Pi RPC loaded parent extension+doctor+runtime skill from the exact archive alongside a generic subagent skill, child mode hid package parent resources, and child normal discovery loaded both ordinary fixtures";
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });
 }

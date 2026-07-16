@@ -23,7 +23,7 @@ Herdr CLI commands are for diagnosis, not bypassing extension ownership or lifec
 
 Pi children receive neither `--approve` nor `--no-approve`, and no skill/prompt-template suppression or explicit-skill flags. Each child process resolves project trust normally. Persisted trust and global settings/resources are available in the ordinary user environment; a transient parent `--approve` or session-only trust decision is not inherited. If a child shows the standard trust prompt, resolve it as an ordinary Pi trust decision before expecting project settings, skills, or templates to load.
 
-The package contributes `use-subagents` only to the parent through dynamic resource discovery. Child mode still contributes no orchestration skill, tools, commands, UI, or lifecycle handlers.
+The package contributes `use-herdr-subagents` only to the parent through dynamic resource discovery. Child mode still contributes no orchestration skill, tools, commands, UI, or lifecycle handlers.
 
 ## Start and monitor
 

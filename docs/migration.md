@@ -45,9 +45,9 @@ subagent_status({ id: "<id>", states: ["done", "idle", "blocked"], timeoutMs: 90
 
 ## Skill migration
 
-The bundled skill is now `skills/use-subagents/SKILL.md` with command `/skill:use-subagents`. It is implementation-neutral and contributed dynamically in parent mode only. Replace any separately installed global skill deliberately after package qualification; package installation does not modify global skill files.
+The bundled runtime skill is now `skills/use-herdr-subagents/SKILL.md` with command `/skill:use-herdr-subagents`. It is contributed dynamically in parent mode only and can coexist with separately installed subagent strategy skills. Package installation does not modify global skill files.
 
-Child guards prohibit `use-subagents` and recursive orchestration tools.
+Child mode contributes neither `use-herdr-subagents` nor recursive orchestration tools.
 
 ## Profile migration
 
