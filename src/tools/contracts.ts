@@ -31,6 +31,11 @@ export interface RunSummary {
   readonly workspaceId?: string;
   readonly worktree?: WorktreeStateView;
   readonly attention?: PublicRunAttention;
+  readonly residue?: {
+    readonly policyKind: "read_only" | "writer" | "unknown";
+    readonly provenance: "validated_metadata" | "malformed" | "unsafe";
+    readonly blocker: string;
+  };
 }
 
 export interface StartCompletionPending {

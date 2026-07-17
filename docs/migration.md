@@ -1,4 +1,4 @@
-# Migration to action-required automatic finalization
+# Migration to passive attention and explicit recovery
 
 This private package intentionally changes lifecycle/artifact behavior without adding tools.
 
@@ -21,13 +21,13 @@ The five tools remain:
 
 Writer stop now defaults to automatic `remove_if_safe`; explicit `cleanup: "retain"` is exceptional. `subagent_stop` is idempotent for a proven already-stopped owned run, so the same call retries after integration, transient refusal, or reload. `parentReview` remains accepted as optional audit text but is not a deletion gate.
 
-Pi results remain exact structured finals. Claude, Codex, and Grok results are bounded Herdr terminal transcripts with explicit source/truncation metadata; no CLI-specific parser is added. Results can contain `ACTION REQUIRED`; later unresolved transitions use `herdr-subagents.action-required.v1`. Status/UI expose the same attention state. Resolve it before final reporting.
+Pi results remain exact structured finals. Claude, Codex, and Grok results are bounded Herdr terminal transcripts with explicit source/truncation metadata; no CLI-specific parser is added. Completed results are the only automatic parent-turn delivery and contain no action block. Later unresolved transitions are passive `run.attention` in status/TUI/doctor. Resolve them explicitly before final reporting.
 
 ## Runtime metadata and recovery
 
-New runs write schema-v5 `run.json` with lifecycle, action state, ownership journal, and exact worktree snapshot while unresolved. Earlier metadata schemas are intentionally unsupported during early development; remove or archive old `.subagents/runs/*` state before loading this version.
+New runs continue writing schema-v5 `run.json` with lifecycle, passive attention, ownership journal, and exact worktree snapshot while unresolved. Existing schema-v5 attention delivery fields remain inert compatibility state; newly derived attention stays `derived`. Exact legacy parent-persisted failed action evidence is recognized read-only and never replayed.
 
-Schema-v5 prior-session cleanup can be reauthorized only after exact stopped Git/Herdr/nonce/branch/path/anchor proof. This never adopts a process or prior private result.
+Startup does not adopt, finalize, message about, or otherwise mutate prior-session residue. Schema-v5 prior-session cleanup can be reauthorized only by an explicit exact-ID stop after exact stopped identity and result/failure evidence checks; writers retain full Git/Herdr/anchor proof, while read-only records do not require worktree metadata. This never adopts a process or exposes prior private output.
 
 Rollback must first resolve or intentionally retain owned runs. Disabling package loading does not stop children.
 
@@ -48,7 +48,7 @@ Legacy `skills`, `preferredSkills`, `artifacts.prompt`, and `artifacts.system` r
 
 ## Finalization and residue
 
-After a parent-persisted result envelope or exact parent-persisted `failed` notice plus clean objective integration/no-change proof, finalization removes:
+After a parent-persisted result envelope or exact non-model-visible branch-bound failure entry (or exact legacy failed action evidence) plus clean objective integration/no-change proof, finalization removes:
 
 1. Herdr workspace/tabs/panes and linked worktree, non-forcibly;
 2. only the exact manager-generated branch at its expected child HEAD;

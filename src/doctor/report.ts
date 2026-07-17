@@ -63,6 +63,12 @@ export interface DoctorOptions {
   readonly activeTools?: readonly string[];
   readonly runtimeEvidence?: readonly DoctorRunEvidence[];
   readonly worktrees?: readonly WorktreeStateView[];
+  readonly priorResidue?: readonly {
+    readonly runId: string;
+    readonly policyKind: "read_only" | "writer" | "unknown";
+    readonly provenance: "validated_metadata" | "malformed" | "unsafe";
+    readonly blocker: string;
+  }[];
   readonly client?: HerdrClient;
   readonly startupIssue?: string;
   readonly now?: () => Date;
@@ -258,6 +264,15 @@ export async function createDoctorReport(options: DoctorOptions): Promise<Doctor
     checks.push(check("recovery.observational", "recovery", observational.length === 0 ? "pass" : "info", observational.length === 0 ? "No additional live Herdr agents require observational retention" : `${observational.length} unowned/orphan/global live agent(s) retained observationally`, observational.map((item) => `${item.terminalId} ${item.agent} ${item.status}`)));
   }
 
+  const residue = options.priorResidue ?? [];
+  checks.push(check(
+    "recovery.prior-stopped-residue",
+    "recovery",
+    residue.length === 0 ? "pass" : "warning",
+    residue.length === 0 ? "No prior-session stopped residue was found" : `${residue.length} prior-session stopped residue record(s) require explicit exact-ID inspection or cleanup`,
+    residue.map((item) => `${item.runId}: ${item.policyKind} ${item.provenance} — ${item.blocker}`),
+  ));
+
   const worktrees = options.worktrees ?? [];
   checks.push(check("worktrees.state", "worktrees", worktrees.some((item) => item.state === "dirty" || item.state === "retained" || item.removalRefusal) ? "warning" : "pass", worktrees.length === 0 ? "No active-branch worktree records" : `${worktrees.length} active-branch worktree record(s) inspected read-only`, worktrees.map((item) => `${item.id}: ${item.state} ${item.checkoutPath}${item.retentionReason ? ` — ${item.retentionReason}` : ""}`)));
 
@@ -271,7 +286,7 @@ export async function createDoctorReport(options: DoctorOptions): Promise<Doctor
     summary,
     checks,
     observational,
-    retentionGuidance: "Uncertain, orphaned, other-session, and global agents/worktrees are observational only. Retain their panes, checkouts, branches, and artifacts; this package does not adopt or destructively clean them.",
+    retentionGuidance: "Uncertain, orphaned, other-session, and global resources are observational only. Retain them unless an explicit exact-ID stop revalidates cleanup provenance; startup never adopts or cleans prior-session residue.",
     destructiveActions: [],
   };
 }

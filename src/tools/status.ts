@@ -9,10 +9,10 @@ export function registerStatusTool(pi: ExtensionAPI, runtime: HerdrToolRuntimeCo
   pi.registerTool({
     name,
     label: "Subagent Status",
-    description: "Observe subagents in exactly one mode: omit id to list an optional scope; provide id without states to inspect details, captured result/source/stage when available, and bounded terminal diagnostics; provide id with explicit states to wait with a bounded timeout and then return the same detailed inspection. Scope is list-only, timeoutMs is wait-only, and invalid combinations fail. Automatic result delivery does not require this tool, but exact-ID inspection remains the recovery path.",
+    description: "Observe subagents in exactly one mode: omit id to list an optional scope; provide id without states to inspect details, captured result/source/stage when available, and bounded terminal diagnostics; provide id with explicit states to wait with a bounded timeout and then return the same detailed inspection. Project scope and exact-ID inspection passively expose prior stopped cleanup residue without private child output. Automatic completed-result delivery does not require this tool; all other obligations remain passive run.attention until explicit action.",
     promptSnippet: "List subagents, inspect one, or wait for states then inspect output",
     promptGuidelines: [
-      "Use subagent_status without id to list; with id to inspect; and with id plus states to wait then inspect. Treat run.attention as an unresolved parent obligation. Resolve blocked, failed, timed-out, unknown, review-required, and cleanup-required runs before final reporting. Results usually arrive automatically; use exact-ID status for live inspection and recovery.",
+      "Use subagent_status without id to list; with id to inspect; and with id plus states to wait then inspect. Treat run.attention as an unresolved passive parent obligation. Resolve blocked, failed, timed-out, unknown, review-required, and cleanup-required runs before final reporting. Only completed results arrive automatically; use exact-ID status and explicit subagent_stop for prior stopped cleanup residue.",
     ],
     parameters: StatusToolSchema,
     async execute(_toolCallId, params, signal): Promise<AgentToolResult<unknown>> {

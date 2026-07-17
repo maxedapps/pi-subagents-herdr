@@ -7,7 +7,7 @@ import { exactToolPayload } from "../results/presentation.ts";
 export function registerStopTool(pi: ExtensionAPI, runtime: HerdrToolRuntimeController, name: string): void {
   pi.registerTool({
     name, label: "Subagent Stop",
-    description: "Gracefully stop, or explicitly force-close, only a freshly identity-verified current-active-branch owned subagent. The same call is idempotent for an already-stopped owned run and retries cleanup. Writer cleanup defaults to remove_if_safe: it requires parent-persisted result/failure evidence, objective no-change/integration proof, cleanliness, idle owned topology, and exact provenance. Refusals retain work and return an actionable retry reason; dirty discard is never implied.",
+    description: "Gracefully stop, or explicitly force-close, a freshly identity-verified current-active-branch owned subagent. For an otherwise unknown exact ID, explicitly attempt cleanup-only adoption of proven-stopped prior-session residue; never adopt a live process. Writer cleanup defaults to remove_if_safe and requires parent-persisted result/failure evidence, objective no-change/integration proof, cleanliness, idle owned topology, and exact provenance. Refusals retain work in passive attention; dirty discard is never implied.",
     promptSnippet: "Stop one owned subagent and automatically finalize its writer resources when proven safe",
     parameters: StopToolSchema,
     async execute(_id, params, signal) {

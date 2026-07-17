@@ -36,13 +36,18 @@ test("doctor is truthful, read-only, and reports parent identity, optional capab
     const report = await createDoctorReport({
       context: { cwd: root, isProjectTrusted: () => false, sessionManager: { getSessionId: () => "parent-session", getSessionFile: () => undefined, getBranch: () => [] } },
       environment: { ...process.env, HERDR_ENV: "1", HERDR_SOCKET_PATH: server.socketPath, HERDR_PANE_ID: "w1:p1", HERDR_TAB_ID: "w1:t1", HERDR_WORKSPACE_ID: "w1" },
-      agentDir, activeTools: [], client, probe, now: () => new Date("2026-07-15T00:00:00.000Z"),
+      agentDir, activeTools: [], client, probe,
+      priorResidue: [{ runId: "run-prior", policyKind: "read_only", provenance: "validated_metadata", blocker: "explicit exact-ID stop required" }],
+      now: () => new Date("2026-07-15T00:00:00.000Z"),
     });
     assert.equal(report.package.private, true);
     assert.deepEqual(report.destructiveActions, []);
     assert.equal(report.observational.some((item) => item.terminalId === "term-global"), true);
     assert.equal(report.checks.some((item) => item.id === "herdr.parent-identity" && item.status === "pass"), true);
     assert.equal(report.checks.some((item) => item.id === "capabilities.research" && item.status === "warning"), true);
+    const prior = report.checks.find((item) => item.id === "recovery.prior-stopped-residue");
+    assert.deepEqual(prior?.details, ["run-prior: read_only validated_metadata — explicit exact-ID stop required"]);
+    assert.doesNotMatch(JSON.stringify(prior), /private output|private result/);
     assert.match(formatDoctorReport(report), /Doctor is read-only/);
     await assert.rejects(readFile(join(root, ".subagents", "anything"), "utf8"), /ENOENT/);
   } finally { await server.close(); await rm(root, { recursive: true, force: true }); }

@@ -28,7 +28,7 @@ subagent_status({ id: "<id>", lines: 160 })
 subagent_status({ scope: "all_owned" })
 ```
 
-Results arrive automatically as separate custom messages: Pi delivers an exact structured final; Claude, Codex, and Grok deliver a bounded Herdr terminal transcript labeled with source/truncation. Collapsed result messages show the first meaningful child line; Ctrl+O expands the exact bounded parent-visible content. Exact-ID status shows `capture_pending` while a submitted generation has no durable envelope and `capture_unavailable` plus its bounded close reason when capture closes without one. A writer result can include `ACTION REQUIRED` with exact checkout/branch/base/HEAD/clean/ahead facts and the next stop/integration step. Later blockers, failures, cleanup refusals, and recovery issues use a deduplicated follow-up message and the same `run.attention` status/TUI state. Treat it as unresolved until cleanup succeeds or an explicit blocker is reported.
+Completed results arrive automatically as separate custom messages: Pi delivers an exact structured final; Claude, Codex, and Grok deliver a bounded Herdr terminal transcript labeled with source/truncation. Collapsed result messages show the first meaningful child line; Ctrl+O expands the exact bounded parent-visible content. Result messages contain no action block and are the only lifecycle path that starts a parent model turn. Exact-ID status shows `capture_pending` while a submitted generation has no durable envelope and `capture_unavailable` plus its bounded close reason when capture closes without one. Writer review, blockers, failures, cleanup refusals, and recovery issues remain passive in `run.attention`, project/exact status, TUI, and doctor. Inspect and resolve them explicitly.
 
 Blocked state is not permission to self-approve. Use one bounded same-assignment follow-up when appropriate. For send/interrupt, inspect `unconfirmed` and `uncertain`; never retry uncertain input automatically.
 
@@ -48,35 +48,35 @@ Cleanup retains and reports an exact retry action unless all of these hold:
 
 - current ownership or exact cleanup-only adoption is authoritative;
 - child/native agent is gone and only recorded idle anchors remain;
-- a result envelope or exact `failed` notice is parent-persisted; other notices never qualify;
+- a result envelope or exact branch/session/run/nonce-bound failure custom entry is parent-persisted; passive attention never qualifies, while exact legacy failed action evidence remains read-only compatible;
 - checkout is clean and no-change/integration is objectively proven;
 - Herdr/Git repository, workspace, worktree path, branch, and child HEAD match;
 - every present explicit custom artifact is copied and hash verified.
 
 On success it removes the Herdr workspace/tabs/panes and linked worktree, compare-deletes the exact manager-generated branch at its expected HEAD, and purges transient run metadata/results. Caller-supplied or moved branches are never deleted. Force stop affects only the process; dirty discard remains human-only.
 
-Explicit `cleanup: "retain"` remains available for exceptional intentional retention and creates action-required state.
+Explicit `cleanup: "retain"` remains available for exceptional intentional retention and creates passive cleanup-required attention.
 
 ## Dashboard
 
-`/subagents` shows current-session runs plus stopped runs needing action. Controls are ↑/↓, Enter focus, `x` graceful stop with automatic safe finalization, `r`, and Escape. A refusal is shown as warning/action-required, never completion.
+`/subagents` shows current-session runs plus stopped runs needing attention. Controls are ↑/↓, Enter focus, `x` graceful stop with automatic safe finalization, `r`, and Escape. A refusal is shown passively as a warning, never completion or a model-turn trigger.
 
 ## Recovery
 
 Children survive extension reload/shutdown.
 
-- Current-session active-branch stopped journals resume through the same stop/finalize path.
-- Schema-v3/v4 metadata is accepted for current-branch migration.
-- A later parent session may reauthorize cleanup only for a schema-v5 stopped journal with exact parent/child Git, nonce, branch/path, Herdr workspace/anchors, idle/no-agent, and clean-checkout proof.
-- Cross-session cleanup adoption never controls a process or delivers prior private output.
-- Legacy/ambiguous/dirty/live/moved/tampered resources remain untouched and appear in one consolidated startup recovery notice.
-- `/tree`-abandoned and global resources remain observational.
+- Startup reconstructs current active-branch state only; it never finalizes or mutates prior-session residue and sends no recovery message.
+- Prior stopped residue appears passively in project/exact status and `/subagents-doctor` without prior private child output.
+- A later parent session may reauthorize cleanup only after an explicit exact-ID `subagent_stop` and full schema-v5 stopped provenance checks.
+- Read-only residue requires current checkout identity, no live terminal/native agent, and exact result/failure evidence, but no worktree metadata.
+- Writers retain clean worktree/Git/Herdr/idle-anchor checks. Legacy/ambiguous/dirty/live/moved/tampered resources remain untouched.
+- Cleanup-only adoption never controls a prior process; `/tree`-abandoned and global resources remain observational.
 
 Do not edit journals or metadata to manufacture authority.
 
 ## Artifact lifecycle
 
-Bundled profiles write no handoff/progress files. While unresolved, parent operational files are `run.json` and optional `results/`. The delivered result envelope (exact Pi final or bounded non-Pi transcript), or an exact persisted `failed` notice, is the durable handoff. Private prompt/session/exchange files remain only while live or capture-uncertain.
+Bundled profiles write no handoff/progress files. While unresolved, parent operational files are `run.json` and optional `results/`. The delivered result envelope (exact Pi final or bounded non-Pi transcript), or an exact non-model-visible `herdr-subagents.failure.v1` entry, is the durable handoff. Private prompt/session/exchange files remain only while live or capture-uncertain.
 
 Custom profile artifacts are explicit supplemental retention. Present files inside a writer worktree are copied under parent-owned `captured/` and byte/SHA-256 verified. Missing optional files do not gate cleanup; a failed copy of a present file retains. Successful default finalization leaves no `.subagents/runs/<id>` directory; custom captures remain.
 
@@ -92,9 +92,9 @@ Git-local excludes protect `/.subagents/` and only explicitly requested `/.progr
 | incompatible protocol/integration | install a reviewed compatible version |
 | profile collision/schema error | remove duplicate/unsupported fields |
 | research unavailable | expose reviewed research tools or choose another task |
-| action/cleanup required | inspect exact run facts, resolve blocker, retry `subagent_stop` |
+| passive attention/cleanup required | inspect exact run facts, resolve blocker, retry `subagent_stop` |
 | dirty/unintegrated writer | review/test/integrate; never discard automatically |
-| legacy cleanup proof incomplete | retain; inspect the consolidated recovery notice |
+| prior cleanup proof incomplete | retain; inspect project/exact status or doctor, then retry only an explicit exact-ID stop after resolving the blocker |
 
 ## Exact archive activation and rollback
 

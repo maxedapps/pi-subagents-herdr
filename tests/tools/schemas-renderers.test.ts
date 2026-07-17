@@ -33,7 +33,7 @@ test("subagent_start metadata prefers profile defaults and reports thinking clam
   assert.match(definition!.description, /delivers results automatically/);
   assert.equal((definition!.promptGuidelines ?? []).length <= 2, true);
   assert.match((definition!.promptGuidelines ?? []).join("\n"), /Omit optional overrides unless required/);
-  assert.match((definition!.promptGuidelines ?? []).join("\n"), /adjustments and ACTION REQUIRED/);
+  assert.match((definition!.promptGuidelines ?? []).join("\n"), /passive run\.attention/);
 
   const properties = (StartToolSchema as unknown as { properties: Record<string, { description?: string }> }).properties;
   for (const field of ["harness", "model", "thinking", "cwd", "worktree"]) assert.equal(typeof properties[field]?.description, "string", `${field} needs actionable guidance`);

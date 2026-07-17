@@ -15,21 +15,21 @@ Invariants:
 
 ## Extension and result lifecycle
 
-Factory registration has no runtime side effects. `session_start` loads settings/profiles, verifies the owning parent, recovers active-branch state, reconciles stopped cleanup journals, and starts result/action/subscription services. `session_shutdown` closes extension services only; children survive.
+Factory registration has no runtime side effects. `session_start` loads settings/profiles, verifies the owning parent, reconstructs only current active-branch state, passively inventories prior stopped residue, and starts result/subscription services. It never adopts, finalizes, or messages about prior-session resources. `session_shutdown` closes extension services only; children survive.
 
 Parent mode contributes `use-herdr-subagents` dynamically. `PI_HERDR_SUBAGENT=1` registers only the narrow Pi result bridge—no parent tools, commands, UI, or orchestration skill.
 
 Each generation follows `preparing → submitted → captured | closed | blocked`. Pi uses its exact structured final-message bridge. Confirmed Claude, Codex, and Grok generations at `done`, `idle`, or `blocked` use one bounded ownership-validated Herdr `recent_unwrapped` transcript; its source, revision, and truncation are explicit. Both become envelopes under `.subagents/runs/<id>/results/` with delivery stages `captured → dispatched → parent_persisted` and one-at-a-time `herdr-subagents.result.v1` follow-ups. Exact-ID status exposes `capture_pending` for submitted generations without envelopes and `capture_unavailable` with the close reason when capture closes empty. Result custom messages collapse to the first meaningful child line; Ctrl+O expands the exact bounded parent-visible content. Pi never falls back to terminal text; empty/failed non-Pi reads close capture unavailable.
 
-A writer result carries the same-revision extension-derived action block. Later blocked, failed, delivery-uncertain, cleanup-retained, UI, and recovery transitions use `herdr-subagents.action-required.v1`. Stable notice identity, exact consolidated `noticeIds`, runtime-epoch in-flight state, active-branch scans, and ownership authorization ensure one model-visible message per unchanged action revision. Status and TUI project the same `attention` object.
+Completed child results are the only automatic model-visible follow-ups and contain no action block. Blocked, failed, delivery-uncertain, cleanup-retained, review, UI, and recovery transitions update passive schema-v5 `attention` only; status and TUI project it without starting a parent turn. New attention retains inert `delivery.stage: "derived"` compatibility fields. Exact authorized failures additionally append a deduplicated `herdr-subagents.failure.v1` custom entry, which does not enter model context.
 
 ## Ownership and recovery
 
-`herdr-subagents.ownership.v1` journals append returned worktree/group/terminal/native identities on the active Pi branch. Schema-v5 `run.json` stores operational metadata, action state, the ownership journal, and the exact worktree snapshot; it never grants process authority alone.
+`herdr-subagents.ownership.v1` journals append returned worktree/group/terminal/native identities on the active Pi branch. Schema-v5 `run.json` stores operational metadata, passive attention, the ownership journal, and the exact worktree snapshot; it never grants process authority alone.
 
 Live process control requires current-session active-branch ownership plus fresh matching pane/agent/native topology. `/tree`, fork/new sessions, malformed metadata, and partial identity make live runs observational.
 
-A stopped run has a terminal `stopped` ownership phase. `subagent_stop` can therefore skip process control and retry cleanup after terminal exit or reload. A later parent session may create a terminal `cleanup_adopted` phase only when a schema-v5 parent journal, run nonce, source/child repository identity, generated branch/path, Herdr workspace/anchors, clean checkout, idle shells, and no agent all reconcile. This grants cleanup only: it never adopts/stops a prior process or delivers prior private output. Schema-v3/v4 metadata is parsed for current-branch cleanup migration; if it lacks the exact worktree/ownership snapshot required for cross-session adoption, startup retains it and injects one consolidated recovery notice.
+A stopped run has a terminal `stopped` ownership phase. `subagent_stop` can therefore skip process control and retry cleanup after terminal exit or reload. Cross-session cleanup is never startup-driven. Only an explicit exact-ID stop may create a terminal `cleanup_adopted` phase after schema-v5 metadata, stopped journal, run/nonce/current-checkout identity, no-live-agent evidence, and exact parent-persisted result/failure evidence reconcile. Read-only residue requires no worktree metadata; writer residue additionally requires source/child repository identity, generated branch/path, Herdr workspace/anchors, clean checkout, and idle shells. This grants cleanup only: it never adopts/stops a prior process or exposes prior private output. Malformed, live, dirty, moved, or ambiguous residue remains passive in project/exact status and doctor.
 
 ## Launch and worktree policy
 
@@ -37,7 +37,7 @@ Adapters validate executable, canonical cwd/roots, capabilities, model/thinking,
 
 A group is launch-ready only after a fresh snapshot contains its exact workspace, tab, root pane, and root terminal and the root process probe returns the same pane. Creation waits within a short fixed bound; cached groups are freshly revalidated and stale/moved provenance is never replaced implicitly. `agent.start` performs the same exact check before each call and retries only `HerdrApiError.code === "agent_placement_not_found"`, with three total attempts and fixed abort-aware waits. All transport, timeout, malformed, abort, and other API outcomes remain non-retryable because acceptance could be uncertain.
 
-Exhausted explicit placement rejection proves no child identity, not absence of extension-owned topology. The managed run and journal enter failed attention and return a blocked start payload with the exact run ID. A new read-only group uses the existing partial-start idle/identity cleanup proof; reused/ambiguous groups retain. Writer workspace/worktree provenance remains durable and the existing stop/finalization state machine skips process control, waits for an exact parent-persisted `failed` notice, derives no-change/integration, and performs normal exact cleanup—there is no provisioning rollback path.
+Exhausted explicit placement rejection proves no child identity, not absence of extension-owned topology. The managed run and journal enter failed attention, append exact non-model-visible failure evidence, and return a blocked start payload with the exact run ID. A new read-only group uses the existing partial-start idle/identity cleanup proof; reused/ambiguous groups retain. Writer workspace/worktree provenance remains durable and the existing stop/finalization state machine skips process control, requires exact result/failure evidence, derives no-change/integration, and performs normal exact cleanup—there is no provisioning rollback path.
 
 Pi children independently resolve ordinary trust/resources; transient parent approval is not inherited. Recursive orchestration tools are rejected.
 
@@ -53,7 +53,7 @@ Bundled profiles create no child handoff/progress files. Their self-contained fi
 
 Custom profiles may explicitly configure run-unique handoff/progress files. Existing custom files inside a disposable checkout are copied to parent-owned `captured/` storage and byte/SHA-256 verified before removal. Missing optional files do not block; a failed copy of a present file retains. Public profiles still cannot customize internal prompt/system paths.
 
-Private system/session/exchange files are canonical run-bound OS-temp state. They remain while live or capture-uncertain and are removed after proven stop. Assignment/runtime metadata remains until a result envelope or exact `failed` notice is parent-persisted. Successful default finalization removes the runtime run directory; verified custom captures remain intentional.
+Private system/session/exchange files are canonical run-bound OS-temp state. They remain while live or capture-uncertain and are removed after proven stop. Assignment/runtime metadata remains until an exact result envelope or branch-bound failure custom entry is parent-persisted. Exact legacy failed action evidence is recognized read-only. Successful default finalization removes the runtime run directory; verified custom captures remain intentional.
 
 ## Writer finalization state machine
 
@@ -64,7 +64,7 @@ live writer → stop → parent evidence persistence → safe cleanup attempt
 stopped writer → skip process control → retry safe cleanup
 ```
 
-Safe cleanup requires exact ownership, a parent-persisted result envelope or exact parent-persisted `failed` notice, clean checkout, and objective integration. Every other attention kind and every omitted/false evidence value retains. The extension derives `no_changes`, direct commit containment, or exact current parent/child tree equivalence; callers may supply existing containment/tree evidence for older equivalent parent refs. Parent review text is optional audit detail, not a deletion gate.
+Safe cleanup requires exact ownership, a parent-persisted result envelope or exact branch-bound failure entry (with legacy failed action compatibility), clean checkout, and objective integration. Passive attention and every omitted/false evidence value retain. The extension derives `no_changes`, direct commit containment, or exact current parent/child tree equivalence; callers may supply existing containment/tree evidence for older equivalent parent refs. Parent review text is optional audit detail, not a deletion gate.
 
 Historical foreground snapshot hashes are not destructive gates. Current exact workspace/tab/terminal topology must contain only recorded anchors, no agent/unknown pane, and each anchor must be a known idle shell. Process information that is missing or active fails closed.
 

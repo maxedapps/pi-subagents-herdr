@@ -20,7 +20,7 @@ export class OverlayActions {
   async stopAfterOverlayClosed(id: string): Promise<void> {
     const confirmed = await this.ctx.ui.confirm(
       "Stop owned subagent?",
-      "The child process/session will end. A writer worktree will be removed automatically only when clean no-change/integration and identity checks pass; otherwise it remains with an action-required notice.",
+      "The child process/session will end. A writer worktree is removed only when clean no-change/integration and identity checks pass; otherwise it remains with passive attention for explicit inspection.",
     );
     if (!confirmed) return;
     const result = await this.runtime.stop({ id, mode: "graceful" }, this.ctx.signal);

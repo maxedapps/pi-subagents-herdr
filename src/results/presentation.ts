@@ -104,18 +104,9 @@ export function resultCollapsedPreview(deliveredText: string, expansionHint = "C
   if (!lines[0]?.startsWith("HERDR_RESULT_V1 ")) return collapsedPreview(deliveredText);
   const bodyStart = lines.indexOf("") + 1;
   const bodyLines = bodyStart > 0 ? lines.slice(bodyStart) : [];
-  const actionStart = bodyLines.findIndex((line) => line.startsWith("HERDR_ACTION_REQUIRED_V1 "));
-  const bodyLine = (actionStart < 0 ? bodyLines : bodyLines.slice(0, actionStart))
-    .find((line) => line.trim().length > 0);
+  const bodyLine = bodyLines.find((line) => line.trim().length > 0);
   const preview = bodyLine === undefined ? "No child result text" : collapsedPreview(bodyLine.trim(), 180, 1);
   return `Result received · ${preview}\n${expansionHint} to expand`;
-}
-
-export function actionCollapsedPreview(deliveredText: string, expansionHint = "Ctrl+O"): string {
-  const lines = deliveredText.split("\n");
-  const headline = lines.find((line) => line.startsWith("ACTION REQUIRED")) ?? "ACTION REQUIRED";
-  const reason = lines.find((line) => line.startsWith("reason="));
-  return [headline, ...(reason === undefined ? [] : [collapsedPreview(reason, 180, 1)]), `${expansionHint} to expand`].join("\n");
 }
 
 export function exactToolPayload<T>(result: T, serialize: (value: T) => string): {

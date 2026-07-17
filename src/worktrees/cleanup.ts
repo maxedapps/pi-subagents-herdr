@@ -245,7 +245,7 @@ export interface SafeCleanupInput {
   readonly artifactCapture: CaptureWorktreeArtifactsOptions;
   readonly parentRoots: ArtifactRoots;
   readonly integrationEvidence?: IntegrationVerificationRequest;
-  /** A result envelope or exact failed notice is already durable in the parent branch. */
+  /** An exact result envelope or branch-bound failure entry is durable in the parent branch. */
   readonly resultEvidencePersisted: boolean;
   /** Optional caller-owned active-branch proof, rerun at the destructive boundary. */
   readonly revalidateOwnership?: () => Promise<void>;

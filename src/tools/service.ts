@@ -1,9 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { ensureRuntimeGitExcludes } from "../artifacts/git-ignore.ts";
 import { materializeHandoff, parentHandoffWrapperPath } from "../artifacts/handoff.ts";
 import {
@@ -14,7 +14,7 @@ import {
   type ArtifactRoots,
 } from "../artifacts/paths.ts";
 import { ensureSafeArtifactDirectory, writeArtifactAtomic } from "../artifacts/store.ts";
-import { purgeRuntimeRunArtifacts } from "../artifacts/purge.ts";
+import { assertRuntimeRunArtifactsPurgeSafe, purgeRuntimeRunArtifacts } from "../artifacts/purge.ts";
 import { loadSettingsForContext, type HerdrSubagentsSettings } from "../config/settings.ts";
 import type { ArtifactContract } from "../contracts/artifact.ts";
 import { isHarness, type EffectiveLaunchPolicy, type Harness, type LaunchAdjustment, type LaunchPolicy, type ThinkingLevel, type ToolGrant } from "../contracts/harness.ts";
@@ -70,7 +70,8 @@ import { PlacementStartExhaustedError, StartCleanupError, TurnSubmissionUncertai
 import { closeDedicatedTabIfSafe, stopSubagent, type StopSubagentResult } from "../runtime/stop.ts";
 import { waitForSubagent } from "../runtime/wait.ts";
 import { toPublicResultView, type GenerationSummary, type PublicResultView, type ResultEnvelopeV1 } from "../results/contracts.ts";
-import { ACTION_NOTICE_CUSTOM_TYPE, ACTION_NOTICE_SENTINEL, ActionNoticeService, deriveRunAttention, findPersistedActionNotice, formatActionNotice, toPublicRunAttention, type ActionKind, type RunAttention } from "../results/action-notices.ts";
+import { deriveRunAttention, findLegacyPersistedFailedAction, toPublicRunAttention, type ActionKind, type RunAttention } from "../results/action-notices.ts";
+import { appendFailureEvidence, findPersistedFailureEvidence } from "../results/failure-evidence.ts";
 import { ResultCoordinator } from "../results/coordinator.ts";
 import { ResultDeliveryService } from "../results/delivery.ts";
 import { boundUtf8HeadTail } from "../results/presentation.ts";
@@ -166,6 +167,7 @@ interface RunArtifacts {
 interface ObservationalRun {
   readonly summary: RunSummary;
   readonly reason: string;
+  readonly projectPath?: string;
 }
 
 interface ManagedRun {
@@ -214,9 +216,22 @@ function isWithin(root: string, candidate: string): boolean {
   return value === "" || (!value.startsWith("..") && !isAbsolute(value));
 }
 
-export function handoffEvidencePersisted(run: Pick<ManagedRun, "latestResult" | "attention">): boolean {
-  return run.latestResult?.deliveryStage === "parent_persisted"
-    || (run.attention?.kind === "failed" && run.attention.delivery.stage === "parent_persisted");
+export function handoffEvidencePersisted(
+  run: Pick<ManagedRun, "id" | "runNonce" | "journal" | "latestResult" | "attention">,
+  branch: readonly SessionEntry[] = [],
+): boolean {
+  if (run.latestResult?.deliveryStage === "parent_persisted") return true;
+  const exactFailure = findPersistedFailureEvidence(branch, {
+    runId: run.id,
+    runNonce: run.runNonce,
+    parentSessionId: run.journal.parent.sessionId,
+    ...(run.journal.parent.sessionPath === undefined ? {} : { parentSessionPath: run.journal.parent.sessionPath }),
+    branchEntryId: run.journal.parent.branchEntryId,
+  });
+  if (exactFailure) return true;
+  return run.attention?.kind === "failed"
+    && run.attention.delivery.stage === "parent_persisted"
+    && findLegacyPersistedFailedAction(branch, run.id, run.attention.noticeId) !== undefined;
 }
 
 function statusCall(runId: string): string { return `subagent_status({ id: ${JSON.stringify(runId)} })`; }
@@ -247,6 +262,15 @@ function sessionIdentity(context: ExtensionContext): { sessionId: string; sessio
   const sessionId = context.sessionManager.getSessionId();
   const sessionPath = context.sessionManager.getSessionFile();
   return { sessionId, ...(sessionPath === undefined ? {} : { sessionPath }) };
+}
+
+function snapshotHasRunIdentity(snapshot: SessionSnapshot, terminalId: string, nativeSession?: { readonly kind: "id" | "path"; readonly value: string; readonly source: string }): boolean {
+  return snapshot.panes.some((pane) => pane.terminal_id === terminalId)
+    || snapshot.agents.some((agent) => agent.terminal_id === terminalId
+      || (nativeSession !== undefined
+        && agent.agent_session?.kind === nativeSession.kind
+        && agent.agent_session.value === nativeSession.value
+        && agent.agent_session.source === nativeSession.source));
 }
 
 function currentBranch(context: ExtensionContext): readonly SessionEntry[] {
@@ -365,9 +389,7 @@ export class HerdrToolRuntimeController {
   #startupIssue: string | undefined;
   #coordinator: ResultCoordinator | undefined;
   #delivery: ResultDeliveryService | undefined;
-  #notices: ActionNoticeService | undefined;
   #runtimeEpoch = randomUUID();
-  #startupReconciling = false;
   readonly #uiListeners = new Set<() => void>();
 
   constructor(pi: ExtensionAPI, options: ToolRuntimeOptions = {}) {
@@ -386,13 +408,11 @@ export class HerdrToolRuntimeController {
 
   noteParentSettled(): void {
     this.#delivery?.noteParentSettled();
-    this.#notices?.noteParentSettled();
     this.#coordinator?.wake();
   }
 
   async reconcileResultPersistence(): Promise<void> {
     await this.#delivery?.reconcilePersistence();
-    await this.#notices?.reconcilePersistence();
   }
 
 
@@ -424,46 +444,19 @@ export class HerdrToolRuntimeController {
       this.#worktreeCleanup = new WorktreeCleanupManager(client, this.#worktrees);
       this.#installResultServices();
       await this.#recoverLiveRuns();
-      const unresolvedRecovery = [...await this.#adoptCrossSessionCleanupJournals()];
-      for (const record of this.#worktrees.list().filter((candidate) => candidate.state === "removed" && candidate.finalization?.branchFinalizedAt !== undefined && candidate.finalization.runtimeArtifactsPurgedAt === undefined)) {
-        const run = this.#runs.get(record.id);
-        if (!run || !handoffEvidencePersisted(run)) {
-          unresolvedRecovery.push({ runId: record.id, reason: "Finalized writer runtime artifacts remain because parent result/failure evidence is not currently persisted" });
-          continue;
-        }
-        try {
-          const roots = await resolveArtifactRoots({ checkout: record.sourceCheckoutPath, allowProgress: false });
-          await purgeRuntimeRunArtifacts(roots, record.id);
-          this.#worktrees.markRuntimeArtifactsPurged(record.id);
-        } catch (error) {
-          unresolvedRecovery.push({ runId: record.id, reason: `Finalized writer runtime artifact purge remains unresolved: ${error instanceof Error ? error.message : String(error)}` });
-        }
-      }
-      this.#startupReconciling = true;
-      try {
-        for (const run of [...this.#runs.values()].filter((candidate) => candidate.lifecycle === "stopped")) {
-          try { await this.stop({ id: run.id }); }
-          catch (error) {
-            await this.#setAttention(run, { kind: "recovery_required", reason: `Startup finalization retry failed: ${error instanceof Error ? error.message : String(error)}`, nextActions: [`Inspect ${statusCall(run.id)}, then retry ${stopCall(run.id)}`] }).catch(() => undefined);
-          }
-        }
-      } finally { this.#startupReconciling = false; }
-      const startupAttention = [...this.#runs.values()].flatMap((run) => run.attention === undefined || run.attention.delivery.stage === "parent_persisted" ? [] : [{ runId: run.id, reason: run.attention.reason, noticeId: run.attention.noticeId }]);
-      const consolidatedRecovery = [...unresolvedRecovery, ...startupAttention];
-      if (consolidatedRecovery.length > 0) await this.#sendRecoverySummary(consolidatedRecovery);
+      await this.#enumeratePriorStoppedResidue();
       this.#subscriptions = new HerdrSubscriptionManager({
         client,
         ownedPaneIds: () => [...this.#runs.values()].flatMap((run) => run.journal.resources.paneId ? [run.journal.resources.paneId] : []),
         onChange: () => {
           this.#notifyUi();
           this.#coordinator?.wake();
-          void Promise.all([...this.#runs.keys()].map((id) => this.#refreshAttention(id))).then(() => this.#notices?.scheduleFlush()).catch(() => undefined);
+          void Promise.all([...this.#runs.keys()].map((id) => this.#refreshAttention(id))).catch(() => undefined);
         },
       });
       await this.#subscriptions.start();
       this.#coordinator?.start();
       this.#delivery?.scheduleFlush(0);
-      this.#notices?.scheduleFlush(consolidatedRecovery.length > 0 ? 250 : 0);
     } catch (error) {
       this.#startupIssue = error instanceof Error ? error.message : String(error);
 
@@ -476,29 +469,6 @@ export class HerdrToolRuntimeController {
     const installed = installResultServices(this.#resultHost());
     this.#coordinator = installed.coordinator;
     this.#delivery = installed.delivery;
-    this.#notices = new ActionNoticeService({
-      pi: this.#pi,
-      runtimeEpoch: this.#runtimeEpoch,
-      getContext: () => this.#context,
-      listQueued: async () => [...this.#runs.values()].flatMap((run) => run.attention === undefined ? [] : [{
-        runId: run.id,
-        runNonce: run.runNonce,
-        attention: run.attention,
-        parentSessionId: run.journal.parent.sessionId,
-        ...(run.journal.parent.sessionPath === undefined ? {} : { parentSessionPath: run.journal.parent.sessionPath }),
-        ...(run.target?.terminalId ?? run.journal.resources.terminalId ? { terminalId: run.target?.terminalId ?? run.journal.resources.terminalId } : {}),
-        ...(run.target?.nativeSession ?? run.journal.resources.nativeSession ? { nativeSession: run.target?.nativeSession ?? run.journal.resources.nativeSession } : {}),
-      }]),
-      updateAttention: async (runId, update) => {
-        const run = this.#runs.get(runId);
-        if (!run?.attention) return undefined;
-        run.attention = update(run.attention);
-        await this.#persistMetadata(run).catch(() => undefined);
-        if (run.attention.delivery.stage === "parent_persisted") await this.#finalizeStoppedReadOnly(run).catch(() => undefined);
-        this.#notifyUi();
-        return run.attention;
-      },
-    });
   }
 
   #resultHost() {
@@ -527,18 +497,20 @@ export class HerdrToolRuntimeController {
     };
   }
 
-  async #setAttention(run: ManagedRun, input: { readonly kind: ActionKind; readonly reason: string; readonly nextActions: readonly string[]; readonly facts?: Parameters<typeof deriveRunAttention>[2]["facts"] }, schedule = true): Promise<void> {
+  async #setAttention(run: ManagedRun, input: { readonly kind: ActionKind; readonly reason: string; readonly nextActions: readonly string[]; readonly facts?: Parameters<typeof deriveRunAttention>[2]["facts"] }): Promise<void> {
     const next = deriveRunAttention(run.id, run.attention, {
       kind: input.kind,
       reason: input.reason,
       nextActions: input.nextActions,
       ...(input.facts === undefined ? {} : { facts: input.facts }),
     });
+    if (input.kind === "failed" && run.lifecycle === "failed" && this.#context) {
+      appendFailureEvidence({ pi: this.#pi, context: this.#context, journal: run.journal, reason: input.reason });
+    }
     if (next === run.attention) return;
     run.attention = next;
     await this.#persistMetadata(run).catch(() => undefined);
     this.#notifyUi();
-    if (schedule && !this.#startupReconciling) this.#notices?.scheduleFlush();
   }
 
   async #refreshAttention(runId: string): Promise<void> {
@@ -550,14 +522,17 @@ export class HerdrToolRuntimeController {
       return;
     }
     if (run.attention?.kind === "cleanup_required" || run.attention?.kind === "recovery_required") return;
-    if (run.lifecycle === "failed" && run.attention?.kind === "failed") return;
+    if (run.lifecycle === "failed" && run.attention?.kind === "failed") {
+      if (this.#context) appendFailureEvidence({ pi: this.#pi, context: this.#context, journal: run.journal, reason: run.attention.reason });
+      return;
+    }
     if (run.lifecycle === "failed") {
       await this.#setAttention(run, {
         kind: "failed",
         reason: run.failure ?? "Subagent failed before a clean terminal handoff",
         nextActions: [`Inspect ${statusCall(run.id)}`, `Retry ${stopCall(run.id)}; safe no-change cleanup is automatic when provable`],
         facts: { ...(worktree === undefined ? {} : { checkoutPath: worktree.checkoutPath, branch: worktree.branch, base: worktree.base, workspaceId: worktree.workspaceId }), ...(run.target?.terminalId === undefined ? {} : { terminalId: run.target.terminalId }) },
-      }, false);
+      });
       return;
     }
     if (run.herdrStatus === "blocked") {
@@ -566,7 +541,7 @@ export class HerdrToolRuntimeController {
         reason: "Subagent is blocked and requires parent inspection or same-assignment follow-up",
         nextActions: [`Inspect ${statusCall(run.id)}`, `Resolve the blocker, then use subagent_send for the same assignment or ${stopCall(run.id)}`],
         ...(run.target?.terminalId === undefined ? {} : { facts: { terminalId: run.target.terminalId } }),
-      }, false);
+      });
       return;
     }
     if (worktree && run.latestResult) {
@@ -580,22 +555,26 @@ export class HerdrToolRuntimeController {
           reason: facts.noChanges ? "Writer completed with no checkout changes and awaits finalization" : "Writer result is available and its checkout awaits parent review/integration/finalization",
           nextActions: [`Inspect the delivered result and diff for ${run.id}`, evidence],
           facts,
-        }, false);
+        });
       } catch (error) {
         await this.#setAttention(run, {
           kind: "recovery_required",
           reason: `Writer facts could not be revalidated: ${error instanceof Error ? error.message : String(error)}`,
           nextActions: [`Inspect ${worktree.checkoutPath} and ${statusCall(run.id)}; do not delete it while identity is uncertain`],
           facts: { checkoutPath: worktree.checkoutPath, branch: worktree.branch, base: worktree.base, workspaceId: worktree.workspaceId },
-        }, false);
+        });
       }
     }
   }
 
   async #finalizeStoppedReadOnly(run: ManagedRun): Promise<void> {
     if (run.lifecycle !== "stopped" || run.worktreeId || !run.artifacts) return;
-    const evidencePersisted = handoffEvidencePersisted(run);
+    const evidencePersisted = handoffEvidencePersisted(run, currentBranch(this.#context!));
     if (!evidencePersisted) return;
+    if (run.journal.phase === "cleanup_adopted" && this.#client && run.target) {
+      const snapshot = await this.#client.snapshot();
+      if (snapshotHasRunIdentity(snapshot, run.target.terminalId, run.target.nativeSession)) throw new Error("Cleanup-only read-only identity became live; runtime artifacts retained");
+    }
     await this.#removeEphemeral(run).catch(() => undefined);
     const roots = run.artifacts.metadataRoots;
     const preservePaths = run.profile.artifacts === undefined
@@ -615,7 +594,6 @@ export class HerdrToolRuntimeController {
     await this.#refreshAttention(run.id);
     if (envelope.delivery.stage === "parent_persisted") {
       await this.#finalizeStoppedReadOnly(run).catch(() => undefined);
-      this.#notices?.scheduleFlush();
     }
   }
 
@@ -637,10 +615,8 @@ export class HerdrToolRuntimeController {
   async stopSession(): Promise<void> {
     await this.#coordinator?.stop();
     this.#delivery?.stop();
-    this.#notices?.stop();
     this.#coordinator = undefined;
     this.#delivery = undefined;
-    this.#notices = undefined;
     await this.#subscriptions?.stop();
     this.#subscriptions = undefined;
     this.#client = undefined;
@@ -651,111 +627,144 @@ export class HerdrToolRuntimeController {
     this.#context = undefined;
   }
 
-  async #adoptCrossSessionCleanupJournals(): Promise<readonly { readonly runId: string; readonly reason: string }[]> {
+  async #priorHandoffEvidence(metadata: RuntimeRunMetadata, journal: OwnershipJournalData): Promise<boolean> {
     const context = this.#context!;
-    const client = this.#client!;
-    const currentParent = sessionIdentity(context);
-    const leaf = context.sessionManager.getLeafId();
-    if (!leaf) return [];
-    const candidates = (await listRuntimeRunMetadata(context.cwd)).filter((metadata) => (metadata.lifecycle === "stopped" || metadata.lifecycle === "failed") && !this.#runs.has(metadata.runId) && !this.#worktrees?.get(metadata.runId));
-    if (candidates.length === 0) return [];
-    let sourceIdentity: Awaited<ReturnType<typeof identifyCheckout>>;
-    try { sourceIdentity = await identifyCheckout(context.cwd); }
-    catch (error) { return candidates.map((metadata) => ({ runId: metadata.runId, reason: `cleanup adoption requires a canonical Git checkout: ${error instanceof Error ? error.message : String(error)}` })); }
-    const snapshot = await client.snapshot();
-    const unresolved: Array<{ runId: string; reason: string }> = [];
-    for (const metadata of candidates) {
-      const prior = metadata.worktree;
-      const priorJournal = metadata.ownershipJournal;
-      if (!prior || !priorJournal) {
-        unresolved.push({ runId: metadata.runId, reason: "runtime metadata lacks the exact worktree/ownership cleanup journal required for automatic adoption" });
-        continue;
-      }
-      if (prior.state === "removed") continue;
-      try {
-        if (metadata.runId !== prior.id || metadata.runNonce !== prior.owner.runNonce || metadata.runId !== priorJournal.runId || metadata.runNonce !== priorJournal.runNonce) throw new Error("metadata/worktree/ownership run identity mismatch");
-        if (prior.sourceCheckoutPath !== sourceIdentity.checkoutPath || prior.repositoryId !== sourceIdentity.repositoryId || prior.commonGitDir !== sourceIdentity.commonGitDir) throw new Error("source checkout identity mismatch");
-        const childIdentity = await identifyCheckout(prior.checkoutPath);
-        if (childIdentity.repositoryId !== prior.repositoryId || childIdentity.commonGitDir !== prior.commonGitDir || childIdentity.checkoutPath !== prior.checkoutPath) throw new Error("child checkout identity mismatch");
-        const status = (await execFileAsync("git", ["-C", prior.checkoutPath, "status", "--porcelain=v1", "--untracked-files=all"], { encoding: "utf8", maxBuffer: 1_000_000 })).stdout.trim();
-        if (status !== "") throw new Error("legacy checkout is dirty");
-        if (snapshot.panes.some((pane) => pane.terminal_id === metadata.terminalId) || snapshot.agents.some((agent) => agent.terminal_id === metadata.terminalId || agent.workspace_id === prior.workspaceId)) throw new Error("legacy child/workspace still has a live or partial agent identity");
-        const listed = await client.listWorktrees({ cwd: context.cwd });
-        const candidate = listed.worktrees.find((worktree) => resolve(worktree.path) === prior.checkoutPath);
-        if (!candidate || candidate.branch !== prior.branch || candidate.open_workspace_id !== prior.workspaceId || !candidate.is_linked_worktree || listed.source.repo_key !== prior.herdrRepositoryKey) throw new Error("Herdr worktree identity mismatch");
-        const anchors = [prior.createdRoot, ...(prior.tab ? [prior.tab] : [])];
-        const allowed = new Set(anchors.map((anchor) => anchor.rootTerminalId));
-        const panes = snapshot.panes.filter((pane) => pane.workspace_id === prior.workspaceId);
-        if (panes.some((pane) => !allowed.has(pane.terminal_id)) || panes.length !== anchors.length) throw new Error("legacy workspace contains unknown or missing panes");
-        for (const anchor of anchors) {
-          const pane = panes.find((item) => item.terminal_id === anchor.rootTerminalId && item.tab_id === anchor.tabId);
-          if (!pane) throw new Error(`legacy anchor ${anchor.rootTerminalId} is absent or moved`);
-          const idle = verifyIdleShell(await client.getPaneProcessInfo(pane.pane_id));
-          if (!idle.idle) throw new Error(`legacy anchor ${anchor.rootTerminalId} is not idle: ${idle.reason}`);
-        }
-        const oldPaneId = priorJournal.resources.paneId;
-        if (!oldPaneId || priorJournal.resources.terminalId !== metadata.terminalId) throw new Error("legacy ownership journal lacks exact child pane/terminal identity");
-        const journalWriter = new ActiveBranchOwnershipJournal(this.#pi);
-        let adopted = journalWriter.begin({ runId: metadata.runId, runNonce: metadata.runNonce, branchEntryId: leaf, sessionId: currentParent.sessionId, ...(currentParent.sessionPath === undefined ? {} : { sessionPath: currentParent.sessionPath }), intended: { workspaceId: prior.workspaceId, group: "default", worktreeRequested: true } });
-        adopted = journalWriter.append(adopted, "cleanup_adopted", {
-          tabId: prior.tab?.tabId ?? prior.createdRoot.tabId,
-          rootPaneId: prior.tab?.rootPaneId ?? prior.createdRoot.rootPaneId,
-          rootTerminalId: prior.tab?.rootTerminalId ?? prior.createdRoot.rootTerminalId,
-          rootProcessBaseline: prior.tab?.rootProcessBaseline ?? prior.createdRoot.rootProcessBaseline ?? "legacy-cleanup-adoption",
-          paneId: oldPaneId,
-          terminalId: metadata.terminalId,
-          ...(metadata.nativeSession === undefined ? {} : { nativeSession: metadata.nativeSession }),
-          repositoryId: prior.repositoryId,
-          commonGitDir: prior.commonGitDir,
-          herdrRepositoryKey: prior.herdrRepositoryKey,
-          ...(prior.sourceWorkspaceId === undefined ? {} : { worktreeSourceWorkspaceId: prior.sourceWorkspaceId }),
-          worktreeWorkspaceId: prior.workspaceId,
-          checkoutPath: prior.checkoutPath,
-          worktreeBranch: prior.branch,
-          worktreeBase: prior.base,
-          worktreeInitialTabId: prior.createdRoot.tabId,
-          worktreeInitialRootPaneId: prior.createdRoot.rootPaneId,
-          worktreeInitialRootTerminalId: prior.createdRoot.rootTerminalId,
-        });
-        const reauthorized: WorktreeRecord = { ...prior, legacyOwner: prior.legacyOwner ?? prior.owner, owner: { runId: metadata.runId, runNonce: metadata.runNonce, parent: { sessionId: currentParent.sessionId, ...(currentParent.sessionPath === undefined ? {} : { sessionPath: currentParent.sessionPath }), branchEntryId: leaf } }, state: "retained", retentionReason: "Prior-session writer reauthorized for cleanup only after exact stopped provenance reconciliation", updatedAt: Date.now() };
-        this.#worktrees!.register(reauthorized);
-        await this.#recoverStoppedRun(adopted);
-        const run = this.#runs.get(metadata.runId);
-        if (run) await this.#setAttention(run, { kind: "recovery_required", reason: "Prior-session writer was reauthorized for cleanup only and awaits safe finalization", nextActions: [`Inspect ${reauthorized.checkoutPath}, then retry ${stopCall(run.id)}`], facts: { checkoutPath: reauthorized.checkoutPath, branch: reauthorized.branch, base: reauthorized.base, workspaceId: reauthorized.workspaceId } }, false);
-      } catch (error) {
-        unresolved.push({ runId: metadata.runId, reason: error instanceof Error ? error.message : String(error) });
-      }
+    const envelopes = await listResultEnvelopes(context.cwd, metadata.runId);
+    if (envelopes.some((envelope) => envelope.runId === metadata.runId
+      && envelope.runNonce === metadata.runNonce
+      && envelope.delivery.stage === "parent_persisted"
+      && envelope.delivery.parentSessionId === journal.parent.sessionId
+      && envelope.delivery.parentSessionPath === journal.parent.sessionPath
+      && envelope.delivery.parentEntryId !== undefined)) return true;
+    if (!journal.parent.sessionPath) return false;
+    let manager: SessionManager;
+    try { manager = SessionManager.open(journal.parent.sessionPath); } catch { return false; }
+    if (manager.getSessionId() !== journal.parent.sessionId || manager.getSessionFile() !== journal.parent.sessionPath) return false;
+    for (const entry of manager.getEntries()) {
+      const branch = manager.getBranch(entry.id);
+      if (findPersistedFailureEvidence(branch, {
+        runId: metadata.runId,
+        runNonce: metadata.runNonce,
+        parentSessionId: journal.parent.sessionId,
+        ...(journal.parent.sessionPath === undefined ? {} : { parentSessionPath: journal.parent.sessionPath }),
+        branchEntryId: journal.parent.branchEntryId,
+      })) return true;
+      if (metadata.attention?.kind === "failed"
+        && metadata.attention.delivery.stage === "parent_persisted"
+        && findLegacyPersistedFailedAction(branch, metadata.runId, metadata.attention.noticeId)) return true;
     }
-    return unresolved;
+    return false;
   }
 
-  async #sendRecoverySummary(items: readonly { readonly runId: string; readonly reason: string; readonly noticeId?: string }[]): Promise<void> {
-    const context = this.#context;
-    if (!context || typeof this.#pi.sendMessage !== "function") return;
-    const ordered = [...items].sort((left, right) => left.runId.localeCompare(right.runId));
-    const noticeIds = [...new Set(ordered.flatMap((item) => item.noticeId === undefined ? [] : [item.noticeId]))];
-    const noticeId = `act-recovery-${createHash("sha256").update(JSON.stringify(ordered), "utf8").digest("hex").slice(0, 24)}`;
-    const branch = currentBranch(context);
-    if (findPersistedActionNotice(branch, noticeId)) return;
-
-    const coveredRuns: ManagedRun[] = [];
-    for (const item of ordered) {
-      if (!item.noticeId) continue;
-      const run = this.#runs.get(item.runId);
-      if (!run?.attention || run.attention.noticeId !== item.noticeId) continue;
-      run.attention = { ...run.attention, delivery: { stage: "dispatched", runtimeEpoch: this.#runtimeEpoch } };
-      coveredRuns.push(run);
+  async #adoptExactStoppedForCleanup(runId: string, signal?: AbortSignal): Promise<void> {
+    const context = this.#context!;
+    const client = this.#client!;
+    const metadata = await readRuntimeRunMetadata(context.cwd, runId);
+    if (!metadata) throw new Error(`Unknown subagent run: ${runId}`);
+    if (metadata.runId !== runId || metadata.lifecycle !== "stopped") throw new Error(`Run ${runId} is not exact stopped cleanup residue`);
+    const priorJournal = metadata.ownershipJournal;
+    if (!priorJournal || priorJournal.phase !== "stopped") throw new Error(`Run ${runId} lacks an exact stopped ownership journal`);
+    if (priorJournal.runId !== metadata.runId || priorJournal.runNonce !== metadata.runNonce) throw new Error(`Run ${runId} metadata and ownership identities differ`);
+    assertRuntimeMetadataMatchesJournal(metadata, priorJournal);
+    const leaf = context.sessionManager.getLeafId();
+    if (!leaf) throw new Error("A current parent branch entry is required for explicit cleanup adoption");
+    const snapshot = await client.snapshot(signal);
+    if (snapshotHasRunIdentity(snapshot, metadata.terminalId, metadata.nativeSession)) {
+      throw new Error(`Run ${runId} still has a live terminal or native agent identity`);
     }
-    try { await Promise.all(coveredRuns.map((run) => this.#persistMetadata(run))); }
-    catch { return; }
+    if (!await this.#priorHandoffEvidence(metadata, priorJournal)) throw new Error(`Run ${runId} lacks exact parent-persisted result or failure evidence`);
+    const parentRoots = await resolveArtifactRoots({ checkout: context.cwd, allowProgress: false });
+    const preservePaths = Object.entries(metadata.artifacts).filter(([kind]) => kind !== "metadata").map(([, path]) => path);
+    await assertRuntimeRunArtifactsPurgeSafe(parentRoots, runId, preservePaths);
 
-    const content = boundUtf8HeadTail([
-      `${ACTION_NOTICE_SENTINEL} ${JSON.stringify({ noticeId, noticeIds, kind: "recovery_required", revision: 1, runs: ordered.map((item) => item.runId) })}`,
-      "ACTION REQUIRED — startup recovery",
-      ...ordered.flatMap((item) => [`run=${item.runId}`, ...(item.noticeId === undefined ? [] : [`noticeId=${item.noticeId}`]), `reason=${item.reason}`]),
-      "next=Inspect the listed exact resources; use current-session cleanup only when full provenance can be supplied. No resource was deleted.",
-    ].join("\n")).text;
-    this.#pi.sendMessage({ customType: ACTION_NOTICE_CUSTOM_TYPE, content, display: true, details: { noticeId, noticeIds, runIds: ordered.map((item) => item.runId), kind: "recovery_required" } }, { deliverAs: "followUp", triggerTurn: true });
+    const currentParent = sessionIdentity(context);
+    const journalWriter = new ActiveBranchOwnershipJournal(this.#pi);
+    if (!metadata.policy.requireWorktree) {
+      if (metadata.worktree !== undefined || priorJournal.intended.worktreeRequested) throw new Error(`Read-only run ${runId} unexpectedly claims worktree provenance`);
+      const source = await identifyCheckout(context.cwd);
+      const metadataCwd = await identifyCheckout(metadata.policy.cwd);
+      if (metadataCwd.checkoutPath !== source.checkoutPath || metadataCwd.repositoryId !== source.repositoryId || metadataCwd.commonGitDir !== source.commonGitDir) {
+        throw new Error(`Read-only run ${runId} current checkout identity does not match`);
+      }
+      let adopted = journalWriter.begin({
+        runId,
+        runNonce: metadata.runNonce,
+        branchEntryId: leaf,
+        sessionId: currentParent.sessionId,
+        ...(currentParent.sessionPath === undefined ? {} : { sessionPath: currentParent.sessionPath }),
+        intended: { workspaceId: priorJournal.intended.workspaceId, group: priorJournal.intended.group, worktreeRequested: false },
+      });
+      adopted = journalWriter.append(adopted, "cleanup_adopted", priorJournal.resources);
+      await this.#recoverStoppedRun(adopted);
+      this.#observational.delete(runId);
+      return;
+    }
+
+    const prior = metadata.worktree;
+    if (!prior || !priorJournal.intended.worktreeRequested) throw new Error(`Writer run ${runId} lacks exact worktree provenance`);
+    if (prior.state === "dirty" || prior.recoveryIssue || prior.removalAttempt) throw new Error(`Writer run ${runId} has unsafe or uncertain durable cleanup state`);
+    if (prior.state === "removed") throw new Error(`Writer run ${runId} is already removed but still has unresolved runtime artifacts`);
+    if (metadata.runId !== prior.id || metadata.runNonce !== prior.owner.runNonce) throw new Error("metadata/worktree run identity mismatch");
+    const sourceIdentity = await identifyCheckout(context.cwd);
+    if (prior.sourceCheckoutPath !== sourceIdentity.checkoutPath || prior.repositoryId !== sourceIdentity.repositoryId || prior.commonGitDir !== sourceIdentity.commonGitDir) throw new Error("source checkout identity mismatch");
+    const childIdentity = await identifyCheckout(prior.checkoutPath);
+    if (childIdentity.repositoryId !== prior.repositoryId || childIdentity.commonGitDir !== prior.commonGitDir || childIdentity.checkoutPath !== prior.checkoutPath) throw new Error("child checkout identity mismatch");
+    const status = (await execFileAsync("git", ["-C", prior.checkoutPath, "status", "--porcelain=v1", "--untracked-files=all"], { encoding: "utf8", maxBuffer: 1_000_000 })).stdout.trim();
+    if (status !== "") throw new Error("prior-session writer checkout is dirty");
+    if (snapshot.agents.some((agent) => agent.workspace_id === prior.workspaceId)) throw new Error("prior-session writer workspace still has a live agent");
+    const listed = await client.listWorktrees({ cwd: context.cwd }, signal);
+    const candidate = listed.worktrees.find((worktree) => resolve(worktree.path) === prior.checkoutPath);
+    if (!candidate || candidate.branch !== prior.branch || candidate.open_workspace_id !== prior.workspaceId || !candidate.is_linked_worktree || listed.source.repo_key !== prior.herdrRepositoryKey) throw new Error("Herdr worktree identity mismatch");
+    const anchors = [prior.createdRoot, ...(prior.tab ? [prior.tab] : [])];
+    const allowed = new Set(anchors.map((anchor) => anchor.rootTerminalId));
+    const panes = snapshot.panes.filter((pane) => pane.workspace_id === prior.workspaceId);
+    if (panes.some((pane) => !allowed.has(pane.terminal_id)) || panes.length !== anchors.length) throw new Error("prior-session writer workspace contains unknown or missing panes");
+    for (const anchor of anchors) {
+      const pane = panes.find((item) => item.terminal_id === anchor.rootTerminalId && item.tab_id === anchor.tabId);
+      if (!pane) throw new Error(`prior-session writer anchor ${anchor.rootTerminalId} is absent or moved`);
+      const idle = verifyIdleShell(await client.getPaneProcessInfo(pane.pane_id, signal));
+      if (!idle.idle) throw new Error(`prior-session writer anchor ${anchor.rootTerminalId} is not idle: ${idle.reason}`);
+    }
+    if (!priorJournal.resources.paneId || priorJournal.resources.terminalId !== metadata.terminalId) throw new Error("prior-session ownership journal lacks exact child pane/terminal identity");
+    let adopted = journalWriter.begin({
+      runId,
+      runNonce: metadata.runNonce,
+      branchEntryId: leaf,
+      sessionId: currentParent.sessionId,
+      ...(currentParent.sessionPath === undefined ? {} : { sessionPath: currentParent.sessionPath }),
+      intended: { workspaceId: prior.workspaceId, group: "default", worktreeRequested: true },
+    });
+    adopted = journalWriter.append(adopted, "cleanup_adopted", {
+      tabId: prior.tab?.tabId ?? prior.createdRoot.tabId,
+      rootPaneId: prior.tab?.rootPaneId ?? prior.createdRoot.rootPaneId,
+      rootTerminalId: prior.tab?.rootTerminalId ?? prior.createdRoot.rootTerminalId,
+      rootProcessBaseline: prior.tab?.rootProcessBaseline ?? prior.createdRoot.rootProcessBaseline ?? "prior-session-cleanup-adoption",
+      paneId: priorJournal.resources.paneId,
+      terminalId: metadata.terminalId,
+      ...(metadata.nativeSession === undefined ? {} : { nativeSession: metadata.nativeSession }),
+      repositoryId: prior.repositoryId,
+      commonGitDir: prior.commonGitDir,
+      herdrRepositoryKey: prior.herdrRepositoryKey,
+      ...(prior.sourceWorkspaceId === undefined ? {} : { worktreeSourceWorkspaceId: prior.sourceWorkspaceId }),
+      worktreeWorkspaceId: prior.workspaceId,
+      checkoutPath: prior.checkoutPath,
+      worktreeBranch: prior.branch,
+      worktreeBase: prior.base,
+      worktreeInitialTabId: prior.createdRoot.tabId,
+      worktreeInitialRootPaneId: prior.createdRoot.rootPaneId,
+      worktreeInitialRootTerminalId: prior.createdRoot.rootTerminalId,
+    });
+    const reauthorized: WorktreeRecord = {
+      ...prior,
+      legacyOwner: prior.legacyOwner ?? prior.owner,
+      owner: { runId, runNonce: metadata.runNonce, parent: { sessionId: currentParent.sessionId, ...(currentParent.sessionPath === undefined ? {} : { sessionPath: currentParent.sessionPath }), branchEntryId: leaf } },
+      state: "retained",
+      retentionReason: "Prior-session writer reauthorized for cleanup only after explicit exact-ID provenance reconciliation",
+      updatedAt: Date.now(),
+    };
+    this.#worktrees!.register(reauthorized);
+    await this.#recoverStoppedRun(adopted);
+    this.#observational.delete(runId);
   }
 
   async #recoverStoppedRun(journal: OwnershipJournalData): Promise<boolean> {
@@ -870,20 +879,6 @@ export class HerdrToolRuntimeController {
         try { await this.#recoverStoppedRun(journal); }
         catch (error) { observe(journal, "uncertain", `Stopped cleanup recovery refused: ${error instanceof Error ? error.message : String(error)}`); }
         continue;
-      }
-      if (recovered.state === "owned" && (journal.phase === "started" || journal.phase === "failed") && journal.resources.terminalId) {
-        const pane = preflight.snapshot.panes.find((candidate) => candidate.terminal_id === journal.resources.terminalId);
-        const agent = preflight.snapshot.agents.find((candidate) => candidate.terminal_id === journal.resources.terminalId);
-        if (!pane && !agent && this.#worktrees?.get(journal.runId)) {
-          try {
-            const metadata = await readRuntimeRunMetadata(context.cwd, journal.runId);
-            if (!metadata || metadata.runtime.ephemeralFiles !== "removed") throw new Error("legacy cleanup-only recovery requires removed ephemeral runtime state");
-            assertRuntimeMetadataMatchesJournal(metadata, journal);
-            const stopped = new ActiveBranchOwnershipJournal(this.#pi).append(journal, "stopped", {});
-            await this.#recoverStoppedRun(stopped);
-          } catch (error) { observe(journal, "uncertain", `Legacy stopped cleanup recovery refused: ${error instanceof Error ? error.message : String(error)}`); }
-          continue;
-        }
       }
       if (recovered.state !== "owned" || journal.phase !== "started" || !journal.resources.terminalId) {
         observe(journal, "uncertain", recovered.state === "uncertain" ? recovered.issues.join("; ") : `Active journal phase ${journal.phase} is not recoverable for control`);
@@ -1004,6 +999,46 @@ export class HerdrToolRuntimeController {
         const journal = parseOwnershipJournalData(entry.data);
         if (!active.has(journal.runId) && !this.#observational.has(journal.runId)) observe(journal, "orphaned", "Ownership journal is outside the current active Pi branch; no adoption or control is permitted");
       } catch { /* Malformed inactive entries remain non-authoritative. */ }
+    }
+  }
+
+  async #enumeratePriorStoppedResidue(): Promise<void> {
+    const context = this.#context;
+    const snapshot = this.#preflight?.snapshot;
+    if (!context) return;
+    for (const metadata of await listRuntimeRunMetadata(context.cwd)) {
+      if ((metadata.lifecycle !== "stopped" && metadata.lifecycle !== "failed") || this.#runs.has(metadata.runId) || this.#observational.has(metadata.runId)) continue;
+      const policyKind = metadata.policy.requireWorktree ? "writer" as const : "read_only" as const;
+      let provenance: "validated_metadata" | "unsafe" = "validated_metadata";
+      let blocker = "Prior-session stopped residue requires an explicit exact-ID subagent_stop cleanup request";
+      try {
+        if (!metadata.ownershipJournal) throw new Error("ownership journal is missing");
+        assertRuntimeMetadataMatchesJournal(metadata, metadata.ownershipJournal);
+        if (metadata.ownershipJournal.phase !== "stopped") throw new Error(`ownership journal phase is ${metadata.ownershipJournal.phase}, not stopped`);
+        if (metadata.ownershipJournal.runId !== metadata.runId || metadata.ownershipJournal.runNonce !== metadata.runNonce) throw new Error("metadata and ownership identities differ");
+        if (snapshot && snapshotHasRunIdentity(snapshot, metadata.terminalId, metadata.nativeSession)) {
+          throw new Error("recorded child terminal or native agent is still live");
+        }
+      } catch (error) {
+        provenance = "unsafe";
+        blocker = `Explicit cleanup is currently blocked: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      this.#observational.set(metadata.runId, {
+        reason: blocker,
+        projectPath: metadata.policy.cwd,
+        summary: {
+          id: metadata.runId,
+          profile: `prior-session-${policyKind === "writer" ? "writer" : "read-only"}`,
+          harness: metadata.harness,
+          lifecycle: metadata.lifecycle,
+          herdrStatus: "unknown",
+          ownership: "other_session",
+          live: false,
+          elapsedMs: Math.max(0, Date.now() - metadata.createdAt),
+          taskSynopsis: "Prior-session stopped residue; child output is intentionally not exposed",
+          residue: { policyKind, provenance, blocker },
+        },
+      });
     }
   }
 
@@ -1576,10 +1611,12 @@ export class HerdrToolRuntimeController {
     catch (error) { if (!isUnavailableError(error)) throw error; }
     const summaries = await Promise.all([...this.#runs.values()].map((run) => this.#summary(run, snapshot)));
     let runs = scope === "current_session" ? summaries.filter((run) => run.ownership === "current_session") : summaries;
-    if (scope === "all_owned" || scope === "global") runs = [...runs, ...[...this.#observational.values()].map((item) => item.summary)];
+    if (scope === "project" || scope === "all_owned" || scope === "global") runs = [...runs, ...[...this.#observational.values()].map((item) => item.summary)];
     if (scope === "project") runs = runs.filter((run) => {
       const managed = this.#runs.get(run.id);
-      return managed ? isWithin(resolve(context.cwd), resolve(managed.policy.cwd)) : false;
+      const prior = this.#observational.get(run.id);
+      const path = managed?.policy.cwd ?? prior?.projectPath;
+      return path !== undefined && isWithin(resolve(context.cwd), resolve(path));
     });
     if (scope === "global" && snapshot) {
       const known = new Set(runs.map((run) => run.terminalId).filter(Boolean));
@@ -1629,6 +1666,7 @@ export class HerdrToolRuntimeController {
       activeTools: this.#pi.getAllTools().map((tool) => tool.name),
       runtimeEvidence,
       worktrees: this.#worktrees?.listStates() ?? [],
+      priorResidue: [...this.#observational.values()].flatMap((item) => item.summary.residue === undefined ? [] : [{ runId: item.summary.id, ...item.summary.residue }]),
       ...(this.#client === undefined ? {} : { client: this.#client }),
       ...(this.#startupIssue === undefined ? {} : { startupIssue: this.#startupIssue }),
     });
@@ -1646,6 +1684,27 @@ export class HerdrToolRuntimeController {
   }
 
   async get(input: GetToolInput, signal?: AbortSignal): Promise<GetToolResult> {
+    const prior = this.#observational.get(input.id);
+    if (prior) {
+      return {
+        ok: true,
+        run: prior.summary,
+        effectiveProfile: {
+          description: "Prior-session cleanup residue; operational child details are withheld",
+          harness: prior.summary.harness,
+          thinking: "off",
+          cwd: prior.projectPath ?? this.#context?.cwd ?? "",
+          tools: [],
+        },
+        ownership: { runNonce: "withheld", parentSessionId: "prior-session", branchEntryId: "withheld" },
+        topology: {},
+        output: EMPTY_OUTPUT,
+        artifacts: {},
+        runtime: { ephemeralFiles: "removed", piSessionData: "not-applicable" },
+        createdAt: 0,
+        updatedAt: 0,
+      };
+    }
     const run = this.#managed(input.id);
     let output = run.lastOutput;
     if (run.target && run.lifecycle !== "stopped") {
@@ -1869,6 +1928,7 @@ export class HerdrToolRuntimeController {
   async stop(input: StopToolInput, signal?: AbortSignal): Promise<ActionToolResult> {
     return this.#topology.run(async () => {
       const ready = this.#ready(); if ("ok" in ready) return ready;
+      if (!this.#runs.has(input.id)) await this.#adoptExactStoppedForCleanup(input.id, signal);
       const run = this.#managed(input.id);
       const priorLifecycle = run.lifecycle;
       let provenStopped = priorLifecycle === "stopped";
@@ -1953,7 +2013,6 @@ export class HerdrToolRuntimeController {
         }
 
         await this.#delivery?.reconcilePersistence();
-        await this.#notices?.reconcilePersistence();
         let cleanup: unknown;
         if (run.worktreeId) {
           let record = ready.worktrees.get(run.worktreeId);
@@ -1964,7 +2023,7 @@ export class HerdrToolRuntimeController {
           const parentRoots = await resolveArtifactRoots({ checkout: record.sourceCheckoutPath, allowProgress: false });
           const recordCheckoutPath = record.checkoutPath;
           const sourceRoots = await resolveArtifactRoots({ checkout: recordCheckoutPath, allowProgress: record.artifactPaths.some((artifact) => isWithin(join(recordCheckoutPath, ".progress"), artifact.absolutePath)) });
-          const resultEvidencePersisted = handoffEvidencePersisted(run);
+          const resultEvidencePersisted = handoffEvidencePersisted(run, currentBranch(ready.context));
           const cleanupResult = await ready.worktreeCleanup.cleanup({
             id: record.id,
             cleanup: input.cleanup ?? "remove_if_safe",
@@ -2005,7 +2064,7 @@ export class HerdrToolRuntimeController {
             await this.#setAttention(run, { kind: "cleanup_required", reason: `Read-only runtime artifact purge failed: ${error instanceof Error ? error.message : String(error)}`, nextActions: [`Inspect the run-bound artifacts for ${run.id}, then retry ${stopCall(run.id)}`] });
           });
           if (run.artifacts && run.attention === undefined) {
-            await this.#setAttention(run, { kind: "delivery_uncertain", reason: "Parent result/failure evidence is not yet persisted; transient run artifacts remain", nextActions: [`Allow result/action delivery to persist, then retry ${stopCall(run.id)}`] });
+            await this.#setAttention(run, { kind: "delivery_uncertain", reason: "Parent result/failure evidence is not yet persisted; transient run artifacts remain", nextActions: [`Allow exact result delivery or failure evidence to persist, then retry ${stopCall(run.id)}`] });
           }
           if (input.cleanup === "remove_if_safe") cleanup = { removed: false, retained: false, reason: "Run has no writer worktree; owned group-tab cleanup is handled by process stop" };
         }

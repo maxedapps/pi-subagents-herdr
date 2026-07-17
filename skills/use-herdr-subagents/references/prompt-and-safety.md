@@ -62,10 +62,10 @@ Graceful stop may return `stopped: false`; retain and inspect rather than claimi
 Writer cleanup defaults to automatic `remove_if_safe`; omitting `cleanup` is equivalent to `cleanup: "remove_if_safe"`, while explicit `retain` is exceptional. Before accepting successful finalization:
 
 1. Prove the child is stopped and current ownership—or exact cleanup-only adoption—agrees.
-2. Confirm a result envelope (exact Pi final or bounded non-Pi transcript), or an exact `failed` notice, is parent-persisted. Cleanup/recovery/blocked/writer-review notices do not qualify.
+2. Confirm a result envelope (exact Pi final or bounded non-Pi transcript), or an exact non-model-visible branch/session/run/nonce-bound failure entry, is parent-persisted. Passive cleanup/recovery/blocked/writer-review attention does not qualify; exact legacy parent-persisted failed action evidence is read-only compatible.
 3. Inspect the complete diff/Git status and rerun relevant checks; integrate manually.
 4. Let the extension derive `no_changes`, direct containment, or exact current tree equivalence; provide existing `commit_contained`/`tree_matches` evidence only for another integrated parent ref.
 5. Preserve any present explicit custom artifact through verified parent capture.
 6. Require clean Git state, exact worktree provenance, no agent/unknown pane, and known idle anchors.
 
-`parentReview` is optional audit text. On success, non-force Herdr removal closes the writer workspace, compare-deletes only the exact generated branch at expected HEAD, and purges transient runtime files. Retain on stale, missing, uncertain, active, dirty, unintegrated, moved-ref, artifact-copy, or identity mismatch. Never delete unrelated/custom/moved evidence. Dirty discard remains explicit human-only behavior unavailable through these tools.
+`parentReview` is optional audit text. Startup is passive: it neither adopts nor finalizes prior-session residue. An explicit exact-ID stop may attempt cleanup-only adoption after full stopped provenance checks; read-only records do not need worktree metadata, and no prior private output is exposed. On success, non-force Herdr removal closes the writer workspace, compare-deletes only the exact generated branch at expected HEAD, and purges transient runtime files. Retain on stale, missing, uncertain, active, dirty, unintegrated, moved-ref, artifact-copy, or identity mismatch. Never delete unrelated/custom/moved evidence. Dirty discard remains explicit human-only behavior unavailable through these tools.

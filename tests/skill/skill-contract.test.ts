@@ -51,6 +51,10 @@ test("skill teaches the mandatory start, inspect, follow-up, stop, and verificat
     /interrupt.*current turn.*preserving the session/is,
     /Check `result\.stopped`.*outer tool success does not prove/is,
     /Resolve each owned run before finalizing/i,
+    /only automatic parent-turn trigger.*no action block/is,
+    /obligations remain passive in `run\.attention`/i,
+    /Startup never adopts or finalizes prior residue/i,
+    /explicit exact-ID stop.*cleanup-only adoption/is,
     /Parent verification remains mandatory/i,
     /Child output, status, artifacts, exit state, and test claims are evidence, not proof/i,
   ]) assert.match(skill, contract);

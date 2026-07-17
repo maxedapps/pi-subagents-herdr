@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { JsonValue } from "../../src/contracts/protocol.ts";
-import { ACTION_NOTICE_CUSTOM_TYPE } from "../../src/results/action-notices.ts";
+import { FAILURE_EVIDENCE_CUSTOM_TYPE } from "../../src/results/failure-evidence.ts";
 import { HerdrToolRuntimeController } from "../../src/tools/service.ts";
 import { startFakeHerdrServer, type FakeHerdrRequest } from "../support/fake-herdr-server.ts";
 
@@ -15,14 +15,6 @@ const execFileAsync = promisify(execFile);
 const parentNative = { source: "herdr:pi", agent: "pi", kind: "id" as const, value: "parent-session" };
 
 function reply(request: FakeHerdrRequest, result: JsonValue): JsonValue { return { id: request.id ?? "", result }; }
-
-async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error("Timed out waiting for fake parent persistence");
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
 
 function fixtureApi() {
   const branch: Array<Record<string, unknown>> = [{ type: "message", id: "entry-0", parentId: null, message: { role: "user", content: "start" } }];
@@ -120,8 +112,8 @@ test("writer placement exhaustion returns exact resources and ordinary stop remo
     assert.equal(exhausted.run.worktree?.checkoutPath, writerPath); assert.equal(exhausted.run.worktree?.branch, writerBranch); assert.equal(writerLive, true);
     assert.ok((exhausted.reason ?? "").includes(`subagent_stop({ id: ${JSON.stringify(exhausted.run.id)} })`));
     await access(writerPath);
-    await waitFor(() => fake.branch.some((entry) => entry.type === "message" && (entry.message as { customType?: string } | undefined)?.customType === ACTION_NOTICE_CUSTOM_TYPE));
-    await runtime.reconcileResultPersistence();
+    assert.equal(fake.branch.filter((entry) => entry.type === "custom" && entry.customType === FAILURE_EVIDENCE_CUSTOM_TYPE).length, 1);
+    assert.equal(fake.branch.filter((entry) => entry.type === "message").length, 1, "fixture has only its original user message; failure evidence is never model-visible");
     const stopped = await runtime.stop({ id: exhausted.run.id, mode: "graceful", cleanup: "remove_if_safe", timeoutMs: 2_000 });
     assert.equal(stopped.ok, true);
     if (stopped.ok) {

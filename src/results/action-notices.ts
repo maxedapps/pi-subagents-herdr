@@ -1,11 +1,10 @@
 import { createHash } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { authorizeResultDelivery } from "./delivery.ts";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { extractPersistedCustomMessage } from "./persisted-custom-message.ts";
-import { boundUtf8HeadTail } from "./presentation.ts";
 
-export const ACTION_NOTICE_CUSTOM_TYPE = "herdr-subagents.action-required.v1" as const;
-export const ACTION_NOTICE_SENTINEL = "HERDR_ACTION_REQUIRED_V1" as const;
+/** Read-only compatibility constants for schema-v5 sessions written before passive attention. */
+export const LEGACY_ACTION_NOTICE_CUSTOM_TYPE = "herdr-subagents.action-required.v1" as const;
+export const LEGACY_ACTION_NOTICE_SENTINEL = "HERDR_ACTION_REQUIRED_V1" as const;
 
 export type ActionKind =
   | "writer_review_required"
@@ -39,6 +38,7 @@ export interface RunAttention {
   readonly reason: string;
   readonly nextActions: readonly string[];
   readonly facts?: ActionFacts;
+  /** Inert schema-v5 compatibility state. New attention always remains derived. */
   readonly delivery: {
     readonly stage: ActionDeliveryStage;
     readonly runtimeEpoch?: string;
@@ -47,16 +47,6 @@ export interface RunAttention {
 
 export interface PublicRunAttention extends Omit<RunAttention, "delivery"> {
   readonly deliveryStage: ActionDeliveryStage;
-}
-
-export interface ActionNoticeItem {
-  readonly runId: string;
-  readonly runNonce: string;
-  readonly attention: RunAttention;
-  readonly parentSessionId: string;
-  readonly parentSessionPath?: string;
-  readonly terminalId?: string;
-  readonly nativeSession?: { readonly kind: "id" | "path"; readonly value: string; readonly source: string };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -84,6 +74,7 @@ export function parseRunAttention(value: unknown): RunAttention {
     }
   }
   if (!isRecord(value.delivery) || !["derived", "dispatched", "parent_persisted"].includes(String(value.delivery.stage))) throw new Error("run attention delivery is malformed");
+  if (Object.keys(value.delivery).some((key) => key !== "stage" && key !== "runtimeEpoch")) throw new Error("run attention delivery contains an unknown field");
   if (value.delivery.runtimeEpoch !== undefined && (typeof value.delivery.runtimeEpoch !== "string" || value.delivery.runtimeEpoch.length === 0)) throw new Error("run attention runtimeEpoch is malformed");
   return value as unknown as RunAttention;
 }
@@ -124,150 +115,20 @@ export function deriveRunAttention(
   };
 }
 
-export function formatActionNotice(runId: string, attention: RunAttention): string {
-  const facts = attention.facts;
-  const lines = [
-    `${ACTION_NOTICE_SENTINEL} ${JSON.stringify({ noticeId: attention.noticeId, runId, kind: attention.kind, revision: attention.revision })}`,
-    `ACTION REQUIRED — ${attention.kind.replaceAll("_", " ")}`,
-    `run=${runId}`,
-  ];
-  if (facts) {
-    if (facts.checkoutPath) lines.push(`checkout=${facts.checkoutPath}`);
-    if (facts.branch) lines.push(`branch=${facts.branch}`);
-    if (facts.base || facts.head) lines.push(`base=${facts.base ?? "unknown"} head=${facts.head ?? "unknown"}`);
-    if (facts.clean !== undefined || facts.commitsAhead !== undefined || facts.noChanges !== undefined) {
-      lines.push(`clean=${facts.clean ?? "unknown"} commitsAhead=${facts.commitsAhead ?? "unknown"} noChanges=${facts.noChanges ?? "unknown"}`);
-    }
-    if (facts.workspaceId || facts.tabId || facts.terminalId) {
-      lines.push(`workspace=${facts.workspaceId ?? "unknown"} tab=${facts.tabId ?? "unknown"} terminal=${facts.terminalId ?? "unknown"}`);
-    }
-  }
-  lines.push(`reason=${attention.reason}`);
-  for (const action of attention.nextActions) lines.push(`next=${action}`);
-  return lines.join("\n");
-}
-
-export function findPersistedActionNotice(branch: readonly SessionEntry[], noticeId: string): SessionEntry | undefined {
+/** Recognize only exact historical action messages; never generate or replay them. */
+export function findLegacyPersistedFailedAction(branch: readonly SessionEntry[], runId: string, noticeId: string): SessionEntry | undefined {
   return branch.find((entry) => {
     const message = extractPersistedCustomMessage(entry);
-    if (!message) return false;
-    if (message.customType !== ACTION_NOTICE_CUSTOM_TYPE && message.customType !== "herdr-subagents.result.v1") return false;
+    if (!message || (message.customType !== LEGACY_ACTION_NOTICE_CUSTOM_TYPE && message.customType !== "herdr-subagents.result.v1")) return false;
     return message.text.split("\n").some((line) => {
-      if (!line.startsWith(`${ACTION_NOTICE_SENTINEL} `)) return false;
+      if (!line.startsWith(`${LEGACY_ACTION_NOTICE_SENTINEL} `)) return false;
       try {
-        const parsed = JSON.parse(line.slice(ACTION_NOTICE_SENTINEL.length + 1)) as unknown;
-        if (!isRecord(parsed)) return false;
-        if (parsed.noticeId === noticeId) return true;
-        if (!Array.isArray(parsed.noticeIds) || parsed.noticeIds.length === 0) return false;
-        if (!parsed.noticeIds.every((item) => typeof item === "string" && item.length > 0 && !item.includes("\0"))) return false;
-        if (new Set(parsed.noticeIds).size !== parsed.noticeIds.length) return false;
-        return parsed.noticeIds.includes(noticeId);
+        const parsed = JSON.parse(line.slice(LEGACY_ACTION_NOTICE_SENTINEL.length + 1)) as unknown;
+        return isRecord(parsed)
+          && parsed.noticeId === noticeId
+          && parsed.kind === "failed"
+          && parsed.runId === runId;
       } catch { return false; }
     });
   });
-}
-
-export interface ActionNoticeHooks {
-  readonly pi: ExtensionAPI;
-  readonly runtimeEpoch: string;
-  readonly getContext: () => ExtensionContext | undefined;
-  readonly listQueued: () => Promise<readonly ActionNoticeItem[]>;
-  readonly updateAttention: (runId: string, update: (current: RunAttention) => RunAttention) => Promise<RunAttention | undefined>;
-}
-
-const DEBOUNCE_MS = 50;
-const REDISPATCH_GRACE_MS = 250;
-
-export class ActionNoticeService {
-  readonly #hooks: ActionNoticeHooks;
-  #timer: NodeJS.Timeout | undefined;
-  #flushing: Promise<void> | undefined;
-  #stopped = false;
-
-  constructor(hooks: ActionNoticeHooks) { this.#hooks = hooks; }
-
-  stop(): void {
-    this.#stopped = true;
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
-  }
-
-  scheduleFlush(delayMs = DEBOUNCE_MS): void {
-    if (this.#stopped) return;
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = setTimeout(() => { this.#timer = undefined; void this.flush().catch(() => undefined); }, delayMs);
-    this.#timer.unref?.();
-  }
-
-  noteParentSettled(): void {
-    // Settling is a persistence-scan boundary, never permission to resend the
-    // same unchanged notice in this runtime epoch.
-    this.scheduleFlush(REDISPATCH_GRACE_MS);
-  }
-
-  async flush(): Promise<void> {
-    if (this.#flushing) return this.#flushing;
-    this.#flushing = this.#flushLocked().finally(() => { this.#flushing = undefined; });
-    return this.#flushing;
-  }
-
-  async #flushLocked(): Promise<void> {
-    if (this.#stopped) return;
-    const context = this.#hooks.getContext();
-    if (!context) return;
-    const sessionId = context.sessionManager.getSessionId();
-    const sessionPath = context.sessionManager.getSessionFile();
-    const branch = context.sessionManager.getBranch();
-    for (const item of await this.#hooks.listQueued()) {
-      const auth = authorizeResultDelivery({
-        runId: item.runId,
-        runNonce: item.runNonce,
-        parentSessionId: item.parentSessionId,
-        ...(item.parentSessionPath === undefined ? {} : { parentSessionPath: item.parentSessionPath }),
-        ...(item.terminalId === undefined ? {} : { terminalId: item.terminalId }),
-        ...(item.nativeSession === undefined ? {} : { nativeSession: item.nativeSession }),
-        branch,
-        sessionId,
-        ...(sessionPath === undefined ? {} : { sessionPath }),
-      });
-      if (!auth.ok) continue;
-      const persisted = findPersistedActionNotice(branch, item.attention.noticeId);
-      if (persisted) {
-        if (item.attention.delivery.stage !== "parent_persisted") {
-          await this.#hooks.updateAttention(item.runId, (current) => current.noticeId === item.attention.noticeId
-            ? { ...current, delivery: { stage: "parent_persisted" } }
-            : current);
-        }
-        continue;
-      }
-      if (item.attention.delivery.stage === "parent_persisted") continue;
-      const inflight = item.attention.delivery.stage === "dispatched"
-        && item.attention.delivery.runtimeEpoch === this.#hooks.runtimeEpoch;
-      if (inflight) continue;
-      const updated = await this.#hooks.updateAttention(item.runId, (current) => current.noticeId === item.attention.noticeId
-        ? { ...current, delivery: { stage: "dispatched", runtimeEpoch: this.#hooks.runtimeEpoch } }
-        : current);
-      if (!updated || updated.noticeId !== item.attention.noticeId) continue;
-      this.#hooks.pi.sendMessage({
-        customType: ACTION_NOTICE_CUSTOM_TYPE,
-        content: boundUtf8HeadTail(formatActionNotice(item.runId, updated)).text,
-        display: true,
-        details: { noticeId: updated.noticeId, runId: item.runId, kind: updated.kind, revision: updated.revision },
-      }, { deliverAs: "followUp", triggerTurn: true });
-    }
-    setTimeout(() => { void this.reconcilePersistence().catch(() => undefined); }, 0).unref?.();
-  }
-
-  async reconcilePersistence(): Promise<void> {
-    const context = this.#hooks.getContext();
-    if (!context) return;
-    const branch = context.sessionManager.getBranch();
-    for (const item of await this.#hooks.listQueued()) {
-      const persisted = findPersistedActionNotice(branch, item.attention.noticeId);
-      if (!persisted || item.attention.delivery.stage === "parent_persisted") continue;
-      await this.#hooks.updateAttention(item.runId, (current) => current.noticeId === item.attention.noticeId
-        ? { ...current, delivery: { stage: "parent_persisted" } }
-        : current);
-    }
-  }
 }

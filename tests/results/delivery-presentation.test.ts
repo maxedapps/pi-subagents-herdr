@@ -5,7 +5,7 @@ import {
   buildDeliveredText,
   computeDeliveryId,
 } from "../../src/results/delivery.ts";
-import { actionCollapsedPreview, boundUtf8HeadTail, collapsedPreview, exactToolPayload, resultCollapsedPreview } from "../../src/results/presentation.ts";
+import { boundUtf8HeadTail, collapsedPreview, exactToolPayload, resultCollapsedPreview } from "../../src/results/presentation.ts";
 import { createCapturedResult, capturedToEnvelope } from "../../src/results/contracts.ts";
 import type { PiBranchEntry } from "../../src/runtime/ownership.ts";
 import { ActiveBranchOwnershipJournal } from "../../src/runtime/ownership.ts";
@@ -28,7 +28,7 @@ test("collapsed preview is an ordered prefix of delivered text", () => {
   assert.match(preview, /line1/);
 });
 
-test("result and action collapsed previews are semantic and show the expansion hint", () => {
+test("result collapsed previews are semantic and show the expansion hint", () => {
   const result = [
     'HERDR_RESULT_V1 {"resultId":"res-1"}',
     "Subagent result for run-1 (scout) generation 1",
@@ -38,13 +38,6 @@ test("result and action collapsed previews are semantic and show the expansion h
     "details",
   ].join("\n");
   assert.equal(resultCollapsedPreview(result, "Alt+E"), "Result received · ## Child summary\nAlt+E to expand");
-  const action = [
-    'HERDR_ACTION_REQUIRED_V1 {"noticeId":"act-1"}',
-    "ACTION REQUIRED — cleanup required",
-    "run=run-1",
-    "reason=integration missing",
-  ].join("\n");
-  assert.equal(actionCollapsedPreview(action), "ACTION REQUIRED — cleanup required\nreason=integration missing\nCtrl+O to expand");
 });
 
 test("exactToolPayload serializes once for content and details", () => {

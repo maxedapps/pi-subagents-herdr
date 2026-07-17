@@ -2,8 +2,7 @@ import { keyText, type ExtensionAPI, type ExtensionContext, type Theme } from "@
 import { Text } from "@earendil-works/pi-tui";
 import { PACKAGE_ASSETS } from "../package-paths.ts";
 import { RESULT_CUSTOM_TYPE } from "../results/contracts.ts";
-import { ACTION_NOTICE_CUSTOM_TYPE } from "../results/action-notices.ts";
-import { actionCollapsedPreview, resultCollapsedPreview } from "../results/presentation.ts";
+import { resultCollapsedPreview } from "../results/presentation.ts";
 import { registerChildResultBridge } from "../results/child-bridge.ts";
 import { registerHerdrToolSurface } from "../tools/index.ts";
 import { registerHerdrSubagentsUi } from "../ui/index.ts";
@@ -127,8 +126,6 @@ export function registerHerdrSubagentsExtension(
     const expansionHint = () => keyText("app.tools.expand") || "Ctrl+O";
     pi.registerMessageRenderer(RESULT_CUSTOM_TYPE, (message, options, theme) =>
       expandedOr(message, options.expanded, theme, (text) => resultCollapsedPreview(text, expansionHint())));
-    pi.registerMessageRenderer(ACTION_NOTICE_CUSTOM_TYPE, (message, options, theme) =>
-      expandedOr(message, options.expanded, theme, (text) => actionCollapsedPreview(text, expansionHint())));
   }
 
   pi.on("session_shutdown", async () => {

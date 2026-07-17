@@ -68,7 +68,7 @@ export function summarizeDashboardRuns(runs: readonly RunSummary[]): DashboardSu
 
 export function statusSummaryLabel(summary: DashboardSummary): string {
   const parts: string[] = [];
-  if (summary.actionRequired) parts.push(`${summary.actionRequired} action required`);
+  if (summary.actionRequired) parts.push(`${summary.actionRequired} attention`);
   if (summary.blocked) parts.push(`${summary.blocked} blocked`);
   if (summary.working) parts.push(`${summary.working} working`);
   if (summary.ready) parts.push(`${summary.ready} ready`);

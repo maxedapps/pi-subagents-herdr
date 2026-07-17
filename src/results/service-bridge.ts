@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { GenerationSummary, PublicResultView, ResultEnvelopeV1 } from "./contracts.ts";
-import { formatActionNotice, type RunAttention } from "./action-notices.ts";
+import type { RunAttention } from "./action-notices.ts";
 import { toPublicResultView } from "./contracts.ts";
 import { ResultCoordinator, type CoordinatorRunView } from "./coordinator.ts";
 import { ResultDeliveryService, type DeliveryItem } from "./delivery.ts";
@@ -165,7 +165,6 @@ export function installResultServices(host: ResultServiceHost): {
               profileName: run.profile.name,
               ...(terminalId === undefined ? {} : { terminalId }),
               ...(nativeSession === undefined ? {} : { nativeSession }),
-              ...(run.attention === undefined ? {} : { actionText: formatActionNotice(run.id, run.attention) }),
             });
           }
         }

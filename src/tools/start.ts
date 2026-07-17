@@ -12,7 +12,7 @@ export function registerStartTool(pi: ExtensionAPI, runtime: HerdrToolRuntimeCon
     promptSnippet: "Start one bounded, ownership-tracked subagent",
     promptGuidelines: [
       `Use ${name} for one bounded delegation with a clear output and stopping condition.`,
-      "Omit optional overrides unless required; inspect adjustments and ACTION REQUIRED state.",
+      "Omit optional overrides unless required; inspect adjustments and passive run.attention state through subagent_status.",
     ],
     parameters: StartToolSchema,
     executionMode: "parallel",

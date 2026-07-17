@@ -7,7 +7,6 @@ import {
   registerHerdrSubagentsExtension,
   type SessionRuntime,
 } from "../../src/lifecycle/extension.ts";
-import { ACTION_NOTICE_CUSTOM_TYPE } from "../../src/results/action-notices.ts";
 import { RESULT_CUSTOM_TYPE } from "../../src/results/contracts.ts";
 
 type Handler = (...args: readonly unknown[]) => unknown;
@@ -207,7 +206,7 @@ test("message_end reconciliation runs after Pi's append continuation", async () 
   await fake.events.get("session_shutdown")?.({});
 });
 
-test("result and action custom messages use separate semantic collapsed renderers", () => {
+test("completed results are the only registered custom-message renderer", () => {
   const fake = fakeApi();
   registerHerdrSubagentsExtension(fake.api, { environment: {}, createRuntime: () => ({ start() {}, stop() {} }) });
   const theme = { fg: (_color: string, text: string) => text } as unknown as Theme;
@@ -224,12 +223,7 @@ test("result and action custom messages use separate semantic collapsed renderer
   assert.match(collapsedResult.render(160).join("\n"), /Ctrl\+O to expand/);
   const expandedResult = resultRenderer({ content: resultText }, { expanded: true }, theme) as { render(width: number): string[] };
   assert.equal(expandedResult.render(500).map((line) => line.trimEnd()).join("\n"), resultText);
-
-  const actionText = 'HERDR_ACTION_REQUIRED_V1 {"noticeId":"act-1"}\nACTION REQUIRED — cleanup required\nreason=inspect retained files';
-  const actionRenderer = fake.renderers.get(ACTION_NOTICE_CUSTOM_TYPE)!;
-  const collapsedAction = actionRenderer({ content: actionText }, { expanded: false }, theme) as { render(width: number): string[] };
-  assert.match(collapsedAction.render(160).join("\n"), /ACTION REQUIRED — cleanup required/);
-  assert.match(collapsedAction.render(160).join("\n"), /reason=inspect retained files/);
+  assert.deepEqual([...fake.renderers.keys()], [RESULT_CUSTOM_TYPE]);
 });
 
 test("lifecycle child guard registers only the narrow result bridge", () => {

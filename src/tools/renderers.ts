@@ -28,7 +28,7 @@ export function renderToolCall(label: string, detail: string | undefined, theme:
 
 function runLine(run: RunSummary, theme: Theme): string {
   const status = run.lifecycle === "running" ? run.herdrStatus : run.lifecycle;
-  const attention = run.attention?.required ? ` ${theme.fg("warning", `action required: ${run.attention.kind.replaceAll("_", " ")}`)}` : "";
+  const attention = run.attention?.required ? ` ${theme.fg("warning", `attention: ${run.attention.kind.replaceAll("_", " ")}`)}` : "";
   return `${statusColor(theme, status, icon(status))} ${theme.fg("accent", run.id)} ${theme.fg("muted", `${run.profile}/${run.harness}`)} ${statusColor(theme, status, status)}${attention}`;
 }
 

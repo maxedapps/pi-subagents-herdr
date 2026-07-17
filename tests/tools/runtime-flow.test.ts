@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { JsonValue } from "../../src/contracts/protocol.ts";
+import { LEGACY_ACTION_NOTICE_CUSTOM_TYPE, LEGACY_ACTION_NOTICE_SENTINEL } from "../../src/results/action-notices.ts";
+import { ActiveBranchOwnershipJournal } from "../../src/runtime/ownership.ts";
 import { handoffEvidencePersisted, HerdrToolRuntimeController } from "../../src/tools/service.ts";
 import { startFakeHerdrServer, type FakeHerdrRequest } from "../support/fake-herdr-server.ts";
 
@@ -44,16 +46,26 @@ function reply(request: FakeHerdrRequest, result: JsonValue): JsonValue {
   return { id: request.id ?? "", result };
 }
 
-test("only a persisted result or persisted failed notice satisfies the handoff gate", () => {
-  const delivery = (stage: "captured" | "dispatched" | "parent_persisted") => ({ stage, runtimeEpoch: "epoch" });
-  const attention = (kind: "failed" | "cleanup_required" | "recovery_required" | "blocked" | "delivery_uncertain" | "writer_review_required", stage: "captured" | "dispatched" | "parent_persisted") => ({ kind, delivery: delivery(stage) });
-  assert.equal(handoffEvidencePersisted({ latestResult: { deliveryStage: "parent_persisted" } as never }), true);
-  assert.equal(handoffEvidencePersisted({ attention: attention("failed", "parent_persisted") as never }), true);
-  for (const kind of ["cleanup_required", "recovery_required", "blocked", "delivery_uncertain", "writer_review_required"] as const) {
-    assert.equal(handoffEvidencePersisted({ attention: attention(kind, "parent_persisted") as never }), false);
-  }
-  assert.equal(handoffEvidencePersisted({ attention: attention("failed", "dispatched") as never }), false);
-  assert.equal(handoffEvidencePersisted({}), false);
+test("only exact persisted result/failure evidence satisfies the handoff gate", () => {
+  const identity = {
+    id: "run-1",
+    runNonce: "nonce-1",
+    journal: { parent: { sessionId: "parent", branchEntryId: "entry" } },
+  };
+  assert.equal(handoffEvidencePersisted({ ...identity, latestResult: { deliveryStage: "parent_persisted" } } as never), true);
+  assert.equal(handoffEvidencePersisted({ ...identity, attention: { kind: "failed", noticeId: "act-1", delivery: { stage: "parent_persisted" } } } as never), false, "metadata attention without exact branch evidence is passive only");
+  assert.equal(handoffEvidencePersisted(identity as never), false);
+});
+
+test("exact legacy failed action evidence remains cleanup-authoritative without replay", () => {
+  const session = SessionManager.inMemory(process.cwd(), { id: "parent" });
+  const anchor = session.appendCustomMessageEntry("fixture.anchor", "anchor", false);
+  const writer = new ActiveBranchOwnershipJournal({ appendEntry(customType: string, data: unknown) { session.appendCustomEntry(customType, data); } });
+  let journal = writer.begin({ runId: "run-legacy", runNonce: "nonce-legacy", branchEntryId: anchor, sessionId: "parent", intended: { workspaceId: "w1", group: "default", worktreeRequested: false } });
+  journal = writer.append(journal, "failed", {});
+  const attention = { required: true, kind: "failed", noticeId: "act-legacy", revision: 1, reason: "legacy failure", nextActions: ["inspect"], delivery: { stage: "parent_persisted" } } as const;
+  session.appendCustomMessageEntry(LEGACY_ACTION_NOTICE_CUSTOM_TYPE, `${LEGACY_ACTION_NOTICE_SENTINEL} ${JSON.stringify({ noticeId: attention.noticeId, runId: "run-legacy", kind: "failed", revision: 1 })}`, true);
+  assert.equal(handoffEvidencePersisted({ id: "run-legacy", runNonce: "nonce-legacy", journal, attention }, session.getBranch()), true);
 });
 
 test("real tool runtime handles protected starts, normal Pi resources, bounded slots, and start → stop → start through the typed Herdr client", async () => {
@@ -224,7 +236,7 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
       assert.equal(recoveredRun?.ownership, "uncertain");
       assert.match(recoveredRun?.taskSynopsis ?? "", /requires retained run-bound ephemeral files and the full delegated assignment/);
     }
-    await assert.rejects(runtime.stop({ id: started.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 }), /Unknown subagent run/);
+    await assert.rejects(runtime.stop({ id: started.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 }), /not exact stopped cleanup residue/);
     assert.equal(completed.artifacts.handoff, undefined, "tampered stopped-state metadata must not regain control or invent a handoff");
 
     await writeFile(metadataPath, `${JSON.stringify(beforeReloadMetadata, null, 2)}\n`);
@@ -246,7 +258,7 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     const observed = await runtime.list({ scope: "all_owned" });
     assert.equal(observed.ok, true);
     if (observed.ok) assert.equal(observed.runs.find((run) => run.id === started.run.id)?.ownership, "uncertain");
-    await assert.rejects(runtime.stop({ id: started.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 }), /Unknown subagent run/);
+    await assert.rejects(runtime.stop({ id: started.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 }), /retained Pi runtime metadata requires resultExchangeDirectory/);
     assert.equal(await readFile(join(externalPrivateDirectory, "system.md"), "utf8"), "must survive tampered metadata");
 
     beforeReloadMetadata.runtime = untamperedRuntime;
