@@ -272,6 +272,24 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     }
     assert.equal(childLive, false);
     assert.equal(groupLive, false);
+    const paneInputsBeforeStoppedSend = server.requests.filter((request) => request.method === "pane.send_input").length;
+    await assert.rejects(
+      runtime.send({ id: started.run.id, message: "must be refused after stop", timeoutMs: 2_000 }),
+      (error: unknown) => {
+        assert.equal((error as Error).message, "Run lifecycle stopped cannot accept a new generation");
+        return true;
+      },
+    );
+    assert.equal(
+      server.requests.filter((request) => request.method === "pane.send_input").length,
+      paneInputsBeforeStoppedSend,
+      "a stopped-run send refusal must not reach Herdr pane input",
+    );
+    const usableAfterStoppedSend = await runtime.list({});
+    assert.equal(usableAfterStoppedSend.ok, true);
+    if (usableAfterStoppedSend.ok) {
+      assert.equal(usableAfterStoppedSend.runs.find((run) => run.id === started.run.id)?.lifecycle, "stopped");
+    }
     const stoppedInspect = await runtime.get({ id: started.run.id });
     assert.equal(stoppedInspect.ok, true);
     if (stoppedInspect.ok) {

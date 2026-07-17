@@ -49,7 +49,7 @@ class SerialQueue {
     let release!: () => void;
     this.#tail = new Promise<void>((resolveTail) => { release = resolveTail; });
     const result = previous.then(operation, operation);
-    void result.finally(() => { release(); });
+    void result.then(release, release);
     return result;
   }
 }

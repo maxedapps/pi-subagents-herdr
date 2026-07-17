@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerSendTool } from "../../src/tools/send.ts";
 import { StartTopologyGate } from "../../src/tools/service.ts";
 import { registerStartTool } from "../../src/tools/start.ts";
 
@@ -31,4 +32,24 @@ test("security-sensitive execution failures are thrown so Pi marks isError", asy
     definition!.execute("call", { profile: "scout", task: "x" }, undefined, undefined, {}),
     /ownership rejected/,
   );
+});
+
+test("send lifecycle refusals remain the exact thrown tool error", async () => {
+  let definition: { execute: (...args: any[]) => Promise<unknown> } | undefined;
+  const pi = { registerTool(value: typeof definition) { definition = value; } } as unknown as ExtensionAPI;
+  const refusal = new Error("Run lifecycle stopped cannot accept a new generation");
+  const runtime = { send: async () => { throw refusal; } };
+  registerSendTool(pi, runtime as never, "subagent_send");
+
+  const observed = await definition!.execute(
+    "call",
+    { id: "run-stopped", message: "continue" },
+    undefined,
+    undefined,
+    {},
+  ).then(
+    () => assert.fail("stopped send unexpectedly fulfilled"),
+    (error) => error,
+  );
+  assert.equal(observed, refusal);
 });
