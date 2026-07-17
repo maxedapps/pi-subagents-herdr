@@ -1,6 +1,6 @@
 import type { HerdrRequestClient } from "../herdr/client.ts";
 import { harnessAdapter } from "../harnesses/index.ts";
-import { processBaseline } from "./groups.ts";
+import { verifyIdleShell } from "./groups.ts";
 import {
   abortError,
   delay,
@@ -40,7 +40,7 @@ async function waitForTerminalGone(input: {
   }
 }
 
-async function closeDedicatedTabIfSafe(
+export async function closeDedicatedTabIfSafe(
   client: HerdrRequestClient,
   target: OwnedRunTarget,
   signal?: AbortSignal,
@@ -61,7 +61,8 @@ async function closeDedicatedTabIfSafe(
     return { closed: false, reason: "Child terminal still exists" };
   }
   const tab = snapshot.tabs.find((candidate) => candidate.tab_id === group.tabId);
-  if (!tab || tab.workspace_id !== group.workspaceId) return { closed: false, reason: "Dedicated tab identity is absent or moved" };
+  if (!tab && !snapshot.panes.some((pane) => pane.tab_id === group.tabId)) return { closed: true, reason: "Dedicated tab is already absent" };
+  if (!tab || tab.workspace_id !== group.workspaceId) return { closed: false, reason: "Dedicated tab identity is moved or partially represented" };
   const panes = snapshot.panes.filter((candidate) => candidate.tab_id === group.tabId);
   const anchor = panes.find((candidate) => candidate.terminal_id === group.rootTerminalId);
   if (!anchor || panes.length !== 1 || anchor.workspace_id !== group.workspaceId) {
@@ -70,8 +71,13 @@ async function closeDedicatedTabIfSafe(
   if (snapshot.agents.some((agent) => agent.tab_id === group.tabId)) {
     return { closed: false, reason: "Dedicated tab still contains a detected agent" };
   }
-  const baseline = processBaseline(await client.getPaneProcessInfo(anchor.pane_id, signal));
-  if (baseline !== group.rootProcessBaseline) return { closed: false, reason: "Dedicated anchor process baseline changed" };
+  let idle: ReturnType<typeof verifyIdleShell> = { idle: false, reason: "not yet probed" };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    idle = verifyIdleShell(await client.getPaneProcessInfo(anchor.pane_id, signal));
+    if (idle.idle) break;
+    if (attempt < 2) await delay(75, signal);
+  }
+  if (!idle.idle) return { closed: false, reason: `Dedicated anchor is not a known idle shell: ${idle.reason}` };
   await client.closeTab(group.tabId, signal);
   const finalSnapshot = await client.snapshot(signal);
   if (finalSnapshot.tabs.some((candidate) => candidate.tab_id === group.tabId)

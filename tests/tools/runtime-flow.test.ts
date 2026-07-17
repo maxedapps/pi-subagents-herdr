@@ -152,13 +152,13 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     assert.equal(inspected.ok, true);
     if (inspected.ok) {
       assert.equal(inspected.output.returnedLines <= 20, true); assert.equal("systemPrompt" in inspected, false);
-      assert.deepEqual(Object.keys(inspected.artifacts).sort(), ["handoff", "metadata"]);
+      assert.deepEqual(Object.keys(inspected.artifacts).sort(), ["metadata"]);
       assert.deepEqual(inspected.runtime, { ephemeralFiles: "retained", piSessionData: "retained" });
       const metadata = JSON.parse(await readFile(inspected.artifacts.metadata!, "utf8")) as { runId: string; runNonce: string; terminalId: string; assignment: string; nativeSession?: { value: string }; policy: Record<string, unknown>; artifacts: Record<string, string>; runtime: { ephemeralFiles: string; directory: string; systemPrompt: string; sessionDirectory: string } };
       assert.deepEqual({ runId: metadata.runId, terminalId: metadata.terminalId, native: metadata.nativeSession?.value }, { runId: started.run.id, terminalId: "term-child", native: childNative.value });
       assert.equal(metadata.assignment, fullAssignment);
       assert.equal("skills" in metadata.policy, false);
-      assert.deepEqual(Object.keys(metadata.artifacts).sort(), ["handoff", "metadata"]);
+      assert.deepEqual(Object.keys(metadata.artifacts).sort(), ["metadata"]);
       assert.equal(metadata.runtime.ephemeralFiles, "retained");
       assert.equal((await lstat(metadata.runtime.systemPrompt)).isFile(), true);
       assert.equal((await lstat(metadata.runtime.sessionDirectory)).isDirectory(), true);
@@ -182,7 +182,7 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     const completed = await runtime.get({ id: started.run.id, lines: 20 });
     assert.equal(completed.ok, true);
     if (!completed.ok) return;
-    await assert.rejects(readFile(completed.artifacts.handoff!, "utf8"), /ENOENT/, "wait/done observation must not create a partial or duplicate handoff");
+    assert.equal(completed.artifacts.handoff, undefined, "wait/done observation must not create a duplicate handoff");
     const metadataPath = completed.artifacts.metadata!;
     const beforeReloadMetadata = JSON.parse(await readFile(metadataPath, "utf8")) as { assignment: string; output: { text: string }; runtime: Record<string, unknown> };
     assert.equal(beforeReloadMetadata.assignment, fullAssignment);
@@ -201,7 +201,7 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
       assert.match(recoveredRun?.taskSynopsis ?? "", /requires retained run-bound ephemeral files and the full delegated assignment/);
     }
     await assert.rejects(runtime.stop({ id: started.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 }), /Unknown subagent run/);
-    await assert.rejects(readFile(completed.artifacts.handoff!, "utf8"), /ENOENT/, "tampered stopped-state metadata must not regain control or skip the final handoff");
+    assert.equal(completed.artifacts.handoff, undefined, "tampered stopped-state metadata must not regain control or invent a handoff");
 
     await writeFile(metadataPath, `${JSON.stringify(beforeReloadMetadata, null, 2)}\n`);
     await runtime.stopSession();
@@ -230,6 +230,8 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     await runtime.stopSession();
     runtime = new HerdrToolRuntimeController(fake.api, { environment });
     await runtime.startSession(fake.context(root));
+    const recoveredList = await runtime.list({});
+    assert.equal(recoveredList.ok, true, recoveredList.ok ? undefined : recoveredList.reason);
     const recovered = await runtime.get({ id: started.run.id, lines: 20 });
     assert.equal(recovered.ok, true);
     if (recovered.ok) assert.match(recovered.output.text, /completed/);
@@ -252,15 +254,22 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
       assert.deepEqual(stoppedInspect.runtime, { ephemeralFiles: "removed", piSessionData: "removed" });
       const stoppedMetadata = JSON.parse(await readFile(stoppedInspect.artifacts.metadata!, "utf8")) as { assignment?: string; runtime: Record<string, unknown> };
       assert.deepEqual(stoppedMetadata.runtime, { ephemeralFiles: "removed" });
-      assert.equal("assignment" in stoppedMetadata, false);
-      const handoff = await readFile(stoppedInspect.artifacts.handoff!, "utf8");
-      assert.match(handoff, /Map every public package export/);
-      assert.match(handoff, /completed/);
-      assert.deepEqual((await readdir(join(root, ".subagents", "runs", started.run.id))).sort(), ["handoff.md", "results", "run.json"]);
+      assert.equal("assignment" in stoppedMetadata, true, "assignment remains only until parent result persistence is proven");
+      assert.equal(stoppedInspect.artifacts.handoff, undefined);
+      assert.deepEqual((await readdir(join(root, ".subagents", "runs", started.run.id))).sort(), ["run.json"]);
     }
     await assert.rejects(lstat(liveMetadata.runtime.systemPrompt), /ENOENT/);
     await assert.rejects(lstat(liveMetadata.runtime.sessionDirectory), /ENOENT/);
     assert.equal((await readdir(join(root, ".subagents", "runs"))).some((name) => name.endsWith("-preflight") || name.includes("-validation")), false);
+    await runtime.stopSession();
+    runtime = new HerdrToolRuntimeController(fake.api, { environment });
+    await runtime.startSession(fake.context(root));
+    const repeatedStop = await runtime.stop({ id: started.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 });
+    assert.equal(repeatedStop.ok, true);
+    if (repeatedStop.ok) {
+      assert.equal((repeatedStop.result as { stopped: boolean }).stopped, true);
+      assert.match((repeatedStop.result as { reason: string }).reason, /already proven stopped/);
+    }
 
     for (let index = 0; index < 2; index += 1) {
       const sequential = await runtime.start(`tool-sequential-${index}`, { profile: "scout", task: `Sequential run ${index}` });

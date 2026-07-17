@@ -13,6 +13,7 @@ export interface DashboardSummary {
   readonly idle: number;
   readonly unknown: number;
   readonly failures: number;
+  readonly actionRequired?: number;
 }
 
 export interface DashboardState {
@@ -36,7 +37,7 @@ const LIFECYCLE_ORDER: Readonly<Record<RunLifecycle, number>> = {
 const STATUS_ORDER = { blocked: 0, working: 1, done: 2, idle: 3, unknown: 4 } as const;
 
 export function emptyDashboardSummary(): DashboardSummary {
-  return { total: 0, blocked: 0, working: 0, ready: 0, done: 0, idle: 0, unknown: 0, failures: 0 };
+  return { total: 0, blocked: 0, working: 0, ready: 0, done: 0, idle: 0, unknown: 0, failures: 0, actionRequired: 0 };
 }
 
 export function isFailure(run: RunSummary): boolean {
@@ -44,13 +45,14 @@ export function isFailure(run: RunSummary): boolean {
 }
 
 export function isDashboardVisible(run: RunSummary): boolean {
-  return run.lifecycle !== "stopped";
+  return run.lifecycle !== "stopped" || run.attention?.required === true;
 }
 
 export function summarizeDashboardRuns(runs: readonly RunSummary[]): DashboardSummary {
   const mutable = { ...emptyDashboardSummary() };
   for (const run of runs) {
     mutable.total += 1;
+    if (run.attention?.required) mutable.actionRequired = (mutable.actionRequired ?? 0) + 1;
     if (isFailure(run)) {
       mutable.failures += 1;
       continue;
@@ -66,6 +68,7 @@ export function summarizeDashboardRuns(runs: readonly RunSummary[]): DashboardSu
 
 export function statusSummaryLabel(summary: DashboardSummary): string {
   const parts: string[] = [];
+  if (summary.actionRequired) parts.push(`${summary.actionRequired} action required`);
   if (summary.blocked) parts.push(`${summary.blocked} blocked`);
   if (summary.working) parts.push(`${summary.working} working`);
   if (summary.ready) parts.push(`${summary.ready} ready`);
@@ -87,7 +90,8 @@ export class DashboardProjector {
       };
     }
     const runs = result.runs.filter(isDashboardVisible).sort((left, right) =>
-      LIFECYCLE_ORDER[left.lifecycle] - LIFECYCLE_ORDER[right.lifecycle]
+      Number(right.attention?.required === true) - Number(left.attention?.required === true)
+      || LIFECYCLE_ORDER[left.lifecycle] - LIFECYCLE_ORDER[right.lifecycle]
       || STATUS_ORDER[left.herdrStatus] - STATUS_ORDER[right.herdrStatus]
       || left.profile.localeCompare(right.profile)
       || left.id.localeCompare(right.id));

@@ -39,9 +39,17 @@ test("dashboard summary preserves done and idle attention semantics while groupi
     run("blocked", "blocked"), run("working", "working"), run("done", "done"), run("idle", "idle"),
     run("unknown", "unknown"), run("failed", "unknown", { lifecycle: "failed", live: false }),
   ]);
-  assert.deepEqual(summary, { total: 6, blocked: 1, working: 1, ready: 2, done: 1, idle: 1, unknown: 1, failures: 1 });
+  assert.deepEqual(summary, { total: 6, blocked: 1, working: 1, ready: 2, done: 1, idle: 1, unknown: 1, failures: 1, actionRequired: 0 });
   assert.deepEqual(semanticStyle("running", "done"), { icon: "✓", label: "done", color: "success" });
   assert.deepEqual(semanticStyle("running", "idle"), { icon: "○", label: "idle", color: "muted" });
+});
+
+test("stopped cleanup obligations remain visible and sort ahead of ordinary runs", () => {
+  const attention = { required: true as const, kind: "cleanup_required" as const, noticeId: "act-1", revision: 1, reason: "integration missing", nextActions: ["integrate then retry"], deliveryStage: "parent_persisted" as const };
+  const state = project([run("ordinary", "working"), run("stopped", "unknown", { lifecycle: "stopped", live: false, attention })]);
+  assert.deepEqual(state.runs.map((item) => item.id), ["stopped", "ordinary"]);
+  assert.equal(state.summary.actionRequired, 1);
+  assert.match(renderDashboardRow(state.runs[0]!, 90, theme), /cleanup required/);
 });
 
 test("dashboard projects current owned summaries without output-revision state", () => {

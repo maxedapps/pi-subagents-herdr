@@ -69,10 +69,10 @@ test("skill uses concise progressive disclosure for runtime safety and cleanup",
     /no recursive delegation/i,
     /must not edit, format, install into, stash, restore, clean/i,
     /cleanup: "remove_if_safe"/i,
-    /Provide `parentReview`/i,
+    /`parentReview` is optional audit text/i,
     /no_changes.*commit_contained.*tree_matches/is,
-    /optional progress.*never require it/i,
-    /Safe worktree removal never deletes its branch/i,
+    /present explicit custom artifact.*verified parent capture/i,
+    /compare-deletes only the exact generated branch/i,
     /Dirty discard.*human-only/i,
   ]) assert.match(reference, contract);
 });

@@ -11,7 +11,7 @@ export interface JournalResources {
   readonly worktreeBranch?: string; readonly worktreeBase?: string;
   readonly worktreeInitialTabId?: string; readonly worktreeInitialRootPaneId?: string; readonly worktreeInitialRootTerminalId?: string;
 }
-export type OwnershipJournalPhase = "intent" | "worktree_created" | "created" | "started" | "failed";
+export type OwnershipJournalPhase = "intent" | "worktree_created" | "created" | "started" | "stopped" | "cleanup_adopted" | "failed";
 export interface OwnershipJournalData {
   readonly schemaVersion: 1; readonly runId: string; readonly runNonce: string; readonly sequence: number;
   readonly parent: { readonly sessionId: string; readonly sessionPath?: string; readonly branchEntryId: string };
@@ -24,11 +24,13 @@ export interface CurrentParentIdentity { readonly sessionId: string; readonly se
 
 const RESOURCE_KEYS = new Set(["tabId", "rootPaneId", "rootTerminalId", "rootProcessBaseline", "paneId", "terminalId", "nativeSession", "repositoryId", "commonGitDir", "herdrRepositoryKey", "worktreeSourceWorkspaceId", "worktreeWorkspaceId", "checkoutPath", "worktreeBranch", "worktreeBase", "worktreeInitialTabId", "worktreeInitialRootPaneId", "worktreeInitialRootTerminalId"]);
 const TRANSITIONS: Readonly<Record<OwnershipJournalPhase, readonly OwnershipJournalPhase[]>> = {
-  intent: ["worktree_created", "created", "failed"],
+  intent: ["worktree_created", "created", "cleanup_adopted", "failed"],
   worktree_created: ["created", "failed"],
   created: ["created", "started", "failed"],
-  started: ["started", "failed"],
-  failed: [],
+  started: ["started", "stopped", "failed"],
+  stopped: [],
+  cleanup_adopted: [],
+  failed: ["stopped"],
 };
 function safeId(value: string, label: string): void { if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) throw new Error(`${label} is invalid`); }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -45,9 +47,9 @@ function validatePhaseResources(journal: OwnershipJournalData): void {
   const resources = journal.resources;
   if (journal.phase === "intent" && Object.keys(resources).length !== 0) throw new Error("Ownership intent cannot already contain returned resources");
   if (journal.phase === "worktree_created" && (!resources.repositoryId || !resources.commonGitDir || !resources.herdrRepositoryKey || !resources.worktreeWorkspaceId || !resources.checkoutPath || !resources.worktreeBranch || !resources.worktreeBase || !resources.worktreeInitialTabId || !resources.worktreeInitialRootPaneId || !resources.worktreeInitialRootTerminalId)) throw new Error("worktree_created ownership journal lacks canonical repository/worktree provenance and returned root identity");
-  if ((journal.phase === "created" || journal.phase === "started") && (!resources.tabId || !resources.rootPaneId || !resources.rootTerminalId)) throw new Error(`${journal.phase} ownership journal lacks the returned group identity`);
-  if ((journal.phase === "created" || journal.phase === "started") && journal.intended.worktreeRequested && (!resources.repositoryId || !resources.commonGitDir || !resources.herdrRepositoryKey || !resources.worktreeWorkspaceId || !resources.checkoutPath || !resources.worktreeBranch || !resources.worktreeBase)) throw new Error(`${journal.phase} ownership journal lacks worktree provenance`);
-  if (journal.phase === "started" && (!resources.paneId || !resources.terminalId)) throw new Error("Started ownership journal lacks the child pane and terminal identity");
+  if ((journal.phase === "created" || journal.phase === "started" || journal.phase === "stopped" || journal.phase === "cleanup_adopted") && (!resources.tabId || !resources.rootPaneId || !resources.rootTerminalId)) throw new Error(`${journal.phase} ownership journal lacks the returned group identity`);
+  if ((journal.phase === "created" || journal.phase === "started" || journal.phase === "stopped" || journal.phase === "cleanup_adopted") && journal.intended.worktreeRequested && (!resources.repositoryId || !resources.commonGitDir || !resources.herdrRepositoryKey || !resources.worktreeWorkspaceId || !resources.checkoutPath || !resources.worktreeBranch || !resources.worktreeBase)) throw new Error(`${journal.phase} ownership journal lacks worktree provenance`);
+  if ((journal.phase === "started" || journal.phase === "cleanup_adopted") && (!resources.paneId || !resources.terminalId)) throw new Error(`${journal.phase} ownership journal lacks the child pane and terminal identity`);
 }
 export function parseOwnershipJournalData(value: unknown): OwnershipJournalData {
   if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.runId !== "string" || typeof value.runNonce !== "string" || !Number.isSafeInteger(value.sequence) || (value.sequence as number) < 0 || !isRecord(value.parent) || !isRecord(value.intended) || !isRecord(value.resources)) throw new Error("Malformed ownership journal entry");
@@ -55,7 +57,7 @@ export function parseOwnershipJournalData(value: unknown): OwnershipJournalData 
   if (typeof value.parent.sessionId !== "string" || value.parent.sessionId.length === 0 || typeof value.parent.branchEntryId !== "string" || value.parent.branchEntryId.length === 0) throw new Error("Malformed ownership journal parent identity");
   optionalString(value.parent.sessionPath, "parent.sessionPath");
   if (typeof value.intended.workspaceId !== "string" || typeof value.intended.group !== "string" || typeof value.intended.worktreeRequested !== "boolean") throw new Error("Malformed ownership journal intent");
-  if (!["intent", "worktree_created", "created", "started", "failed"].includes(value.phase as string)) throw new Error("Malformed ownership journal phase");
+  if (!["intent", "worktree_created", "created", "started", "stopped", "cleanup_adopted", "failed"].includes(value.phase as string)) throw new Error("Malformed ownership journal phase");
   validateResources(value.resources); const journal = value as unknown as OwnershipJournalData; validatePhaseResources(journal); return journal;
 }
 function mergeResources(previous: JournalResources, patch: JournalResources): JournalResources {

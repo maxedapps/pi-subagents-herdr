@@ -31,6 +31,8 @@ export interface DeliveryItem {
   readonly profileName: string;
   readonly terminalId?: string;
   readonly nativeSession?: { readonly kind: "id" | "path"; readonly value: string; readonly source: string };
+  /** Optional same-revision action block carried by this result delivery. */
+  readonly actionText?: string;
 }
 
 export interface DeliveryRuntimeHooks {
@@ -99,6 +101,7 @@ export function buildDeliveredText(input: {
   readonly envelope: ResultEnvelopeV1;
   readonly profileName: string;
   readonly deliveryId: string;
+  readonly actionText?: string;
   readonly maxBytes?: number;
 }): string {
   const { envelope, profileName } = input;
@@ -118,7 +121,8 @@ export function buildDeliveredText(input: {
     `source=${envelope.source} stage=${envelope.delivery.stage}`,
     "",
   ].join("\n");
-  return boundUtf8HeadTail(`${header}${envelope.rawText}`, input.maxBytes ?? MODEL_VISIBLE_BYTE_LIMIT).text;
+  const action = input.actionText ? `\n\n${input.actionText}` : "";
+  return boundUtf8HeadTail(`${header}${envelope.rawText}${action}`, input.maxBytes ?? MODEL_VISIBLE_BYTE_LIMIT).text;
 }
 
 export function computeDeliveryId(resultId: string, payloadHash: string): string {
@@ -255,6 +259,7 @@ export class ResultDeliveryService {
                     profileName: item.profileName,
                     deliveryId: current.delivery.deliveryId
                       ?? computeDeliveryId(current.resultId, createHash("sha256").update(current.rawText, "utf8").digest("hex")),
+                    ...(item.actionText === undefined ? {} : { actionText: item.actionText }),
                   }),
                 }
               : {}),
@@ -287,7 +292,7 @@ export class ResultDeliveryService {
         const advanced = await updateResultEnvelope(checkout, item.envelope.runId, item.envelope.generation, (current) => ({
           ...current,
           ...(current.deliveredText === undefined
-            ? { deliveredText: buildDeliveredText({ envelope: current, profileName: item.profileName, deliveryId }) }
+            ? { deliveredText: buildDeliveredText({ envelope: current, profileName: item.profileName, deliveryId, ...(item.actionText === undefined ? {} : { actionText: item.actionText }) }) }
             : {}),
           delivery: {
             ...current.delivery,
@@ -307,6 +312,7 @@ export class ResultDeliveryService {
           envelope: current,
           profileName: item.profileName,
           deliveryId: current.delivery.deliveryId ?? deliveryId,
+          ...(item.actionText === undefined ? {} : { actionText: item.actionText }),
         });
         return {
           ...current,

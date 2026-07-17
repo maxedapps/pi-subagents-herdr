@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile);
 test("real worktree conformance is no-model and dry-run safe until explicit operator confirmation", async () => {
   const result = await execFileAsync(process.execPath, strictTsxArgs("scripts/conformance-herdr-worktree-no-model.ts", "--source-cwd", process.cwd()), { cwd: process.cwd(), env: { ...process.env, HERDR_ENV: "", HERDR_SOCKET_PATH: "" }, timeout: 10_000 });
   const report = JSON.parse(result.stdout);
-  assert.deepEqual({ dry_run: report.dry_run, no_model: report.no_model, focus: report.would_create_focus, branchDeletion: report.branch_deletion }, { dry_run: true, no_model: true, focus: false, branchDeletion: false });
+  assert.deepEqual({ dry_run: report.dry_run, no_model: report.no_model, focus: report.would_create_focus, branchDeletion: report.branch_deletion }, { dry_run: true, no_model: true, focus: false, branchDeletion: true });
   const source = await readFile("scripts/conformance-herdr-worktree-no-model.ts", "utf8");
-  assert.doesNotMatch(source, /agent\.start|startAgent|claude|codex/); assert.match(source, /--confirm-create/); assert.match(source, /removeWorktree\([^,]+, false\)/);
+  assert.doesNotMatch(source, /agent\.start|startAgent|claude|codex/); assert.match(source, /--confirm-create/); assert.match(source, /WorktreeCleanupManager/); assert.match(source, /update-ref/); assert.match(source, /zero_residue/);
 });

@@ -64,8 +64,8 @@ test("partial cleanup retains uncertain/stale resources and never closes a repla
   assert.deepEqual(fake.closedPanes, []); assert.deepEqual(fake.closedTabs, []); assert.ok(report.retained.some((reason) => reason.includes("terminal identity was never recorded"))); assert.ok(report.retained.some((reason) => reason.includes("unknown")));
 });
 
-test("anchor tampering prevents dedicated tab cleanup", async () => {
+test("an active foreground process prevents dedicated tab cleanup", async () => {
   const fake = fakeClient(); const manager = new DelegationGroupManager(fake.client); const group = await manager.ensure("w1", "g"); const entries: PiBranchEntry[] = []; const started = intent(entries); const created = started.journal.append(started.state, "created", { tabId: group.tabId, rootPaneId: group.rootPaneId, rootTerminalId: group.rootTerminalId, rootProcessBaseline: group.rootProcessBaseline }); const state = started.journal.append(created, "failed", {});
-  (fake.client.getPaneProcessInfo as any) = async (paneId: string) => ({ pane_id: paneId, shell_pid: 999, foreground_processes: [] });
-  const report = await cleanupPartialStart({ client: fake.client, groupManager: manager, group, journal: state, groupCreatedThisAttempt: true }); assert.deepEqual(fake.closedTabs, []); assert.ok(report.retained.some((reason) => reason.includes("baseline")));
+  (fake.client.getPaneProcessInfo as any) = async (paneId: string) => ({ pane_id: paneId, shell_pid: 999, foreground_processes: [{ pid: 1001, name: "active-command" }] });
+  const report = await cleanupPartialStart({ client: fake.client, groupManager: manager, group, journal: state, groupCreatedThisAttempt: true }); assert.deepEqual(fake.closedTabs, []); assert.ok(report.retained.some((reason) => reason.includes("idle shell")));
 });

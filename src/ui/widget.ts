@@ -30,7 +30,8 @@ export function renderDashboardRow(run: DashboardRun, width: number, theme: Them
   const status = theme.fg(semantic.color, semantic.label);
   const elapsed = theme.fg("dim", formatElapsed(run.elapsedMs));
   const label = theme.fg("text", runLabel(run));
-  const custom = run.customStatus ? ` ${theme.fg("warning", run.customStatus)}` : "";
+  const action = run.attention?.required ? ` ${theme.fg("warning", run.attention.kind.replaceAll("_", " "))}` : "";
+  const custom = run.customStatus ? ` ${theme.fg("warning", run.customStatus)}` : action;
   let content: string;
   if (width < 36) content = `${icon} ${label} ${status}`;
   else if (width < 64) content = `${icon} ${label} ${status}${custom} ${elapsed}`;
@@ -53,7 +54,7 @@ export class SubagentsWidget implements Component {
   render(width: number): string[] {
     const state = this.getState();
     if (width <= 0 || state.runs.length === 0) return [];
-    const fingerprint = JSON.stringify(state.runs.map((run) => [run.id, run.lifecycle, run.herdrStatus, run.customStatus, run.elapsedMs]));
+    const fingerprint = JSON.stringify(state.runs.map((run) => [run.id, run.lifecycle, run.herdrStatus, run.customStatus, run.attention?.noticeId, run.elapsedMs]));
     if (this.#cachedLines && this.#cachedWidth === width && this.#cachedFingerprint === fingerprint) return this.#cachedLines;
     const title = width < 28 ? `Subagents ${state.summary.total}` : `Subagents · ${statusSummaryLabel(state.summary)}`;
     const lines = [truncateToWidth(this.theme.fg("accent", this.theme.bold(title)), width, "")];

@@ -52,7 +52,7 @@ export interface RecoveredWorktreeRecord { readonly state: "certain" | "uncertai
 function assertNonEmpty(value: unknown, label: string): asserts value is string {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) throw new Error(`${label} must be a non-empty string`);
 }
-function decodeWorktreeRecord(value: unknown): WorktreeRecord {
+export function decodeWorktreeRecord(value: unknown): WorktreeRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Worktree record must be an object");
   const record = value as Record<string, unknown>;
   if (record.schemaVersion !== 1) throw new Error("Unsupported worktree record schema");
@@ -76,8 +76,8 @@ function assertRecordUpdate(current: WorktreeRecord, next: WorktreeRecord): void
   if (next.id !== current.id || next.repositoryId !== current.repositoryId || next.commonGitDir !== current.commonGitDir
     || next.herdrRepositoryKey !== current.herdrRepositoryKey || next.sourceWorkspaceId !== current.sourceWorkspaceId
     || next.sourceCheckoutPath !== current.sourceCheckoutPath || next.workspaceId !== current.workspaceId
-    || next.checkoutPath !== current.checkoutPath || next.branch !== current.branch || next.base !== current.base
-    || JSON.stringify(next.owner) !== JSON.stringify(current.owner) || JSON.stringify(next.artifactPaths) !== JSON.stringify(current.artifactPaths)
+    || next.checkoutPath !== current.checkoutPath || next.branch !== current.branch || next.generatedBranch !== current.generatedBranch || next.base !== current.base
+    || JSON.stringify(next.owner) !== JSON.stringify(current.owner) || JSON.stringify(next.legacyOwner) !== JSON.stringify(current.legacyOwner) || JSON.stringify(next.artifactPaths) !== JSON.stringify(current.artifactPaths)
     || next.createdRoot.tabId !== current.createdRoot.tabId || next.createdRoot.rootPaneId !== current.createdRoot.rootPaneId
     || next.createdRoot.rootTerminalId !== current.createdRoot.rootTerminalId) {
     throw new Error("Immutable worktree provenance, artifact paths, or ownership changed");
@@ -178,23 +178,23 @@ export class WorktreeRegistry {
   }
   markDirty(id: string, reason = "Git reports checkout changes"): WorktreeRecord { return this.#transition(id, "dirty", reason); }
   markIntegrationPending(id: string, reason = "Parent integration remains pending"): WorktreeRecord { return this.#transition(id, "integration_pending", reason); }
-  beginRemoval(id: string, force: boolean): WorktreeRecord {
+  beginRemoval(id: string, force: boolean, childHead: string): WorktreeRecord {
     return this.update(id, (record) => {
       if (record.removalAttempt) throw new Error("A durable worktree removal attempt is already unresolved");
       if (!record.artifactsCaptured) throw new Error("A worktree removal attempt requires durable captured-artifact evidence");
       if (force && !record.humanDiscard) throw new Error("Force removal requires a durable human discard decision");
-      if (!force && (record.parentVerification.review !== "reviewed" || (record.parentVerification.integration !== "verified" && record.parentVerification.integration !== "not_required"))) throw new Error("Non-force removal requires durable review/integration evidence");
-      return { ...record, removalAttempt: { force, startedAt: Date.now() }, updatedAt: Date.now() };
+      if (!force && record.parentVerification.integration !== "verified" && record.parentVerification.integration !== "not_required") throw new Error("Non-force removal requires durable objective integration evidence");
+      return { ...record, removalAttempt: { force, startedAt: Date.now(), childHead }, updatedAt: Date.now() };
     });
   }
   markRemoved(id: string): WorktreeRecord {
     const record = this.get(id); if (!record) throw new Error(`Unknown worktree record ${id}`);
-    const safelyVerified = record.parentVerification.review === "reviewed" && (record.parentVerification.integration === "verified" || record.parentVerification.integration === "not_required");
+    const safelyVerified = record.parentVerification.integration === "verified" || record.parentVerification.integration === "not_required";
     if (!safelyVerified && record.humanDiscard === undefined) throw new Error("Worktree cannot enter removed without objective safe-cleanup evidence or a recorded human discard decision");
     if (!record.removalAttempt) throw new Error("Worktree removal requires a durable write-ahead removal attempt");
     return this.update(id, (current) => {
       const { removalAttempt: _attempt, ...rest } = current;
-      return { ...rest, state: "removed", updatedAt: Date.now() };
+      return { ...rest, state: "removed", finalization: { ...current.finalization, workspaceRemovedAt: Date.now(), removedPath: current.checkoutPath, childHead: current.removalAttempt!.childHead }, updatedAt: Date.now() };
     });
   }
   bindWriter(id: string, writer: NonNullable<WorktreeRecord["writer"]>): WorktreeRecord {
@@ -217,7 +217,6 @@ export class WorktreeRegistry {
   }
   setIntegrationEvidence(id: string, evidence: ObjectiveIntegrationEvidence): WorktreeRecord {
     return this.update(id, (record) => {
-      if (record.parentVerification.review !== "reviewed") throw new Error("Parent review must be recorded before integration verification");
       return {
         ...record,
         state: "integrated",
@@ -225,6 +224,21 @@ export class WorktreeRegistry {
         updatedAt: Date.now(),
       };
     });
+  }
+  markBranchFinalized(id: string, disposition: "deleted" | "preserved"): WorktreeRecord {
+    return this.update(id, (record) => {
+      const { removalRefusal: _refusal, ...rest } = record;
+      return { ...rest, finalization: { ...record.finalization, branchFinalizedAt: Date.now(), branchDisposition: disposition }, updatedAt: Date.now() };
+    });
+  }
+  markRuntimeArtifactsPurged(id: string): WorktreeRecord {
+    return this.update(id, (record) => {
+      const { removalRefusal: _refusal, ...rest } = record;
+      return { ...rest, finalization: { ...record.finalization, runtimeArtifactsPurgedAt: Date.now() }, updatedAt: Date.now() };
+    });
+  }
+  recordFinalizationError(id: string, reason: string): WorktreeRecord {
+    return this.update(id, (record) => ({ ...record, finalization: { ...record.finalization, lastError: reason }, removalRefusal: reason, updatedAt: Date.now() }));
   }
   setCapturedArtifacts(id: string, references: WorktreeRecord["capturedArtifacts"]): WorktreeRecord {
     return this.update(id, (record) => ({ ...record, artifactsCaptured: true, capturedArtifacts: references, updatedAt: Date.now() }));
@@ -297,8 +311,6 @@ export class WorktreeManager {
     if (isWithin(sourceIdentity.checkoutPath, path) || isWithin(path, sourceIdentity.checkoutPath)) throw new Error("Writer worktree path must be distinct and non-overlapping with the source checkout");
     try { await access(path); throw new Error(`Writer worktree path already exists: ${path}`); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const requiredKinds = ["handoff"] as const;
-    for (const kind of requiredKinds) if (!input.artifacts.some((artifact) => artifact.kind === kind && artifact.required)) throw new Error(`Writer worktree requires a required:true ${kind} artifact path before creation`);
     const artifactPaths: ArtifactReference[] = input.artifacts.map((artifact) => {
       if (!isAbsolute(artifact.sourcePath)) throw new Error(`Worktree ${artifact.kind} artifact path must be absolute`);
       const suppliedPath = resolve(artifact.sourcePath);
@@ -327,6 +339,7 @@ export class WorktreeManager {
       workspaceId: created.workspace.workspace_id,
       checkoutPath: resolve(created.worktree.path),
       branch,
+      generatedBranch: input.branch === undefined,
       base,
       state: "created",
       createdRoot: { tabId: created.tab.tab_id, rootPaneId: created.rootPane.pane_id, rootTerminalId: created.rootPane.terminal_id },

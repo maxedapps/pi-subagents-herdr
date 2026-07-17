@@ -51,7 +51,7 @@ On a blocker, distinguish missing input, ordinary clarification, trust/approval,
 - The parent and other children must not edit, format, install into, stash, restore, clean, or otherwise mutate that checkout.
 - Prohibit broad formatters, codemods, generators, installs, and unrelated changes unless the assignment requires them.
 - The child must not merge, remove its lane, delete branches, or declare integration.
-- Parent verification must inspect the handoff, complete diff and Git state, checks/skips, risks, and scope; rerun relevant validation before integration.
+- Parent verification must inspect the delivered result, complete diff and Git state, checks/skips, risks, and scope; rerun relevant validation before integration.
 
 Do not grant write access merely to produce a handoff; parent-captured terminal output is sufficient for read-only work.
 
@@ -59,13 +59,13 @@ Do not grant write access merely to produce a handoff; parent-captured terminal 
 
 Graceful stop may return `stopped: false`; retain and inspect rather than claiming completion. Force stop only closes a freshly identity-verified child and never authorizes worktree or artifact discard. Extension reload/shutdown does not stop children; recovery grants control only when current session, active branch, metadata, terminal/native identity, and fresh topology agree.
 
-Writer cleanup defaults to `retain`. Before requesting `cleanup: "remove_if_safe"`:
+Writer cleanup defaults to automatic `remove_if_safe`; omitting `cleanup` is equivalent to `cleanup: "remove_if_safe"`, while explicit `retain` is exceptional. Before accepting successful finalization:
 
-1. Prove the child is stopped and current ownership still agrees.
-2. Capture the required non-empty parent handoff/wrapper outside the disposable checkout; capture optional progress when present, but never require it.
-3. Inspect the complete diff and Git status and rerun relevant checks.
-4. Provide `parentReview` describing what the parent verified.
-5. Provide objective integration evidence: `no_changes`, or `commit_contained`/`tree_matches` with the required parent checkout details.
-6. Prove the exact checkout is clean and no live/unknown pane or identity/provenance mismatch remains.
+1. Prove the child is stopped and current ownership—or exact cleanup-only adoption—agrees.
+2. Confirm the structured result or failure/action notice is parent-persisted.
+3. Inspect the complete diff/Git status and rerun relevant checks; integrate manually.
+4. Let the extension derive `no_changes`, direct containment, or exact current tree equivalence; provide existing `commit_contained`/`tree_matches` evidence only for another integrated parent ref.
+5. Preserve any present explicit custom artifact through verified parent capture.
+6. Require clean Git state, exact worktree provenance, no agent/unknown pane, and known idle anchors.
 
-Retain on stale, missing, uncertain, live, dirty, unintegrated, or identity-mismatched evidence. Safe worktree removal never deletes its branch. Never delete durable run metadata, handoffs, captures, uncertain/live/orphan evidence, or unrelated resources. Dirty discard is a separate explicit human-only path unavailable through these five tools.
+`parentReview` is optional audit text. On success, non-force Herdr removal closes the writer workspace, compare-deletes only the exact generated branch at expected HEAD, and purges transient runtime files. Retain on stale, missing, uncertain, active, dirty, unintegrated, moved-ref, artifact-copy, or identity mismatch. Never delete unrelated/custom/moved evidence. Dirty discard remains explicit human-only behavior unavailable through these tools.

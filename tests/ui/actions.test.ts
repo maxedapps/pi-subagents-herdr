@@ -37,16 +37,17 @@ function fixture(options: {
   return { actions: new OverlayActions(runtime, ctx), stops, confirmations, notifications };
 }
 
-test("graceful stop runs only after plain retain-artifacts confirmation", async () => {
+test("graceful UI stop requests automatic safe cleanup only after confirmation", async () => {
   const declined = fixture({ confirms: [false] });
   await declined.actions.stopAfterOverlayClosed("run-1");
   assert.deepEqual(declined.stops, []);
 
   const accepted = fixture({ confirms: [true] });
   await accepted.actions.stopAfterOverlayClosed("run-1");
-  assert.deepEqual(accepted.stops, [{ id: "run-1", mode: "graceful", cleanup: "retain" }]);
+  assert.deepEqual(accepted.stops, [{ id: "run-1", mode: "graceful" }]);
   assert.match(accepted.confirmations[0]?.message ?? "", /child process\/session will end/i);
-  assert.match(accepted.confirmations[0]?.message ?? "", /artifacts and any writer worktree remain/i);
+  assert.match(accepted.confirmations[0]?.message ?? "", /removed automatically only when clean/i);
+  assert.match(accepted.confirmations[0]?.message ?? "", /action-required notice/i);
 });
 
 test("not-stopped is a warning with the runtime reason, never Stop completed", async () => {

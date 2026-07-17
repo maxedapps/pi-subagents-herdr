@@ -50,34 +50,43 @@ function childWriterProfile(): AgentProfile {
   return { name: "worker", description: "writer", body: "bounded", permissions: "write", artifacts: { writer: "child" }, source: { path: "/worker.md", scope: "bundled", namespace: "shared", priority: 0 } };
 }
 
-function fakeHerdr(record: WorktreeRecord, options: { unavailable?: boolean; mismatch?: boolean; writerPane?: PaneInfo; changedAnchor?: string } = {}) {
+function fakeHerdr(record: WorktreeRecord, options: { unavailable?: boolean; mismatch?: boolean; writerPane?: PaneInfo; changedAnchor?: string; moveBranchOnRemove?: boolean; gone?: boolean } = {}) {
   const anchors = [
     { ...pane, pane_id: record.createdRoot.rootPaneId, terminal_id: record.createdRoot.rootTerminalId, workspace_id: record.workspaceId, tab_id: record.createdRoot.tabId, focused: false },
     ...(record.tab ? [{ ...pane, pane_id: record.tab.rootPaneId, terminal_id: record.tab.rootTerminalId, workspace_id: record.workspaceId, tab_id: record.tab.tabId, focused: false }] : []),
     ...(options.writerPane ? [options.writerPane] : []),
   ];
   const childWorkspace: WorkspaceInfo = { ...workspace, workspace_id: record.workspaceId, active_tab_id: record.createdRoot.tabId, focused: false, pane_count: anchors.length, tab_count: record.tab ? 2 : 1, worktree: { repo_key: "repo-key", repo_name: "repo", repo_root: record.sourceCheckoutPath, checkout_path: record.checkoutPath, is_linked_worktree: true } };
-  const value: SessionSnapshot = { ...snapshot, workspaces: [...snapshot.workspaces, childWorkspace], panes: [...snapshot.panes, ...anchors], agents: snapshot.agents };
+  const value: SessionSnapshot = options.gone ? snapshot : { ...snapshot, workspaces: [...snapshot.workspaces, childWorkspace], panes: [...snapshot.panes, ...anchors], agents: snapshot.agents };
   let removeCalls = 0; let forceValue: boolean | undefined;
   const client = {
     async ping() { if (options.unavailable) throw new Error("Herdr unavailable"); return { version: "0.7.3", protocol: 16 }; },
     async snapshot() { return value; },
-    async getPaneProcessInfo(paneId: string) { return options.changedAnchor === paneId ? { ...anchorProcess, pane_id: paneId, foreground_process_group_id: 99 } : { ...anchorProcess, pane_id: paneId }; },
+    async getPaneProcessInfo(paneId: string) { return options.changedAnchor === paneId ? { ...anchorProcess, pane_id: paneId, foreground_process_group_id: 99, foreground_processes: [{ pid: 99, name: "active-command" }] } : { ...anchorProcess, pane_id: paneId }; },
     async getWorkspace() { return childWorkspace; },
-    async listWorktrees() { return { source: { repo_key: "repo-key", repo_name: "repo", repo_root: record.sourceCheckoutPath, source_checkout_path: record.sourceCheckoutPath, source_workspace_id: "w1" }, worktrees: [{ path: options.mismatch ? `${record.checkoutPath}-other` : record.checkoutPath, branch: record.branch, is_bare: false, is_detached: false, is_prunable: false, is_linked_worktree: true, label: "writer", open_workspace_id: record.workspaceId }] }; },
-    async removeWorktree(workspaceId: string, force: boolean) { removeCalls += 1; forceValue = force; execFileSync("git", ["-C", record.sourceCheckoutPath, "worktree", "remove", ...(force ? ["--force"] : []), record.checkoutPath]); return { workspaceId, path: record.checkoutPath, forced: force }; },
+    async listWorktrees() { return { source: { repo_key: "repo-key", repo_name: "repo", repo_root: record.sourceCheckoutPath, source_checkout_path: record.sourceCheckoutPath, source_workspace_id: "w1" }, worktrees: options.gone ? [] : [{ path: options.mismatch ? `${record.checkoutPath}-other` : record.checkoutPath, branch: record.branch, is_bare: false, is_detached: false, is_prunable: false, is_linked_worktree: true, label: "writer", open_workspace_id: record.workspaceId }] }; },
+    async removeWorktree(workspaceId: string, force: boolean) { removeCalls += 1; forceValue = force; execFileSync("git", ["-C", record.sourceCheckoutPath, "worktree", "remove", ...(force ? ["--force"] : []), record.checkoutPath]); if (options.moveBranchOnRemove) { const moved = execFileSync("git", ["-C", record.sourceCheckoutPath, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moved ref"], { encoding: "utf8" }).trim(); execFileSync("git", ["-C", record.sourceCheckoutPath, "update-ref", `refs/heads/${record.branch}`, moved]); } return { workspaceId, path: record.checkoutPath, forced: force }; },
   } as unknown as HerdrRequestClient;
   return { client, get removeCalls() { return removeCalls; }, get forceValue() { return forceValue; } };
 }
 
-test("retain is the writer default and explicit lifecycle/parent-verification state is exposed", async () => {
+test("explicit retain preserves the writer while review remains optional audit state", async () => {
   const value = await fixture();
   try {
     const registry = newRegistry(); registry.register(value.record); const fake = fakeHerdr(value.record); const cleanup = new WorktreeCleanupManager(fake.client, registry);
-    const retained = await cleanup.cleanup({ id: "run-1", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots });
+    const retained = await cleanup.cleanup({ id: "run-1", cleanup: "retain", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots });
     assert.equal(retained.state, "retained"); assert.equal(fake.removeCalls, 0); assert.equal(registry.getState("run-1")?.parentVerification.integration, "pending");
     registry.setParentReviewed("run-1", "parent inspected diff/tests"); assert.equal(registry.getState("run-1")?.parentVerification.review, "reviewed"); assert.equal(registry.getState("run-1")?.state, "retained", "review alone never declares integration");
     assert.throws(() => registry.markRemoved("run-1"), /objective safe-cleanup evidence/);
+  } finally { await value.dispose(); }
+});
+
+test("cleanup retains until parent result or failure evidence is persisted", async () => {
+  const value = await fixture();
+  try {
+    const registry = newRegistry(); registry.register(value.record); const fake = fakeHerdr(value.record);
+    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: false });
+    assert.equal(result.retained, true); assert.match(result.reason, /not yet persisted/); assert.equal(fake.removeCalls, 0);
   } finally { await value.dispose(); }
 });
 
@@ -88,6 +97,66 @@ test("remove_if_safe captures artifacts, verifies no-change objective evidence, 
     const result = await cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
     assert.equal(result.removed, true); assert.equal(result.record.artifactsCaptured, true); assert.equal(result.record.capturedArtifacts.length, 2); assert.equal(fake.forceValue, false);
     assert.equal(execFileSync("git", ["-C", value.parent, "branch", "--list", "writer-branch"], { encoding: "utf8" }).trim().endsWith("writer-branch"), true, "worktree removal must never delete its branch");
+  } finally { await value.dispose(); }
+});
+
+test("safe removal compare-deletes only an exact extension-generated branch", async () => {
+  const value = await fixture();
+  try {
+    const branch = "herdr-subagents/run-1-aaaaaaaaaaaa";
+    execFileSync("git", ["-C", value.child, "branch", "-m", branch]);
+    const record: WorktreeRecord = { ...value.record, branch, generatedBranch: true };
+    const registry = newRegistry(); registry.register(record); const fake = fakeHerdr(record);
+    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+    assert.equal(result.removed, true); assert.equal(result.retained, false);
+    assert.equal(result.record.finalization?.branchDisposition, "deleted");
+    assert.equal(execFileSync("git", ["-C", value.parent, "branch", "--list", branch], { encoding: "utf8" }).trim(), "");
+  } finally { await value.dispose(); }
+});
+
+test("a generated branch moved after workspace removal is retained and retry remains actionable", async () => {
+  const value = await fixture();
+  try {
+    const branch = "herdr-subagents/run-1-bbbbbbbbbbbb";
+    execFileSync("git", ["-C", value.child, "branch", "-m", branch]);
+    const record: WorktreeRecord = { ...value.record, branch, generatedBranch: true };
+    const registry = newRegistry(); registry.register(record); const fake = fakeHerdr(record, { moveBranchOnRemove: true });
+    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+    assert.equal(result.removed, true); assert.equal(result.retained, true); assert.equal(result.record.state, "removed");
+    assert.match(result.reason, /Generated branch moved/);
+    assert.notEqual(execFileSync("git", ["-C", value.parent, "branch", "--list", branch], { encoding: "utf8" }).trim(), "");
+  } finally { await value.dispose(); }
+});
+
+test("cleanup resumes after a crash once a write-ahead Herdr removal is proven complete", async () => {
+  const value = await fixture();
+  try {
+    const branch = "herdr-subagents/run-1-cccccccccccc";
+    execFileSync("git", ["-C", value.child, "branch", "-m", branch]);
+    const record: WorktreeRecord = { ...value.record, branch, generatedBranch: true };
+    const registry = newRegistry(); registry.register(record);
+    const capture = await captureWriterArtifacts(value.capture); registry.setCapturedArtifacts(record.id, capture.references);
+    const cleanup = new WorktreeCleanupManager(fakeHerdr(record, { gone: true }).client, registry);
+    const integrated = await cleanup.verifyAndRecordIntegration(record.id, { kind: "no_changes" });
+    const childHead = execFileSync("git", ["-C", value.child, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    registry.beginRemoval(record.id, false, childHead);
+    execFileSync("git", ["-C", value.parent, "worktree", "remove", value.child]);
+    const result = await cleanup.cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots });
+    assert.equal(integrated.parentVerification.integration, "not_required");
+    assert.equal(result.removed, true); assert.equal(result.retained, false);
+    assert.equal(result.record.finalization?.branchDisposition, "deleted");
+  } finally { await value.dispose(); }
+});
+
+test("crash recovery preserves the generated branch when current parent integration no longer proves the removed child", async () => {
+  const value = await fixture();
+  try {
+    const branch = "herdr-subagents/run-1-eeeeeeeeeeee"; execFileSync("git", ["-C", value.child, "branch", "-m", branch]); await writeFile(join(value.child, "tracked.txt"), "child\n"); execFileSync("git", ["-C", value.child, "add", "tracked.txt"]); execFileSync("git", ["-C", value.child, "commit", "-qm", "child"]);
+    const record: WorktreeRecord = { ...value.record, branch, generatedBranch: true }; const registry = newRegistry(); registry.register(record); const capture = await captureWriterArtifacts(value.capture); registry.setCapturedArtifacts(record.id, capture.references);
+    execFileSync("git", ["-C", value.parent, "merge", "--no-edit", "--no-ff", branch], { stdio: "ignore" }); await new WorktreeCleanupManager(fakeHerdr(record).client, registry).verifyAndRecordIntegration(record.id, { kind: "commit_contained", parentCheckoutPath: value.parent });
+    const childHead = execFileSync("git", ["-C", value.child, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(); registry.beginRemoval(record.id, false, childHead); execFileSync("git", ["-C", value.parent, "worktree", "remove", value.child]); execFileSync("git", ["-C", value.parent, "reset", "--hard", record.base], { stdio: "ignore" });
+    await assert.rejects(new WorktreeCleanupManager(fakeHerdr(record, { gone: true }).client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots }), /no longer contains/);
+    assert.notEqual(execFileSync("git", ["-C", value.parent, "branch", "--list", branch], { encoding: "utf8" }).trim(), "");
   } finally { await value.dispose(); }
 });
 
@@ -172,14 +241,14 @@ test("dirty/unintegrated, unavailable Herdr, mismatched provenance, and active w
   });
 });
 
-test("artifact capture is record/run/checkout bound, requires handoff, and treats progress as optional", async (t) => {
-  await t.test("optional references cannot satisfy required kinds", async () => {
+test("artifact capture is record/run/checkout bound and explicit supplemental files are optional", async (t) => {
+  await t.test("optional explicit references are captured without becoming cleanup prerequisites", async () => {
     const value = await fixture(); try {
       const optionalRecord = { ...value.record, artifactPaths: value.record.artifactPaths.map((artifact) => ({ ...artifact, required: false })) };
       const optionalCapture = { ...value.capture, artifacts: value.capture.artifacts.map((artifact) => ({ ...artifact, required: false })) };
       const registry = newRegistry(); registry.register(optionalRecord); registry.setParentReviewed(optionalRecord.id); const fake = fakeHerdr(optionalRecord);
       const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: optionalRecord.id, cleanup: "remove_if_safe", ownership: authorization(optionalRecord), artifactCapture: optionalCapture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
-      assert.equal(result.retained, true); assert.match(result.reason, /required non-empty/i); assert.equal(fake.removeCalls, 0);
+      assert.equal(result.removed, true); assert.equal(result.record.capturedArtifacts.length, 2); assert.equal(fake.removeCalls, 1);
     } finally { await value.dispose(); }
   });
   await t.test("empty required files fail closed", async () => {
@@ -204,14 +273,34 @@ test("artifact capture is record/run/checkout bound, requires handoff, and treat
   });
 });
 
-test("initial and group anchor process baselines are rechecked and changed foreground state is retained", async (t) => {
+test("initial and group anchors retain when a current non-shell foreground process is active", async (t) => {
   for (const target of ["initial", "group"] as const) await t.test(target, async () => {
     const value = await fixture();
     try {
       const changedAnchor = target === "initial" ? value.record.createdRoot.rootPaneId : value.record.tab!.rootPaneId;
       const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed(value.record.id); const fake = fakeHerdr(value.record, { changedAnchor });
       const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
-      assert.equal(result.retained, true); assert.match(result.reason, /process baseline changed/); assert.equal(fake.removeCalls, 0);
+      assert.equal(result.retained, true); assert.match(result.reason, /not a known idle shell/); assert.equal(fake.removeCalls, 0);
+    } finally { await value.dispose(); }
+  });
+});
+
+test("cleanup automatically derives direct containment and exact current-tree integration", async (t) => {
+  for (const mode of ["contained", "tree"] as const) await t.test(mode, async () => {
+    const value = await fixture();
+    try {
+      await writeFile(join(value.child, "tracked.txt"), `${mode}\n`); execFileSync("git", ["-C", value.child, "add", "tracked.txt"]); execFileSync("git", ["-C", value.child, "commit", "-qm", `${mode} child change`]);
+      if (mode === "contained") execFileSync("git", ["-C", value.parent, "merge", "--no-edit", "--no-ff", "writer-branch"], { stdio: "ignore" });
+      else {
+        const tree = execFileSync("git", ["-C", value.child, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+        const parentHead = execFileSync("git", ["-C", value.parent, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+        const equivalent = execFileSync("git", ["-C", value.parent, "commit-tree", tree, "-p", parentHead, "-m", "equivalent parent tree"], { encoding: "utf8" }).trim();
+        execFileSync("git", ["-C", value.parent, "reset", "--hard", equivalent], { stdio: "ignore" });
+      }
+      const registry = newRegistry(); registry.register(value.record); const fake = fakeHerdr(value.record);
+      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots });
+      assert.equal(result.removed, true); assert.equal(result.retained, false);
+      assert.equal(result.record.parentVerification.integrationEvidence?.kind, mode === "contained" ? "commit_contained" : "tree_matches");
     } finally { await value.dispose(); }
   });
 });

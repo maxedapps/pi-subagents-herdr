@@ -2,6 +2,7 @@ import type { Harness, ThinkingLevel } from "../contracts/harness.ts";
 import type { HerdrStatus, RunLifecycle } from "../contracts/state.ts";
 import type { BoundedOutput } from "../runtime/control.ts";
 import type { WorktreeStateView } from "../worktrees/contracts.ts";
+import type { PublicRunAttention } from "../results/action-notices.ts";
 
 export type ToolAvailability = "ready" | "blocked" | "unavailable";
 
@@ -29,6 +30,7 @@ export interface RunSummary {
   readonly tabId?: string;
   readonly workspaceId?: string;
   readonly worktree?: WorktreeStateView;
+  readonly attention?: PublicRunAttention;
 }
 
 export interface StartCompletionPending {

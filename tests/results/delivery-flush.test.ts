@@ -76,6 +76,7 @@ test("store-backed flush freezes deliveredText once and calls sendMessage with m
           envelope: loaded,
           profileName: "scout",
           terminalId: "term-1",
+          actionText: "HERDR_ACTION_REQUIRED_V1 {\"noticeId\":\"act-1\"}\nACTION REQUIRED — writer review required\nnext=review and stop",
         }];
       },
     });
@@ -87,6 +88,8 @@ test("store-backed flush freezes deliveredText once and calls sendMessage with m
     assert.match(messages[0]!.content, /structured final answer from child/);
     assert.match(messages[0]!.content, /HERDR_RESULT_V1/);
     assert.match(messages[0]!.content, /deliveryId/);
+    assert.match(messages[0]!.content, /HERDR_ACTION_REQUIRED_V1/);
+    assert.match(messages[0]!.content, /review and stop/);
 
     const onDisk = await readResultEnvelope(root, "run-1", 1);
     assert.ok(onDisk);

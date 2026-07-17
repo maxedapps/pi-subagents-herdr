@@ -7,7 +7,7 @@ import type { CaptureWorktreeArtifactsOptions } from "../artifacts/handoff.ts";
 import type { ArtifactRoots } from "../artifacts/paths.ts";
 import { HERDR_PROTOCOL_VERSION, MINIMUM_HERDR_VERSION } from "../contracts/protocol.ts";
 import type { HerdrRequestClient } from "../herdr/client.ts";
-import { processBaseline } from "../runtime/groups.ts";
+import { verifyIdleShell } from "../runtime/groups.ts";
 import type {
   HumanDiscardDecision,
   ObjectiveIntegrationEvidence,
@@ -111,11 +111,15 @@ async function verifyNoLiveOrUnknownChildren(client: HerdrRequestClient, record:
   const unknownPanes = snapshot.panes.filter((candidate) => candidate.workspace_id === record.workspaceId && !allowedAnchors.has(candidate.terminal_id));
   if (unknownPanes.length !== 0) throw new Error("Worktree workspace contains an unknown/non-anchor pane");
   for (const anchor of anchors) {
-    if (!anchor.rootProcessBaseline) throw new Error(`Anchor ${anchor.rootTerminalId} has no persisted process baseline`);
     const pane = snapshot.panes.find((candidate) => candidate.workspace_id === record.workspaceId && candidate.terminal_id === anchor.rootTerminalId);
     if (!pane || pane.tab_id !== anchor.tabId) throw new Error(`Anchor ${anchor.rootTerminalId} is absent or moved out of its recorded tab`);
-    const current = processBaseline(await client.getPaneProcessInfo(pane.pane_id, signal));
-    if (current !== anchor.rootProcessBaseline) throw new Error(`Anchor ${anchor.rootTerminalId} process baseline changed; unknown foreground state retained`);
+    let idle: ReturnType<typeof verifyIdleShell> = { idle: false, reason: "not yet probed" };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      idle = verifyIdleShell(await client.getPaneProcessInfo(pane.pane_id, signal));
+      if (idle.idle) break;
+      if (attempt < 2) await new Promise((resolveDelay) => setTimeout(resolveDelay, 75));
+    }
+    if (!idle.idle) throw new Error(`Anchor ${anchor.rootTerminalId} is not a known idle shell: ${idle.reason}`);
   }
 }
 
@@ -149,6 +153,26 @@ async function ensureArtifacts(input: {
   return recordedCapture;
 }
 
+async function verifySavedIntegrationWithoutCheckout(record: WorktreeRecord, evidence: ObjectiveIntegrationEvidence, childHead: string): Promise<void> {
+  if (evidence.kind !== "tree_matches" && evidence.childHead !== childHead) throw new Error("Saved integration evidence targets a different child HEAD");
+  if (evidence.kind === "no_changes") {
+    if (childHead !== record.base || evidence.baseCommit !== record.base) throw new Error("Saved no-change evidence no longer matches the base/child HEAD");
+    return;
+  }
+  const parentIdentity = await identifyCheckout(evidence.parentCheckoutPath);
+  if (parentIdentity.repositoryId !== record.repositoryId || parentIdentity.commonGitDir !== record.commonGitDir) throw new Error("Saved integration parent belongs to a different repository");
+  const parentHead = await git(parentIdentity.checkoutPath, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  if (evidence.kind === "commit_contained") {
+    if (!await gitExit(parentIdentity.checkoutPath, ["merge-base", "--is-ancestor", childHead, parentHead])) throw new Error("Current parent HEAD no longer contains the removed child HEAD");
+    return;
+  }
+  const [childTree, parentTree] = await Promise.all([
+    git(parentIdentity.checkoutPath, ["rev-parse", "--verify", `${childHead}^{tree}`]),
+    git(parentIdentity.checkoutPath, ["rev-parse", "--verify", `${parentHead}^{tree}`]),
+  ]);
+  if (childTree !== evidence.childTree || childTree !== parentTree) throw new Error("Current parent tree no longer matches the removed child tree");
+}
+
 function requestFromSavedEvidence(evidence: ObjectiveIntegrationEvidence): IntegrationVerificationRequest {
   switch (evidence.kind) {
     case "no_changes": return { kind: "no_changes" };
@@ -160,6 +184,37 @@ function requestFromSavedEvidence(evidence: ObjectiveIntegrationEvidence): Integ
 async function assertClean(record: WorktreeRecord): Promise<void> {
   const status = await git(record.checkoutPath, ["status", "--porcelain=v1", "--untracked-files=all"]);
   if (status.length !== 0) throw new Error(`Worktree checkout is dirty: ${status.split("\n").slice(0, 5).join(" | ")}`);
+}
+
+async function deriveIntegrationRequest(record: WorktreeRecord): Promise<IntegrationVerificationRequest | undefined> {
+  const childHead = await git(record.checkoutPath, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  if (childHead === record.base) return { kind: "no_changes" };
+  if (await gitExit(record.sourceCheckoutPath, ["merge-base", "--is-ancestor", childHead, "HEAD"])) {
+    return { kind: "commit_contained", parentCheckoutPath: record.sourceCheckoutPath };
+  }
+  const [childTree, parentTree] = await Promise.all([
+    git(record.checkoutPath, ["rev-parse", "--verify", `${childHead}^{tree}`]),
+    git(record.sourceCheckoutPath, ["rev-parse", "--verify", "HEAD^{tree}"]),
+  ]);
+  return childTree === parentTree ? { kind: "tree_matches", parentCheckoutPath: record.sourceCheckoutPath } : undefined;
+}
+
+function generatedBranchOwned(record: WorktreeRecord): boolean {
+  const exact = new RegExp(`^herdr-subagents/${record.id.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}-[a-f0-9]{12}$`);
+  return record.generatedBranch === true || (record.generatedBranch === undefined && exact.test(record.branch));
+}
+
+async function finalizeGeneratedBranch(registry: WorktreeRegistry, record: WorktreeRecord, childHead: string): Promise<WorktreeRecord> {
+  if (record.finalization?.branchFinalizedAt !== undefined) return record;
+  if (!generatedBranchOwned(record)) return registry.markBranchFinalized(record.id, "preserved");
+  const ref = `refs/heads/${record.branch}`;
+  let current: string;
+  try { current = await git(record.sourceCheckoutPath, ["rev-parse", "--verify", `${ref}^{commit}`]); }
+  catch { return registry.markBranchFinalized(record.id, "deleted"); }
+  if (current !== childHead) throw new Error(`Generated branch moved from expected child HEAD ${childHead} to ${current}; ref retained`);
+  await git(record.sourceCheckoutPath, ["update-ref", "-d", ref, childHead]);
+  if (await gitExit(record.sourceCheckoutPath, ["show-ref", "--verify", "--quiet", ref])) throw new Error(`Generated branch ${ref} still exists after compare-delete`);
+  return registry.markBranchFinalized(record.id, "deleted");
 }
 
 async function verifyHerdrRemovalIdentity(client: HerdrRequestClient, record: WorktreeRecord, signal?: AbortSignal): Promise<void> {
@@ -190,6 +245,8 @@ export interface SafeCleanupInput {
   readonly artifactCapture: CaptureWorktreeArtifactsOptions;
   readonly parentRoots: ArtifactRoots;
   readonly integrationEvidence?: IntegrationVerificationRequest;
+  /** A structured result or explicit failure notice is already durable in the parent branch. */
+  readonly resultEvidencePersisted?: boolean;
   /** Optional caller-owned active-branch proof, rerun at the destructive boundary. */
   readonly revalidateOwnership?: () => Promise<void>;
   readonly signal?: AbortSignal;
@@ -239,40 +296,82 @@ export class WorktreeCleanupManager {
   async cleanup(input: SafeCleanupInput): Promise<CleanupResult> {
     let record = this.registry.get(input.id); if (!record) throw new Error(`Unknown worktree ${input.id}`);
     assertOwnership(record, input.ownership);
-    if (record.recoveryIssue || record.removalAttempt) {
-      const reason = record.recoveryIssue ? `Worktree retained because durable recovery is uncertain: ${record.recoveryIssue}` : "Worktree retained because a prior durable removal attempt has an unresolved outcome";
-      return { removed: false, retained: true, state: record.state, reason, record };
+    if (record.recoveryIssue) {
+      const reason = `Worktree retained because durable recovery is uncertain: ${record.recoveryIssue}`;
+      return { removed: record.state === "removed", retained: true, state: record.state, reason, record };
     }
-    if ((input.cleanup ?? "retain") === "retain") {
-      record = this.registry.retain(record.id, "Writer worktree retention is the default; parent verification/integration may continue");
+    if (record.removalAttempt) {
+      const { workspaceId, checkoutPath } = record;
+      const [snapshot, listed] = await Promise.all([this.client.snapshot(input.signal), this.client.listWorktrees({ cwd: record.sourceCheckoutPath }, input.signal)]);
+      const workspaceLive = snapshot.workspaces.some((workspace) => workspace.workspace_id === workspaceId);
+      const checkoutLive = listed.worktrees.some((worktree) => resolve(worktree.path) === checkoutPath);
+      const terminalId = record.writer?.terminalId;
+      const native = record.writer?.nativeSession;
+      const childIdentityLive = snapshot.panes.some((pane) => terminalId !== undefined && pane.terminal_id === terminalId)
+        || snapshot.agents.some((agent) => (terminalId !== undefined && agent.terminal_id === terminalId)
+          || (native !== undefined && agent.agent_session?.kind === native.kind && agent.agent_session.value === native.value && agent.agent_session.source === native.source));
+      if (workspaceLive || checkoutLive || childIdentityLive) {
+        const reason = "Worktree retained because a prior removal attempt still has an owned resource or child identity";
+        return { removed: false, retained: true, state: record.state, reason, record };
+      }
+      const childHead = record.removalAttempt.childHead;
+      const savedEvidence = record.parentVerification.integrationEvidence;
+      if (!savedEvidence) throw new Error("Completed removal attempt lacks objective integration evidence");
+      await verifySavedIntegrationWithoutCheckout(record, savedEvidence, childHead);
+      const retainedArtifacts = await verifyRetainedArtifactCapture({ references: record.capturedArtifacts, parentRoots: input.parentRoots, disposableCheckoutPath: record.checkoutPath, requiredKinds: [] });
+      if (!retainedArtifacts.verified) throw new Error(retainedArtifacts.reason);
+      await input.revalidateOwnership?.();
+      record = this.registry.markRemoved(record.id);
+    }
+    if (record.state === "removed") {
+      try {
+        const childHead = record.finalization?.childHead;
+        if (!childHead) throw new Error("Removed worktree lacks the expected child HEAD needed for branch finalization");
+        record = await finalizeGeneratedBranch(this.registry, record, childHead);
+        return { removed: true, retained: false, state: record.state, reason: "Worktree workspace and generated branch are finalized", record };
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        record = this.registry.recordFinalizationError(record.id, reason);
+        return { removed: true, retained: true, state: record.state, reason, record };
+      }
+    }
+    if ((input.cleanup ?? "remove_if_safe") === "retain") {
+      record = this.registry.retain(record.id, "Writer worktree was explicitly retained; parent review/integration/finalization remains required");
       return { removed: false, retained: true, state: record.state, reason: record.retentionReason!, record };
     }
     try {
-      await verifyNoLiveOrUnknownChildren(this.client, record, input.signal);
+      if (input.resultEvidencePersisted === false) throw new Error("Parent result/failure evidence is not yet persisted; cleanup is retryable after delivery");
+      // Capture configured supplemental artifacts before volatile topology checks.
       record = await ensureArtifacts({ registry: this.registry, record, capture: input.artifactCapture, parentRoots: input.parentRoots });
-      if (record.parentVerification.review !== "reviewed") throw new Error("Parent review is not recorded");
       try { await assertClean(record); }
       catch (error) { record = this.registry.markDirty(record.id, error instanceof Error ? error.message : String(error)); throw error; }
       const savedEvidence = record.parentVerification.integrationEvidence;
-      const finalIntegrationRequest = savedEvidence ? requestFromSavedEvidence(savedEvidence) : input.integrationEvidence;
-      if (!finalIntegrationRequest) { record = this.registry.markIntegrationPending(record.id); throw new Error("Objective integration evidence is required"); }
+      const finalIntegrationRequest = savedEvidence ? requestFromSavedEvidence(savedEvidence) : input.integrationEvidence ?? await deriveIntegrationRequest(record);
+      if (!finalIntegrationRequest) { record = this.registry.markIntegrationPending(record.id); throw new Error("Objective integration evidence is required; integrate the writer then retry the same stop call"); }
       await verifyHerdrRemovalIdentity(this.client, record, input.signal);
-      // Recheck mutable Herdr, artifact, checkout, child commit, and parent commit/tree state at the destructive boundary.
       await verifyNoLiveOrUnknownChildren(this.client, record, input.signal);
-      const finalArtifacts = await verifyRetainedArtifactCapture({ references: record.capturedArtifacts, parentRoots: input.parentRoots, disposableCheckoutPath: record.checkoutPath });
+      const finalArtifacts = await verifyRetainedArtifactCapture({ references: record.capturedArtifacts, parentRoots: input.parentRoots, disposableCheckoutPath: record.checkoutPath, requiredKinds: [] });
       if (!finalArtifacts.verified) throw new Error(finalArtifacts.reason);
       await assertClean(record);
-      record = this.registry.setIntegrationEvidence(record.id, await verifyObjectiveIntegration(record, finalIntegrationRequest));
+      const childHead = await git(record.checkoutPath, ["rev-parse", "--verify", "HEAD^{commit}"]);
+      const integration = await verifyObjectiveIntegration(record, finalIntegrationRequest);
+      record = this.registry.setIntegrationEvidence(record.id, integration);
       await verifyNoLiveOrUnknownChildren(this.client, record, input.signal);
       await input.revalidateOwnership?.();
-      record = this.registry.beginRemoval(record.id, false);
+      record = this.registry.beginRemoval(record.id, false, childHead);
       const removed = await this.client.removeWorktree(record.workspaceId, false, input.signal);
       if (removed.workspaceId !== record.workspaceId || resolve(removed.path) !== record.checkoutPath || removed.forced) throw new Error("Herdr removal response did not match the non-force extension-owned identity");
       record = this.registry.markRemoved(record.id);
-      return { removed: true, retained: false, state: record.state, reason: "Identity-matched clean integrated worktree removed; branch was not deleted", record };
+      record = await finalizeGeneratedBranch(this.registry, record, childHead);
+      return { removed: true, retained: false, state: record.state, reason: `Identity-matched clean integrated worktree removed; generated branch ${record.finalization?.branchDisposition ?? "finalized"}`, record };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      record = this.registry.retain(record.id, `Worktree retained: ${reason}`, reason);
+      const current = this.registry.get(record.id) ?? record;
+      if (current.state === "removed") {
+        record = this.registry.recordFinalizationError(current.id, reason);
+        return { removed: true, retained: true, state: record.state, reason, record };
+      }
+      record = this.registry.retain(current.id, `Worktree retained: ${reason}`, reason);
       return { removed: false, retained: true, state: record.state, reason, record };
     }
   }
@@ -301,11 +400,13 @@ export class WorktreeCleanupManager {
       record = this.registry.setHumanDiscard(record.id, decision);
       await verifyNoLiveOrUnknownChildren(this.client, record, input.signal);
       await input.revalidateOwnership?.();
-      record = this.registry.beginRemoval(record.id, true);
+      const childHead = await git(record.checkoutPath, ["rev-parse", "--verify", "HEAD^{commit}"]);
+      record = this.registry.beginRemoval(record.id, true, childHead);
       const removed = await this.client.removeWorktree(record.workspaceId, true, input.signal);
       if (removed.workspaceId !== record.workspaceId || resolve(removed.path) !== record.checkoutPath || !removed.forced) throw new Error("Herdr force-removal response did not match the confirmed extension-owned identity");
       record = this.registry.markRemoved(record.id);
-      return { removed: true, retained: false, state: record.state, reason: "Human-confirmed discard removed the checkout; branch was not deleted", record };
+      record = this.registry.markBranchFinalized(record.id, "preserved");
+      return { removed: true, retained: false, state: record.state, reason: "Human-confirmed discard removed the checkout; branch was intentionally preserved", record };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       record = this.registry.retain(record.id, `Worktree retained after discard refusal/failure: ${reason}`, reason);

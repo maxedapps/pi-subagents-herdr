@@ -14,7 +14,7 @@ Every child is visible and interactive. Missing/incompatible backend identity fa
 
 Pi children receive no package-specific trust, skill, or prompt-template override flags. Each child independently uses normal Pi trust and resource discovery. Saved trust and global settings are available through the ordinary user environment, but transient parent `--approve` and session-only trust are not inherited by a separate child process.
 
-Control requires agreement between the current Pi session and active branch journal, immutable run nonce, durable `run.json`, stable terminal/native identity, and a fresh backend snapshot. Other-session, orphaned, uncertain, and global records are observational only. Send/interrupt delivery is `confirmed`, `unconfirmed` (Herdr acknowledged but expected evidence did not appear), or `uncertain` (the mutation may have succeeded but its response was lost). Inspect uncertain runs; never retry input or destroy a run automatically. Interrupt remains distinct from stop. Force stop can affect only a freshly revalidated owned pane and never authorizes dirty checkout discard.
+Process control requires agreement between the current Pi session and active branch journal, immutable run nonce, durable `run.json`, stable terminal/native identity, and a fresh backend snapshot. Other-session, orphaned, uncertain, and global live records are observational only. A later parent session may reauthorize **cleanup only** for a proven-stopped schema-v5 journal when exact parent/child Git, Herdr workspace/anchors, run nonce, branch/path, and idle/no-agent evidence all reconcile; it never adopts the process or prior private result. Send/interrupt delivery is `confirmed`, `unconfirmed`, or `uncertain`; never retry uncertain input automatically. Force stop never authorizes dirty checkout discard.
 
 ## Install
 
@@ -42,7 +42,7 @@ subagent_status({ id: "<run>", lines: 160 })
 subagent_status({ id: "<run>", states: ["done", "idle", "blocked"], timeoutMs: 900000, lines: 160 })
 subagent_send({ id: "<run>", message: "Focus on token refresh." })
 subagent_interrupt({ id: "<run>", timeoutMs: 15000 })
-subagent_stop({ id: "<run>", mode: "graceful", cleanup: "retain" })
+subagent_stop({ id: "<run>", mode: "graceful" })
 ```
 
 `subagent_status` has one strict flat Google-compatible schema and three execution modes:
@@ -53,13 +53,13 @@ subagent_stop({ id: "<run>", mode: "graceful", cleanup: "retain" })
 
 Execution rejects cross-mode combinations: `scope` with `id`; `states`, `timeoutMs`, or `lines` without `id`; and `timeoutMs` with `id` but no `states`. Wait preserves semantic `working`, `blocked`, `done`, `idle`, and `unknown` states, abort propagation, timeout errors, ownership defaults, and 50KB/2000-line output bounds. A successful wait returns detailed inspection/output, not only a matched state.
 
-Every successful start reports `completion.pending` with `delivery: "automatic"`. Starts and sends return immediately while children run asynchronously. For Pi children, the structured final assistant response is captured and injected into the owning parent branch as a durable `herdr-subagents.result.v1` custom message. Missing bridge evidence is capture-unavailable (no invented body). Exact-ID `subagent_status` remains for live inspection, blockers, and recovery—not as a mandatory gate for every result. Same-run sends are serialized to one unresolved model generation. Parent verification and explicit stop/cleanup remain mandatory.
+Every successful start reports `completion.pending` with `delivery: "automatic"`. Starts and sends return immediately. For Pi children, the structured final assistant response is captured and injected into the owning parent branch as `herdr-subagents.result.v1`. Writer results carry an extension-derived `ACTION REQUIRED` block with exact Git/worktree facts. Later blocked, failed, retained-cleanup, UI, or recovery transitions use deduplicated `herdr-subagents.action-required.v1` follow-ups and the same status/UI attention state. Missing bridge evidence is capture-unavailable—never an invented result. Parent verification and explicit stop/finalization remain mandatory.
 
 ## Bundled profiles and skill
 
-- `scout`: Pi, read-only reconnaissance, parent-materialized handoff, no progress file.
-- `researcher`: Pi, read-only sourced research when reviewed external tools are actually exposed, parent-materialized handoff, no progress file.
-- `worker`: Pi, mutation tools, isolated writer worktree, preserved child handoff, parent-owned final wrapper, plus optional configured progress.
+- `scout`: Pi, read-only reconnaissance with a self-contained delivered final response.
+- `researcher`: Pi, read-only sourced research when reviewed external tools are exposed, with a self-contained delivered final response.
+- `worker`: Pi, mutation tools, mandatory isolated writer worktree, and a self-contained delivered final response.
 
 Bundled profiles do not pin models and prohibit recursive delegation. Profiles require a self-contained final assistant response as the primary result transport. Profiles do not configure skills; Pi children discover them normally. The package contributes `use-herdr-subagents` dynamically in parent mode only. It teaches the extension's exact five-tool lifecycle, automatic result delivery, profile selection, least privilege, blocked/uncertain handling, writer isolation, parent verification, and cleanup. It also tells agents to pair other applicable subagent skills with it when available and possible, without requiring or naming one. Child mode contributes only a narrow result bridge (no orchestration tools or parent skill).
 
@@ -89,36 +89,25 @@ Merge order is defaults → user → trusted project; known nested objects merge
 
 Overrides narrow by default. Broadening requires trusted configuration plus interactive human confirmation before resources are created. Unknown tools, recursive orchestration, root escapes, and mutation without required isolation remain prohibited.
 
-## Artifacts
+## Artifacts and finalization
 
-Normal read-only run:
+Bundled profiles create only transient parent-checkout operational state while unresolved:
 
 ```text
 .subagents/runs/<id>/
 ├── run.json
-└── handoff.md
+└── results/             # when structured generations were captured
 ```
 
-Bundled worker run inside its disposable worktree:
+The parent-persisted structured result or explicit failure/action notice is the durable handoff. Bundled children do not write handoff/progress files. Custom profiles may explicitly configure run-unique handoff/progress artifacts; existing files in a disposable checkout are copied to parent-owned `captured/` storage and byte/SHA-256 verified before removal. Their absence is not a cleanup prerequisite; capture failure retains rather than losing a present custom artifact.
 
-```text
-.subagents/runs/<id>/
-├── handoff.md           # preserved child-authored file
-├── handoff.parent.md    # required parent-owned final wrapper
-└── progress.md          # optional supporting evidence
-```
-
-The wrapper always contains the full delegated assignment and a validated child handoff (missing/invalid child content fails closed). Its deterministic path is registered as required removal evidence before worktree creation; the child file is never overwritten. The parent checkout retains `.subagents/runs/<id>/run.json`; `captured/` is created only when copying worktree evidence before safe removal. Required wrapper/handoff is captured and hash/byte verified; configured progress is captured when present but is never required for removal.
-
-There are no persistent prompt artifacts or public prompt/system profile fields. While live, `run.json` retains the full delegated assignment and last bounded output so exact context survives reload; wait/done observation does not create handoffs. At proven stop the assignment moves into the single final handoff and is removed from `run.json`. Internal system prompt files live in a canonical, run-bound private OS-temp directory. Pi alone receives a private session directory; Claude/Codex do not get unused session directories. Recovery rejects redirected, symlinked, non-private, or structurally unexpected runtime paths as observational. Internal files remain while a run is live or uncertain and are removed only after handoff materialization and immediate layout revalidation. `run.json` then reports ephemeral files as removed; model-facing inspection exposes only retained/removed state, not private paths.
-
-Launch validation uses an always-removed private temporary directory; no `<id>-preflight` run directory is created. Durable run metadata/handoffs, uncertain/live/orphan evidence, and retained-worktree evidence are never garbage-collected automatically. There is no retention-age setting or cleanup command.
+While live, schema-v5 `run.json` retains assignment, bounded output, action state, ownership journal, and exact worktree snapshot for recovery. Private system/session/exchange files remain only while live or capture-uncertain. After the result/failure notice is parent-persisted and finalization succeeds, runtime metadata/results are purged; verified custom captures remain intentionally. There is no age-based or path-only garbage collector.
 
 Git protection appends anchored `/.subagents/` and explicitly requested `/.progress/` rules to Git-local `info/exclude`; tracked `.gitignore` is not edited. A pre-existing untracked `.progress/` requires explicit review before hiding it.
 
 ## TUI and operations
 
-`/subagents` lists only current-session owned runs. Visible controls are ↑/↓ selection, Enter focus, `x` graceful stop with retained artifacts/worktree, `r` refresh, and Escape close. Focus and stop run only after the overlay is disposed. Use model-facing `subagent_status` for detailed output and broader observational scopes; use explicit `subagent_send`, `subagent_interrupt`, and `subagent_stop` inputs for actions not exposed in the operator dashboard.
+`/subagents` lists current-session owned runs plus stopped runs with unresolved attention. Visible controls are ↑/↓ selection, Enter focus, `x` graceful stop with automatic safe finalization, `r` refresh, and Escape close. Focus and stop run only after the overlay is disposed. Use model-facing `subagent_status` for detailed output and broader observational scopes; use explicit `subagent_send`, `subagent_interrupt`, and `subagent_stop` inputs for actions not exposed in the operator dashboard.
 
 `/subagents-doctor` is read-only. It may mention Herdr because it diagnoses the actual backend: versions/protocol, parent identity, integrations, profiles/settings, Git/artifacts, recovery, topology, and retained worktrees. It never adopts, focuses, sends, stops, cleans, or rewrites settings.
 

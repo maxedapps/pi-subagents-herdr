@@ -2,98 +2,81 @@
 
 ## Boundaries
 
-The package is a Pi extension with a Herdr backend. Model-facing orchestration is backend-neutral; operator diagnostics may name Herdr.
+The package is a Pi extension with a Herdr backend. Model-facing orchestration is the five backend-neutral `subagent_*` tools; operator diagnostics may name Herdr.
 
 Invariants:
 
 1. Children start visibly in dedicated no-focus topology; no hidden/native fallback exists.
-2. Stable run nonce, terminal identity, and native session identity are immutable; pane/tab/workspace IDs are mutable projections.
-3. Every input, focus, interrupt, stop, and cleanup action resolves fresh topology and current active-branch ownership.
-4. Unavailable, stale, split, tampered, orphaned, or uncertain evidence retains resources.
-5. Reload/shutdown closes extension sockets, timers, and UI only—never children.
-6. Interrupt stops a turn; stop resolves the child lifecycle. Neither implies destructive worktree discard.
+2. Mutation-capable children always use an extension-owned isolated linked worktree; the child cannot choose or bypass this policy.
+3. Run nonce, terminal/native identity, repository identity, generated branch, and checkout path are immutable authority inputs.
+4. Every input, focus, interrupt, stop, and destructive cleanup step revalidates current authority and mutable topology.
+5. Dirty, live, unintegrated, moved-ref, tampered, orphaned, or uncertain evidence retains resources.
+6. Interrupt stops a turn; stop resolves the child lifecycle. Neither authorizes dirty discard.
 
-## Extension lifecycle
+## Extension and result lifecycle
 
-`extensions/herdr-subagents/index.ts` delegates to `src/lifecycle/extension.ts`. Factory registration performs no settings read, filesystem write, socket connection, timer, process start, or UI installation.
+Factory registration has no runtime side effects. `session_start` loads settings/profiles, verifies the owning parent, recovers active-branch state, reconciles stopped cleanup journals, and starts result/action/subscription services. `session_shutdown` closes extension services only; children survive.
 
-`session_start` loads namespaced settings/profiles, validates backend parent identity, recovers active-branch runs/worktrees, and starts subscriptions. `/tree` changes authority in place, so actions reread the active branch. `session_shutdown` is idempotent and non-destructive.
+Parent mode contributes `use-herdr-subagents` dynamically. `PI_HERDR_SUBAGENT=1` registers only the narrow Pi result bridge—no parent tools, commands, UI, or orchestration skill.
 
-Parent mode contributes `use-herdr-subagents` through Pi's dynamic `resources_discover` event. `PI_HERDR_SUBAGENT=1` returns child mode immediately: no parent tools, commands, dashboard, lifecycle runtime, or package-provided orchestration skill. Pi children register only a narrow result bridge (`message_end`/`agent_settled`) that writes private response files—never orchestration tools. Pi children receive no trust, skill, or prompt-template override flags and use ordinary independent Pi trust/resource discovery. Saved trust and global settings remain available normally; transient parent `--approve` and session-only trust do not transfer to a separate child process.
+Each generation follows `preparing → submitted → captured | closed | blocked`. Structured Pi final messages become envelopes under `.subagents/runs/<id>/results/` with delivery stages `captured → dispatched → parent_persisted`. They are injected one-at-a-time as `herdr-subagents.result.v1` follow-ups. Missing/malformed bridge evidence closes capture as unavailable; terminal text is never invented as a structured result.
 
-## Five-tool surface
-
-Only `subagent_start`, `subagent_status`, `subagent_send`, `subagent_interrupt`, and `subagent_stop` register.
-
-`subagent_status` uses one flat Google-compatible schema. Execution validates mode combinations:
-
-- no `id`: list with optional scope;
-- `id` without `states`: detailed inspect/output;
-- `id` with `states`: bounded abortable wait followed by detailed inspect/output.
-
-Internal list/get/wait runtime methods remain implementation details; status dispatch uses all three, while the TUI projects only current-session `list` results and performs no per-run output reads. They are not registered tools or aliases. Output is bounded to 50KB/2000 lines and preserves backend semantic `working`, `blocked`, `done`, `idle`, and `unknown` states.
-
-The `/subagents` overlay lists only current-session owned runs and exposes selection, focus, graceful retained stop, refresh, and close. Focus/stop are terminal overlay results, so the overlay is disposed before either mutation. Detailed output, broader observational scopes, send, interrupt, force stop, and safe worktree cleanup remain available only through the explicit model-facing tools. Normal focus validates the returned post-focus `agent_info` identity/state without a second snapshot; a lost response gets one fresh reconciliation snapshot and otherwise reports that focus may have succeeded.
-
-A successful start and each accepted follow-up prepare a durable per-run generation (schema v4) before input mutation. Generations use a single phase machine (`preparing` → `submitted` → `captured` | `closed` | `blocked`) and are correlated with a private request nonce/marker for Pi children. Completion is observed asynchronously via Herdr status events plus periodic reconciliation; `subagent_start`/`subagent_send` remain non-blocking. Only the Pi child bridge may capture a structured final assistant message; there is no terminal or legacy result path. Missing/malformed bridge evidence closes the generation as capture-unavailable without inventing a result. Captured envelopes live at `.subagents/runs/<id>/results/<generation>.json` and are delivered one-at-a-time as `herdr-subagents.result.v1` custom messages into the currently active owning parent branch only. Delivery stages are `captured` → `dispatched` → `parent_persisted`. Same-run sends serialize to one unresolved model generation. Exact-ID `subagent_status` remains for live inspection/recovery and does not gate automatic delivery. Collapsed tool/custom UI previews the exact model-visible text; Ctrl+O expansion is that text byte-for-byte.
+A writer result carries the same-revision extension-derived action block. Later blocked, failed, delivery-uncertain, cleanup-retained, UI, and recovery transitions use `herdr-subagents.action-required.v1`. Stable notice identity, runtime-epoch in-flight state, active-branch scans, and ownership authorization ensure one model-visible message per unchanged action revision. Status and TUI project the same `attention` object.
 
 ## Ownership and recovery
 
-Before topology creation, an active-branch `herdr-subagents.ownership.v1` journal records intent and then monotonically appends returned worktree/group/terminal/native identities. `run.json` stores operational metadata but never grants authority alone.
+`herdr-subagents.ownership.v1` journals append returned worktree/group/terminal/native identities on the active Pi branch. Schema-v5 `run.json` stores operational metadata, action state, the ownership journal, and the exact worktree snapshot; it never grants process authority alone.
 
-Recovery requires:
+Live process control requires current-session active-branch ownership plus fresh matching pane/agent/native topology. `/tree`, fork/new sessions, malformed metadata, and partial identity make live runs observational.
 
-- valid journal chain on the current active branch;
-- matching parent Pi session/path;
-- contained regular `run.json` with exact run nonce/terminal/native identity and a canonical run-bound private OS-temp layout;
-- fresh matching pane/agent topology;
-- available matching native child identity.
+A stopped run has a terminal `stopped` ownership phase. `subagent_stop` can therefore skip process control and retry cleanup after terminal exit or reload. A later parent session may create a terminal `cleanup_adopted` phase only when a schema-v5 parent journal, run nonce, source/child repository identity, generated branch/path, Herdr workspace/anchors, clean checkout, idle shells, and no agent all reconcile. This grants cleanup only: it never adopts/stops a prior process or delivers prior private output. Schema-v3/v4 metadata is parsed for current-branch cleanup migration; if it lacks the exact worktree/ownership snapshot required for cross-session adoption, startup retains it and injects one consolidated recovery notice.
 
-Full-session entries preserve abandoned evidence but cannot grant control. There is no adoption or ownership-transfer API.
+## Launch and worktree policy
 
-## Launch and harness policy
+Adapters validate executable, canonical cwd/roots, capabilities, model/thinking, and prohibited options before topology creation. Writers always create a linked worktree under the run-bound sibling container and a dedicated group tab inside its Herdr worktree workspace. Read-only profiles share the verified checkout but use a dedicated group tab. The group and writer terminal are journaled before task mutation.
 
-Adapters validate executable identity, canonical cwd/trusted roots, capabilities, model/thinking mapping, private ephemeral system prompt, and prohibited options before `agent.start`. Launch argv is an array and never contains task text.
-
-1. A private temporary validation directory is created and always removed; no durable preflight run directory exists.
-2. Writer worktree/group topology is created when required.
-3. Durable artifact paths are prepared.
-4. A private live runtime directory is created with `system.md`; Pi also gets `sessions/` and `result-exchange/{requests,responses}`, while Claude/Codex do not.
-5. The harness starts without task text in argv.
-6. Returned identity is journaled and schema-v4 `run.json` is written (generation/bridge summary only; full captures live under `results/`).
-7. Readiness/native identity is proven.
-8. A generation is prepared, instructions are wrapped (Pi) and submitted atomically, and a new work cycle is proven.
-
-After any input mutation is attempted, a lost/aborted response is treated as submission/delivery uncertainty and the child is retained. Send/interrupt results use `confirmed`, `unconfirmed` (acknowledged request without bounded state/revision evidence), or `uncertain` (request may have applied before response loss). No automatic retry, message ID, deduplication ledger, or destructive uncertainty cleanup exists. Confirmed interrupt output is reread before graceful exit so stop/handoff uses the newest available pre-exit output.
-
-Pi children independently resolve ordinary project trust and resource discovery; this is not parent trust inheritance. Pi and Claude tool policies are not filesystem sandboxes. Codex uses its documented sandbox. Capability overrides are monotonic unless trusted configuration and interactive human confirmation authorize broadening before resource creation. Recursive orchestration tools are rejected for all children.
+Pi children independently resolve ordinary trust/resources; transient parent approval is not inherited. Recursive orchestration tools are rejected.
 
 ## Artifacts
 
-Durable defaults are `run.json` and `handoff.md`. `progress.md` exists only when a profile explicitly configures it and is always optional evidence. Public profiles can customize progress/handoff paths and writer mode, not prompt/system paths.
+Bundled profiles create no child handoff/progress files. Their self-contained final assistant response is the primary handoff and is persisted in the parent Pi branch. While unresolved, parent operational state is:
 
-While live, `run.json` stores the full delegated assignment and last bounded output for exact reload recovery. Wait/done observation only updates metadata; it never materializes a handoff. A proven stop moves the assignment into one final handoff and removes it from final metadata.
+```text
+.subagents/runs/<id>/
+├── run.json
+└── results/             # when captures exist
+```
 
-Read-only handoffs are parent-materialized with full assignment and non-empty final output. For a child writer, the child file is preserved and a deterministic parent-owned sibling (`handoff.parent.md` for the default) wraps the full assignment plus validated child content. Missing or invalid child handoff content fails closed—there is no invented substitute body. That wrapper is registered as the required cleanup artifact before worktree creation, so provenance is never rebound later.
+Custom profiles may explicitly configure run-unique handoff/progress files. Existing custom files inside a disposable checkout are copied to parent-owned `captured/` storage and byte/SHA-256 verified before removal. Missing optional files do not block; a failed copy of a present file retains. Public profiles still cannot customize internal prompt/system paths.
 
-System prompt and Pi session/exchange paths are recorded in internal `run.json` only while retained. Their directory must be the exact canonical private OS-temp `mkdtemp` layout derived from immutable run ID, with real non-symlink `system.md` and (Pi only) `sessions/` plus `result-exchange/{requests,responses}` children and no unexpected root entry. Tampering makes recovery observational. Stop performs a capture barrier (structured Pi bridge only; no invented terminal result) before temporary deletion. After a proven stop, handoff materialization occurs first (preferring captured final response when present), then the layout is revalidated immediately before recursive removal and `run.json` is atomically rewritten with `runtime.ephemeralFiles: "removed"`, no ephemeral paths, and no assignment. If capture is uncertain, temporary files are retained. Durable `results/` records are retained when written. Live, blocked, uncertain, or stop-unproven runs retain temporary files.
+Private system/session/exchange files are canonical run-bound OS-temp state. They remain while live or capture-uncertain and are removed after proven stop. Assignment/runtime metadata remains until a structured result or explicit failure/action notice is parent-persisted. Successful default finalization removes the runtime run directory; verified custom captures remain intentional.
 
-For disposable worktrees, the required parent wrapper/handoff and any present optional progress are copied to parent-owned `captured/` storage and byte/hash verified before removal. `captured/` is not created for ordinary history. Parent `run.json` remains outside the disposable worktree. After proven removal, metadata points to retained captures rather than removed source paths.
+## Writer finalization state machine
 
-There is no age/retention policy, garbage collector, cleanup command, or automatic historical deletion. Durable run/handoff evidence, uncertain/live/orphan evidence, and retained-worktree evidence remain.
+The existing stop tool owns a stop-once/finalize-many flow:
 
-## Writers and destructive safety
+```text
+live writer → stop → parent evidence persistence → safe cleanup attempt
+stopped writer → skip process control → retry safe cleanup
+```
 
-A persistent writer lease binds canonical repository/common-Git-dir + checkout path, run nonce, parent branch proof, terminal/native session, and fresh backend reconciliation. Concurrent writers never share a checkout.
+Safe cleanup requires exact ownership, parent-persisted result/failure evidence, clean checkout, and objective integration. The extension derives `no_changes`, direct commit containment, or exact current parent/child tree equivalence; callers may supply existing containment/tree evidence for older equivalent parent refs. Parent review text is optional audit detail, not a deletion gate.
 
-Safe removal requires current ownership, no live/unknown child, unchanged anchor process identities, required handoff capture, parent review, objective integration/no-change evidence, clean exact checkout, and matching Herdr/Git worktree provenance. Progress is not required. Removal never deletes branches. Dirty discard remains a separate interactive-human-only path unavailable to model tools.
+Historical foreground snapshot hashes are not destructive gates. Current exact workspace/tab/terminal topology must contain only recorded anchors, no agent/unknown pane, and each anchor must be a known idle shell. Process information that is missing or active fails closed.
+
+After final revalidation, cleanup journals milestones:
+
+1. non-force Herdr worktree removal (closes its workspace/tabs/panes);
+2. compare-delete only the exact manager-generated branch at its expected child HEAD (`git update-ref -d`); caller-supplied/moved refs are preserved;
+3. safe runtime artifact purge.
+
+A crash resumes only unfinished milestones. Dirty discard remains separate interactive-human-only behavior unavailable to model tools.
 
 ## Test layers
 
-- unit/profile/artifact/protocol/harness/runtime/worktree/tool/UI/integration core tests;
-- deterministic subprocess fake E2E, explicit via `test:e2e`;
-- exact one-pass archive pack/install/isolated Pi RPC load via `pack:inspect`;
-- pinned local `skills-ref` validation;
+- unit/profile/artifact/result/protocol/harness/runtime/worktree/tool/UI/integration core tests;
+- deterministic fake E2E;
+- exact pack/install/isolated Pi RPC load via `pack:inspect`;
+- pinned skill validation;
+- opt-in no-model real Herdr worktree conformance proving zero workspace/tab/pane/worktree/generated-branch/runtime-artifact residue;
 - opt-in model-backed smoke, dry-run by default.
-
-See [`operations.md`](operations.md) for commands and failure handling.

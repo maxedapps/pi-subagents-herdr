@@ -70,7 +70,7 @@ export const StopToolSchema = Type.Object({
   id: RunId,
   mode: Type.Optional(StringEnum(["graceful", "force"] as const)),
   cleanup: Type.Optional(StringEnum(["retain", "remove_if_safe"] as const)),
-  parentReview: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000, description: "What the parent inspected and verified before cleanup" })),
+  parentReview: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000, description: "Optional audit note describing parent review; objective Git/topology evidence controls cleanup" })),
   integration: Type.Optional(IntegrationSchema),
   timeoutMs: Type.Optional(Timeout),
 }, strict);

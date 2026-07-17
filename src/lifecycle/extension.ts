@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { Text } from "@earendil-works/pi-tui";
 import { PACKAGE_ASSETS } from "../package-paths.ts";
 import { RESULT_CUSTOM_TYPE } from "../results/contracts.ts";
+import { ACTION_NOTICE_CUSTOM_TYPE } from "../results/action-notices.ts";
 import { collapsedPreview } from "../results/presentation.ts";
 import { registerChildResultBridge } from "../results/child-bridge.ts";
 import { registerHerdrToolSurface } from "../tools/index.ts";
@@ -114,14 +115,13 @@ export function registerHerdrSubagentsExtension(
   });
 
   if (typeof pi.registerMessageRenderer === "function") {
-    pi.registerMessageRenderer(RESULT_CUSTOM_TYPE, (message, options, theme: Theme) => {
+    const render = (message: unknown, options: { expanded: boolean }, theme: Theme) => {
       const text = messageContentText(message as { content?: unknown });
-      if (!options.expanded) {
-        return new Text(theme.fg("muted", collapsedPreview(text)), 0, 0);
-      }
-      // Expanded Ctrl+O must show exactly the model-visible content bytes.
+      if (!options.expanded) return new Text(theme.fg("muted", collapsedPreview(text)), 0, 0);
       return new Text(text, 0, 0);
-    });
+    };
+    pi.registerMessageRenderer(RESULT_CUSTOM_TYPE, render);
+    pi.registerMessageRenderer(ACTION_NOTICE_CUSTOM_TYPE, render);
   }
 
   pi.on("session_shutdown", async () => {

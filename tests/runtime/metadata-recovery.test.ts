@@ -60,9 +60,23 @@ test("readiness-time native identity extends the monotonic started journal witho
   assert.throws(() => writer.append(value, "started", {}), /must add immutable resource evidence/);
 });
 
-test("schema versions other than 4 and policy.skills are rejected", () => {
-  const root = "/tmp/metadata-v4-only";
-  assert.throws(() => parseRuntimeRunMetadata({ ...metadata(root), schemaVersion: 3 }), /malformed/);
+test("cleanup-only adoption is an explicit terminal ownership phase with full immutable provenance", () => {
+  const entries: PiBranchEntry[] = [{ type: "message", id: "leaf", parentId: null }];
+  const writer = new ActiveBranchOwnershipJournal({ appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", id: `a${entries.length}`, parentId: entries.at(-1)!.id, customType, data }); } });
+  const intent = writer.begin({ runId: "run-cleanup", runNonce: "nonce-cleanup", branchEntryId: "leaf", sessionId: "parent", intended: { workspaceId: "w2", group: "default", worktreeRequested: true } });
+  const adopted = writer.append(intent, "cleanup_adopted", { tabId: "t2", rootPaneId: "p2", rootTerminalId: "root2", rootProcessBaseline: "legacy", paneId: "old-pane", terminalId: "old-terminal", repositoryId: "repo", commonGitDir: "/git", herdrRepositoryKey: "key", worktreeWorkspaceId: "w2", checkoutPath: "/writer", worktreeBranch: "herdr-subagents/run-cleanup-aaaaaaaaaaaa", worktreeBase: "base", worktreeInitialTabId: "t1", worktreeInitialRootPaneId: "p1", worktreeInitialRootTerminalId: "root1" });
+  assert.equal(recoverActiveBranchOwnership(entries).get("run-cleanup")?.state, "owned");
+  assert.equal(adopted.phase, "cleanup_adopted");
+  assert.throws(() => writer.append(adopted, "started", {}), /Invalid ownership journal transition/);
+});
+
+test("schema 3/4 metadata migrates to 5 while unsupported versions and policy.skills are rejected", () => {
+  const root = "/tmp/metadata-migration";
+  const v4 = parseRuntimeRunMetadata(metadata(root)); assert.equal(v4.schemaVersion, 5);
+  const { generation: _generation, ...legacy } = metadata(root);
+  const v3 = parseRuntimeRunMetadata({ ...legacy, schemaVersion: 3 }); assert.equal(v3.schemaVersion, 5); assert.equal(v3.generation.nextGeneration, 1);
+  assert.throws(() => parseRuntimeRunMetadata({ ...metadata(root), schemaVersion: 2 }), /malformed/);
+  assert.throws(() => parseRuntimeRunMetadata({ ...metadata(root), schemaVersion: 6 }), /malformed/);
   assert.throws(() => parseRuntimeRunMetadata({
     ...metadata(root),
     policy: { ...metadata(root).policy, skills: [{ name: "x", path: "/tmp/x/SKILL.md" }] },

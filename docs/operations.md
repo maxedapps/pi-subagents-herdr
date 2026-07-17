@@ -4,10 +4,10 @@
 
 1. Start Pi inside the intended Herdr pane.
 2. Confirm matching `HERDR_ENV`, socket, pane, tab, and workspace variables.
-3. Confirm Pi 0.80.6+, Herdr 0.7.3/protocol 16, current integrations, and selected harness authentication.
-4. Reload the package and run `/subagents-doctor`.
+3. Confirm Pi 0.80.6+, Herdr 0.7.3/protocol 16, integrations, and harness authentication.
+4. Reload and run `/subagents-doctor`.
 
-Useful read-only operator commands:
+Useful read-only commands:
 
 ```sh
 pi --version
@@ -17,146 +17,90 @@ herdr integration status
 npm run smoke:load
 ```
 
-Herdr CLI commands are for diagnosis, not bypassing extension ownership or lifecycle controls.
+Herdr CLI is diagnostic, not an ownership bypass.
 
-## Pi child trust and resources
-
-Pi children receive neither `--approve` nor `--no-approve`, and no skill/prompt-template suppression or explicit-skill flags. Each child process resolves project trust normally. Persisted trust and global settings/resources are available in the ordinary user environment; a transient parent `--approve` or session-only trust decision is not inherited. If a child shows the standard trust prompt, resolve it as an ordinary Pi trust decision before expecting project settings, skills, or templates to load.
-
-The package contributes `use-herdr-subagents` only to the parent through dynamic resource discovery. Child mode still contributes no orchestration skill, tools, commands, UI, or lifecycle handlers.
-
-## Start and monitor
+## Start, monitor, and act
 
 ```text
 subagent_start({ profile: "scout", task: "Map src/auth; return paths and flow; do not modify files." })
 subagent_status({ id: "<id>", states: ["done", "idle", "blocked"], timeoutMs: 900000, lines: 160 })
-```
-
-List without an ID:
-
-```text
-subagent_status({})
+subagent_status({ id: "<id>", lines: 160 })
 subagent_status({ scope: "all_owned" })
 ```
 
-Inspect without waiting:
+Results arrive automatically. A writer result can include `ACTION REQUIRED` with exact checkout/branch/base/HEAD/clean/ahead facts and the next stop/integration step. Later blockers, failures, cleanup refusals, and recovery issues use a deduplicated follow-up message and the same `run.attention` status/TUI state. Treat it as unresolved until cleanup succeeds or an explicit blocker is reported.
+
+Blocked state is not permission to self-approve. Use one bounded same-assignment follow-up when appropriate. For send/interrupt, inspect `unconfirmed` and `uncertain`; never retry uncertain input automatically.
+
+## Parent verification, integration, and stop
+
+Child output and test claims are evidence, not proof. For a writer, inspect the complete diff/status, rerun relevant checks, and integrate manually. Then call:
 
 ```text
-subagent_status({ id: "<id>", lines: 160 })
+subagent_stop({ id: "<id>", mode: "graceful" })
 ```
 
-A blocked result is not failure or permission to approve automatically. Inspect, decide, then send one bounded same-assignment clarification:
+Writer cleanup defaults to `remove_if_safe`. The same call is idempotent after the child is stopped and after reload. The extension automatically derives clean `no_changes`, direct `commit_contained`, or exact current-tree evidence. For another integrated parent ref, provide the existing `commit_contained`/`tree_matches` object. `parentReview` is optional audit text.
 
-```text
-subagent_send({ id: "<id>", message: "Limit scope to refresh-token handling; request no new permissions." })
-```
+Cleanup retains and reports an exact retry action unless all of these hold:
 
-Interrupt preserves the session:
+- current ownership or exact cleanup-only adoption is authoritative;
+- child/native agent is gone and only recorded idle anchors remain;
+- structured result or explicit failure/action evidence is parent-persisted;
+- checkout is clean and no-change/integration is objectively proven;
+- Herdr/Git repository, workspace, worktree path, branch, and child HEAD match;
+- every present explicit custom artifact is copied and hash verified.
 
-```text
-subagent_interrupt({ id: "<id>", timeoutMs: 15000 })
-```
+On success it removes the Herdr workspace/tabs/panes and linked worktree, compare-deletes the exact manager-generated branch at its expected HEAD, and purges transient run metadata/results. Caller-supplied or moved branches are never deleted. Force stop affects only the process; dirty discard remains human-only.
 
-Mutation delivery reports one of:
+Explicit `cleanup: "retain"` remains available for exceptional intentional retention and creates action-required state.
 
-- `confirmed`: Herdr acknowledged and the expected state/revision evidence appeared;
-- `unconfirmed`: Herdr acknowledged, but bounded follow-up evidence did not appear;
-- `uncertain`: the mutation may have applied before its response was lost or aborted.
+## Dashboard
 
-Inspect `unconfirmed`/`uncertain` runs and their output. Never resend uncertain input, repeat interrupt automatically, or destroy the run merely to resolve ambiguity.
-
-## Parent verification and stop
-
-A done/idle state, handoff, or child test claim is not correctness proof. The parent reads artifacts/output, inspects every diff, checks Git state, and reruns relevant tests.
-
-```text
-subagent_stop({ id: "<id>", mode: "graceful", cleanup: "retain" })
-```
-
-Force mode only permits freshly identity-verified pane termination. It never discards worktree changes or artifacts.
-
-`remove_if_safe` additionally requires a parent review note and objective `no_changes`, `commit_contained`, or `tree_matches` evidence. Removal still refuses unless current ownership agrees, child/unknown panes are gone, the required parent wrapper/handoff is captured and verified, checkout is clean, and exact backend/Git provenance agrees. Optional progress is captured when present but not required. Branches are never deleted.
-
-## Operator dashboard
-
-`/subagents` shows current-session owned runs only. Controls are ↑/↓ selection, Enter focus, `x` graceful stop with artifacts/worktree retained, `r` refresh, and Escape close. The overlay closes before focus or stop. A stop timeout/refusal is reported as not stopped with its reason, never as completion. Use `subagent_status` for detailed output or `all_owned`/`global` observation.
-
-Interrupt cancels only the current turn and keeps the child reusable. Graceful stop ends the child and already interrupts first when necessary, so interrupt is not an ordinary prerequisite for stop. Send, interrupt, force stop, and safe worktree cleanup remain explicit model-facing tool operations rather than dashboard hotkeys.
+`/subagents` shows current-session runs plus stopped runs needing action. Controls are ↑/↓, Enter focus, `x` graceful stop with automatic safe finalization, `r`, and Escape. A refusal is shown as warning/action-required, never completion.
 
 ## Recovery
 
-Children survive reload/shutdown. Control recovers only from exact current-session active-branch journal + safe parent-checkout `run.json` + canonical run-bound private OS-temp layout + live terminal/native/topology agreement. Redirected external paths, symlinks, permissive modes, or unexpected runtime-root entries make the run observational and authorize no deletion.
+Children survive extension reload/shutdown.
 
-- `/tree` away from the creation branch removes control; returning recovers only if all evidence still agrees.
-- Fork/new sessions do not inherit ownership.
-- Moved panes are followed by stable terminal identity, never stale pane ID.
-- Partial starts and disconnects retain every returned identity when cleanup cannot be proven.
-- Missing/tampered metadata and orphan/global panes remain observational; do not edit metadata to adopt them.
+- Current-session active-branch stopped journals resume through the same stop/finalize path.
+- Schema-v3/v4 metadata is accepted for current-branch migration.
+- A later parent session may reauthorize cleanup only for a schema-v5 stopped journal with exact parent/child Git, nonce, branch/path, Herdr workspace/anchors, idle/no-agent, and clean-checkout proof.
+- Cross-session cleanup adoption never controls a process or delivers prior private output.
+- Legacy/ambiguous/dirty/live/moved/tampered resources remain untouched and appear in one consolidated startup recovery notice.
+- `/tree`-abandoned and global resources remain observational.
+
+Do not edit journals or metadata to manufacture authority.
 
 ## Artifact lifecycle
 
-Read-only default:
+Bundled profiles write no handoff/progress files. While unresolved, parent operational files are `run.json` and optional `results/`. The delivered structured result is the durable handoff. Private prompt/session/exchange files remain only while live or capture-uncertain.
 
-```text
-.subagents/runs/<id>/
-├── run.json
-└── handoff.md
-```
+Custom profile artifacts are explicit supplemental retention. Present files inside a writer worktree are copied under parent-owned `captured/` and byte/SHA-256 verified. Missing optional files do not gate cleanup; a failed copy of a present file retains. Successful default finalization leaves no `.subagents/runs/<id>` directory; custom captures remain.
 
-A profile may explicitly add `progress.md`; bundled scout/researcher do not, bundled worker does. Prompt/system profile customization is removed.
+Git-local excludes protect `/.subagents/` and only explicitly requested `/.progress/`; tracked `.gitignore` is unchanged.
 
-Launch validation uses an always-removed private temporary directory. Live runtime uses another canonical private OS-temp directory containing internal `system.md`; Pi also uses `sessions/`. Claude/Codex do not create unused package session directories. While live, `run.json` retains the full assignment and last bounded output; repeated waits do not create handoffs. These files remain while live/blocked/uncertain. After a proven stop, the package creates the single final handoff, removes its assignment from metadata, revalidates the exact temporary layout immediately before deletion, and atomically rewrites `run.json` without ephemeral paths.
+## Doctor diagnostics
 
-For child writers, `handoff.md` remains child-owned while deterministic `handoff.parent.md` is the required parent-owned final wrapper containing full assignment plus validated child content (missing/invalid child content fails closed). Its path is registered before worktree creation. For safe disposable-worktree removal, that wrapper and present optional progress are copied under parent-owned `.subagents/runs/<id>/captured/` and byte/hash verified. `captured/` exists only for this removal boundary. `run.json`, handoff/captures, uncertain/live/orphan evidence, and retained-worktree evidence are not automatically deleted. There is no age-based retention or cleanup command.
-
-## Git behavior
-
-The selected checkout must be the real repository/worktree root. The package asks Git for `info/exclude` and append-locks:
-
-```gitignore
-/.subagents/
-/.progress/
-```
-
-`/.progress/` is requested only by an enabled profile. A pre-existing untracked `.progress/` is not hidden without explicit review. Tracked `.gitignore` remains unchanged. Non-Git directories report protection as not applicable.
-
-## Doctor interpretation
-
-`/subagents-doctor` is read-only. It checks package/Pi/Herdr versions, protocol/parent identity, harnesses/integrations, profiles/settings, optional research capability, Git/artifacts, recovery/topology, and retained worktrees. It never writes, adopts, focuses, sends, stops, or cleans.
-
-Common failures:
+`/subagents-doctor` is read-only. Common responses:
 
 | Diagnostic | Response |
 |---|---|
-| missing/mismatched Herdr environment | restart Pi in the intended managed pane; do not copy identity variables |
-| incompatible protocol/integration | install a reviewed compatible Herdr/integration version and restart |
-| profile collision/schema error | remove same-priority duplicate or unsupported fields |
-| research unavailable | expose a reviewed preferred external tool or choose a non-research assignment |
-| artifact root/ignore failure | correct trusted roots/template or review Git-local excludes before retry |
-| orphan/uncertain recovery | retain and inspect; no adoption exists |
-| dirty/unintegrated writer | review/test/integrate and retry safe cleanup, otherwise retain |
+| missing/mismatched Herdr environment | restart Pi in the intended managed pane |
+| incompatible protocol/integration | install a reviewed compatible version |
+| profile collision/schema error | remove duplicate/unsupported fields |
+| research unavailable | expose reviewed research tools or choose another task |
+| action/cleanup required | inspect exact run facts, resolve blocker, retry `subagent_stop` |
+| dirty/unintegrated writer | review/test/integrate; never discard automatically |
+| legacy cleanup proof incomplete | retain; inspect the consolidated recovery notice |
 
 ## Validation
 
-Fast core gate:
-
 ```sh
 npm run check
-```
-
-Release qualification:
-
-```sh
 npm run check:full
+npm run pack:inspect
+npm run conformance:herdr:worktree:no-model -- --confirm-create --source-cwd <clean-repo>
 ```
 
-Explicit layers are `npm run test:e2e`, `npm run pack:inspect`, and `npm run skill:check`. All are deterministic/no-model. `pack:inspect` packs exactly once and installs/loads that archive.
-
-The real backend script remains opt-in and dry-run by default:
-
-```sh
-node scripts/e2e-herdr-smoke.mjs --harness pi
-node scripts/e2e-herdr-smoke.mjs --harness pi --confirm-model --parent-session-path <session.jsonl>
-```
-
-Never use `--confirm-model`, `--exercise-focus`, or `--force-cleanup` without explicit authorization for the corresponding cost/mutation.
+The conformance command is no-model and opt-in because it creates and fully finalizes a real disposable worktree. Model-backed smoke remains separately opt-in; never use model/focus/force flags without explicit authorization.

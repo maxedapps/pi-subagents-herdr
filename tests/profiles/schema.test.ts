@@ -91,7 +91,8 @@ test("bundled scout, researcher, and worker are strict, model-free, non-recursiv
     assert.equal(parsed.name, name);
     assert.equal(parsed.model, undefined);
     assert.equal(/^herdr\s*:/m.test(text), false);
-    assert.match(parsed.body, /handoff/i);
+    assert.match(parsed.body, /final assistant response|primary result transport|self-contained/i);
+    assert.equal(parsed.artifacts, undefined);
     assert.match(parsed.body, /not delegate recursively|do not delegate recursively/i);
   }
   const scoutText = await readFile(join(PACKAGE_ASSETS.agents, "scout.md"), "utf8");
@@ -99,7 +100,7 @@ test("bundled scout, researcher, and worker are strict, model-free, non-recursiv
   const workerText = await readFile(join(PACKAGE_ASSETS.agents, "worker.md"), "utf8");
   assert.doesNotMatch(scoutText, /\n\s*progress:/);
   assert.doesNotMatch(researcherText, /\n\s*progress:/);
-  assert.match(workerText, /\n\s*progress:/);
+  assert.doesNotMatch(workerText, /\n\s*(progress|handoff|writer):/);
   const researcher = parseProfile(researcherText, source(join(PACKAGE_ASSETS.agents, "researcher.md")));
   assert.deepEqual(researcher.preferredTools, ["web_search", "fetch_content", "get_search_content"]);
   assert.deepEqual(researcher.tools, ["read", "grep", "find", "ls"]);

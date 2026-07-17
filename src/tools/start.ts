@@ -10,7 +10,7 @@ export function registerStartTool(pi: ExtensionAPI, runtime: HerdrToolRuntimeCon
     label: "Subagent Start",
     description: "Start one visible subagent after strict profile, ownership, capability, cwd, and worktree validation. A successful start returns immediately while the child runs asynchronously; the child's final assistant response is captured and injected into this parent branch automatically. Use subagent_status with the exact returned ID for live inspection, blockers, or recovery. There is no hidden or cross-harness fallback.",
     promptSnippet: "Start one bounded, ownership-tracked subagent",
-    promptGuidelines: [`Use ${name} only for deliberate bounded delegation with least privilege, a clear output, and a stopping condition. After ${name}, results arrive automatically; call subagent_status with the exact ID for live inspection or recovery. List mode does not inspect a single run's result.`],
+    promptGuidelines: [`Use ${name} only for deliberate bounded delegation with least privilege, a clear output, and a stopping condition. After ${name}, results arrive automatically and may include an ACTION REQUIRED block. Treat that block as unresolved: inspect/integrate as needed and call subagent_stop until writer cleanup is finalized or an exact blocker is reported. Use subagent_status with the exact ID for live inspection or recovery; list mode does not inspect a single run's result.`],
     parameters: StartToolSchema,
     executionMode: "parallel",
     async execute(toolCallId, params, signal) {

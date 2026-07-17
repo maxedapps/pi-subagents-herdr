@@ -33,9 +33,6 @@ context:
 timeout: 900000
 worktree: forbidden
 disabled: false
-artifacts:
-  handoff: .subagents/runs/{id}/handoff.md
-  writer: parent
 ---
 
 Inspect only the assigned scope. Do not delegate. Return evidence and limitations.
@@ -59,8 +56,8 @@ Optional fields:
 | `worktree` | `forbidden`, `optional`, `required`, `required-for-concurrency` |
 | `disabled` | winning disabled profile hides weaker definitions |
 | `artifacts.progress` | optional run-unique progress path |
-| `artifacts.handoff` | optional run-unique handoff path; canonical default otherwise |
-| `artifacts.writer` | `parent` default or mutation-only `child`; child file is preserved and a deterministic parent wrapper becomes final required evidence |
+| `artifacts.handoff` | optional explicit run-unique supplemental handoff path; there is no implicit handoff |
+| `artifacts.writer` | `parent` default or mutation-only `child`; existing child content is wrapped/captured before removal |
 
 `artifacts.prompt` and `artifacts.system` do not exist. System prompt files are internal ephemeral runtime data. Unknown fields, duplicate YAML keys, invalid values, missing requirements, and empty bodies fail discovery.
 
@@ -78,15 +75,15 @@ Supported placeholders: `{id}`, `{groupId}`, `{profile}`, `{harness}`. Every pub
 
 Relative templates resolve from the selected checkout and must remain under `.subagents/` or explicitly enabled `.progress/`. Absolute templates require a canonical additional root granted by trusted namespaced settings. Unknown placeholders, NULs, `.`/`..`, traversal, symlink escape, and non-unique templates fail.
 
-`progress` is optional evidence even when configured. Required final handoff remains the only artifact prerequisite for safe worktree removal. For `writer: child`, the configured path is child-owned and its deterministic `.parent` sibling is registered from outset as that required final handoff. Parent-owned `run.json` always uses `.subagents/runs/<id>/run.json` and is not profile-customizable.
+Artifacts are supplemental and optional. Profiles without an `artifacts` block create no handoff/progress file. For `writer: child`, existing configured child content is validated and wrapped before capture; a missing optional file does not block, while failure to preserve a present file retains. Parent operational `run.json` always uses `.subagents/runs/<id>/run.json` and is not profile-customizable.
 
 ## Bundled defaults
 
 | Name | Harness | Permission | Worktree | Durable output |
 |---|---|---|---|---|
-| `scout` | Pi | read-only | forbidden/shared | handoff only |
-| `researcher` | Pi | read-only + soft research | forbidden/shared | handoff only |
-| `worker` | Pi | write | isolated | preserved child handoff + required parent wrapper + optional configured progress |
+| `scout` | Pi | read-only | forbidden/shared | structured delivered result |
+| `researcher` | Pi | read-only + soft research | forbidden/shared | structured delivered result |
+| `worker` | Pi | write | isolated | structured delivered result; no default files |
 
 All prohibit recursive delegation and omit models.
 

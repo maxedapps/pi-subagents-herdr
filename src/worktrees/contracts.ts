@@ -130,11 +130,15 @@ export interface WorktreeRecord {
   readonly workspaceId: string;
   readonly checkoutPath: string;
   readonly branch: string;
+  /** True only when this extension generated the branch name during creation. */
+  readonly generatedBranch?: boolean;
   readonly base: string;
   readonly state: WorktreeState;
   readonly createdRoot: WorktreeCreationRoot;
   readonly tab?: WorktreeTabIdentity;
   readonly owner: WorktreeOwner;
+  /** Prior owner retained when a later parent session reauthorizes cleanup only. */
+  readonly legacyOwner?: WorktreeOwner;
   readonly writer?: WorktreeWriterIdentity;
   /** Source artifact paths fixed before Herdr creates the disposable checkout. */
   readonly artifactPaths: readonly ArtifactReference[];
@@ -145,7 +149,16 @@ export interface WorktreeRecord {
   readonly removalRefusal?: string;
   readonly humanDiscard?: HumanDiscardDecision;
   /** Durable write-ahead evidence that a destructive Herdr call may have started. */
-  readonly removalAttempt?: { readonly force: boolean; readonly startedAt: number };
+  readonly removalAttempt?: { readonly force: boolean; readonly startedAt: number; readonly childHead: string };
+  readonly finalization?: {
+    readonly workspaceRemovedAt?: number;
+    readonly removedPath?: string;
+    readonly childHead?: string;
+    readonly branchFinalizedAt?: number;
+    readonly branchDisposition?: "deleted" | "preserved";
+    readonly runtimeArtifactsPurgedAt?: number;
+    readonly lastError?: string;
+  };
   /** Recovery uncertainty always blocks further cleanup. */
   readonly recoveryIssue?: string;
   readonly createdAt: number;
@@ -167,6 +180,7 @@ export interface WorktreeStateView {
   readonly parentVerification: ParentVerificationState;
   readonly retentionReason?: string;
   readonly removalRefusal?: string;
+  readonly finalized: boolean;
 }
 
 export function toWorktreeStateView(record: WorktreeRecord): WorktreeStateView {
@@ -185,5 +199,8 @@ export function toWorktreeStateView(record: WorktreeRecord): WorktreeStateView {
     parentVerification: record.parentVerification,
     ...(record.retentionReason === undefined ? {} : { retentionReason: record.retentionReason }),
     ...(record.removalRefusal === undefined ? {} : { removalRefusal: record.removalRefusal }),
+    finalized: record.state === "removed"
+      && record.finalization?.branchFinalizedAt !== undefined
+      && record.finalization.runtimeArtifactsPurgedAt !== undefined,
   };
 }

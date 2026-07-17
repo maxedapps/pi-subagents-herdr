@@ -21,7 +21,7 @@ export interface VerifiedWorktreeCapture extends WorktreeCaptureResult {
 /** Capture required handoff evidence and any configured optional progress before removal. */
 export async function captureWriterArtifacts(
   options: CaptureWorktreeArtifactsOptions,
-  requiredKinds: readonly ArtifactKind[] = ["handoff"],
+  requiredKinds: readonly ArtifactKind[] = [],
 ): Promise<VerifiedWorktreeCapture> {
   const requiredInputsPresent = requiredKinds.every((kind) => options.artifacts.some((artifact) => artifact.kind === kind && artifact.required));
   const capture = await captureWorktreeArtifactsBeforeRemoval(options);
@@ -36,16 +36,18 @@ export async function verifyRetainedArtifactCapture(input: {
   readonly disposableCheckoutPath: string;
   readonly requiredKinds?: readonly ArtifactKind[];
 }): Promise<{ verified: boolean; reason: string }> {
-  const requiredKinds = input.requiredKinds ?? ["handoff"];
+  const requiredKinds = input.requiredKinds ?? [];
   for (const kind of requiredKinds) {
-    const reference = input.references.find((candidate) => candidate.kind === kind && candidate.required);
-    if (!reference?.absolutePath || reference.byteLength === undefined || reference.byteLength <= 0 || reference.sha256 === undefined) return { verified: false, reason: `Required non-empty parent-owned ${kind} capture metadata is missing` };
-    if (isWithin(input.disposableCheckoutPath, reference.absolutePath)) return { verified: false, reason: `Required ${kind} capture still resides in the disposable checkout` };
+    if (!input.references.some((candidate) => candidate.kind === kind && candidate.required)) return { verified: false, reason: `Required non-empty parent-owned ${kind} capture metadata is missing` };
+  }
+  for (const reference of input.references) {
+    if (!reference.absolutePath || reference.byteLength === undefined || reference.byteLength < 0 || reference.sha256 === undefined) return { verified: false, reason: `Captured ${reference.kind} metadata is incomplete` };
+    if (isWithin(input.disposableCheckoutPath, reference.absolutePath)) return { verified: false, reason: `Captured ${reference.kind} still resides in the disposable checkout` };
     let bytes: Buffer;
     try { bytes = await readArtifactSafe(reference.absolutePath, input.parentRoots); }
-    catch (error) { return { verified: false, reason: `Required ${kind} capture cannot be read safely: ${error instanceof Error ? error.message : String(error)}` }; }
+    catch (error) { return { verified: false, reason: `Captured ${reference.kind} cannot be read safely: ${error instanceof Error ? error.message : String(error)}` }; }
     const digest = createHash("sha256").update(bytes).digest("hex");
-    if (bytes.byteLength !== reference.byteLength || digest !== reference.sha256) return { verified: false, reason: `Required ${kind} capture no longer matches its verified byte/hash evidence` };
+    if (bytes.byteLength !== reference.byteLength || digest !== reference.sha256) return { verified: false, reason: `Captured ${reference.kind} no longer matches its verified byte/hash evidence` };
   }
-  return { verified: true, reason: "Required parent-owned handoff capture still matches verified byte/hash evidence" };
+  return { verified: true, reason: input.references.length === 0 ? "No explicit custom artifacts require capture" : "All captured custom artifacts match verified byte/hash evidence" };
 }

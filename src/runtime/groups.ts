@@ -19,6 +19,15 @@ export function processBaseline(info: PaneProcessInfo): string {
   return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
 }
 
+/** Current destructive-boundary proof: exact pane identity plus a known idle shell. */
+export function verifyIdleShell(info: PaneProcessInfo): { readonly idle: true } | { readonly idle: false; readonly reason: string } {
+  if (!Number.isSafeInteger(info.shell_pid) || (info.shell_pid as number) < 1) return { idle: false, reason: "shell PID is unavailable" };
+  if (!Array.isArray(info.foreground_processes)) return { idle: false, reason: "foreground process list is unavailable" };
+  if (info.foreground_processes.length === 0) return { idle: true };
+  if (info.foreground_processes.length === 1 && info.foreground_processes[0]!.pid === info.shell_pid) return { idle: true };
+  return { idle: false, reason: `foreground process list contains ${info.foreground_processes.length} active/non-shell process(es)` };
+}
+
 export class DelegationGroupManager {
   #groups = new Map<string, DelegationGroup>(); #queues = new Map<string, SerialQueue>(); #partials = new Map<string, PartialDelegationGroup>();
   constructor(private readonly client: HerdrRequestClient) {}
@@ -62,8 +71,8 @@ export class DelegationGroupManager {
   async verifyAnchor(group: DelegationGroup, signal?: AbortSignal): Promise<{ verified: boolean; currentPaneId?: string; reason?: string }> {
     const panes = await this.client.listPanes(group.workspaceId, signal); const pane = panes.find((candidate) => candidate.terminal_id === group.rootTerminalId);
     if (!pane || pane.tab_id !== group.tabId) return { verified: false, reason: "Anchor terminal is absent or moved out of the dedicated tab" };
-    const current = processBaseline(await this.client.getPaneProcessInfo(pane.pane_id, signal));
-    if (current !== group.rootProcessBaseline) return { verified: false, currentPaneId: pane.pane_id, reason: "Anchor process baseline changed" };
+    const idle = verifyIdleShell(await this.client.getPaneProcessInfo(pane.pane_id, signal));
+    if (!idle.idle) return { verified: false, currentPaneId: pane.pane_id, reason: `Anchor is not a known idle shell: ${idle.reason}` };
     return { verified: true, currentPaneId: pane.pane_id };
   }
 }

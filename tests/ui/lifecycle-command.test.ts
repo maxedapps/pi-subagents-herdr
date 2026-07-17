@@ -97,7 +97,7 @@ test("graceful stop confirmation and mutation run only after the overlay closes"
   const fake = runtime({
     stop: async (input) => {
       assert.equal(overlayClosed, true, "stop must not run while overlay owns input");
-      assert.deepEqual(input, { id: "run-owned", mode: "graceful", cleanup: "retain" });
+      assert.deepEqual(input, { id: "run-owned", mode: "graceful" });
       stopped = true;
       return stopSuccess();
     },

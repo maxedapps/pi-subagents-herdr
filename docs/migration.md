@@ -1,26 +1,17 @@
-# Migration to the lean tool and artifact contract
+# Migration to action-required automatic finalization
 
-This private package intentionally breaks its 0.1 model-facing API. There are no compatibility aliases.
+This private package intentionally changes lifecycle/artifact behavior without adding tools.
 
 ## Before upgrading
 
-1. Inventory live/retained children and dirty worktrees under the currently owning session/package.
-2. Finish, stop, or deliberately retain each run; preserve handoffs and integration evidence.
-3. Back up custom profiles and namespaced settings.
-4. Disable other packages that register the same canonical `subagent_*` lifecycle tools. Tool load order is not an ownership protocol.
-5. Upgrade/reload this package and run `/subagents-doctor`.
+1. Inventory live/retained children, dirty worktrees, generated `herdr-subagents/*` branches, and `.subagents/runs/*`.
+2. Preserve dirty/unintegrated owner work; do not edit journals or metadata to manufacture authority.
+3. Back up custom profiles/settings.
+4. Reload and run `/subagents-doctor`.
 
-Never edit journals or `run.json` to transfer ownership. Old/global resources remain observational when current authority cannot be proven.
+## Tool behavior
 
-## Tool migration
-
-Removed model-facing names:
-
-- every `herdr_subagent_*` name;
-- separate `subagent_list`, `subagent_get`, and `subagent_wait` tools;
-- compatibility alias settings.
-
-Use exactly:
+The five tools remain:
 
 - `subagent_start`
 - `subagent_status`
@@ -28,48 +19,21 @@ Use exactly:
 - `subagent_interrupt`
 - `subagent_stop`
 
-Status replacements:
+Writer stop now defaults to automatic `remove_if_safe`; explicit `cleanup: "retain"` is exceptional. `subagent_stop` is idempotent for a proven already-stopped owned run, so the same call retries after integration, transient refusal, or reload. `parentReview` remains accepted as optional audit text but is not a deletion gate.
 
-```text
-# old list
-subagent_status({ scope: "current_session" })
+Results can contain `ACTION REQUIRED`; later unresolved transitions use `herdr-subagents.action-required.v1`. Status/UI expose the same attention state. Resolve it before final reporting.
 
-# old get
-subagent_status({ id: "<id>", lines: 160 })
+## Runtime metadata and recovery
 
-# old wait followed by get
-subagent_status({ id: "<id>", states: ["done", "idle", "blocked"], timeoutMs: 900000, lines: 160 })
-```
+New runs write schema-v5 `run.json` with lifecycle, action state, ownership journal, and exact worktree snapshot while unresolved. Schema-v3/v4 files are parsed and normalized for current-active-branch stopped cleanup. They often lack enough exact worktree/ownership state for safe **cross-session** adoption; those resources remain untouched and appear in a consolidated recovery notice.
 
-`scope` is list-only. `timeoutMs` requires `id` plus explicit `states`. Invalid mixed modes fail instead of guessing.
+Schema-v5 prior-session cleanup can be reauthorized only after exact stopped Git/Herdr/nonce/branch/path/anchor proof. This never adopts a process or prior private result.
 
-## Skill migration
+Rollback must first resolve or intentionally retain owned runs. Disabling package loading does not stop children.
 
-The bundled runtime skill is now `skills/use-herdr-subagents/SKILL.md` with command `/skill:use-herdr-subagents`. It is contributed dynamically in parent mode only and can coexist with separately installed subagent strategy skills. Package installation does not modify global skill files.
+## Profile and artifact migration
 
-Child mode contributes neither `use-herdr-subagents` nor recursive orchestration tools.
-
-## Result delivery migration
-
-Runs write schema-v4 `run.json` only (generation/bridge summaries and durable captures under `.subagents/runs/<id>/results/`). Older schema versions are not readable for control recovery. The previous in-memory “must call `subagent_status`” reminder loop is removed: starts/sends stay asynchronous, and completed Pi generations are injected automatically into the active owning parent branch as `herdr-subagents.result.v1` custom messages.
-
-Same-run `subagent_send` requires the child to be `blocked`/`done`/`idle` with the prior generation captured or closed. There is no terminal/legacy result invent path and no final-output handoff substitute for missing child writer content.
-
-Rollback requires resolving or retaining v4 runs and preserving `results/` files; never edit metadata to fake delivery stages. Automatic result capture applies only to Pi children with a working result bridge.
-
-## Profile migration
-
-Remove `skills` and `preferredSkills`; child Pi now uses normal skill discovery and these legacy fields produce a migration error. Remove `artifacts.prompt` and `artifacts.system`; they are invalid. Remove progress from read-only scout/research profiles unless it is intentionally needed. Progress remains optional evidence even when configured.
-
-Recommended artifacts:
-
-```yaml
-artifacts:
-  handoff: .subagents/runs/{id}/handoff.md
-  writer: parent
-```
-
-Writer profile:
+Bundled profiles no longer configure `artifacts`; their self-contained final assistant response is the durable parent handoff. Remove redundant blocks like:
 
 ```yaml
 artifacts:
@@ -78,28 +42,20 @@ artifacts:
   writer: child
 ```
 
-Mutation-capable writers still require isolated worktrees. The required parent wrapper/handoff remains the only artifact prerequisite for safe removal; configured progress stays optional.
+Custom profiles may keep an explicit run-unique handoff/progress contract when intentional. Such files are supplemental: present worktree files are copied to parent-owned `captured/` and byte/SHA-256 verified; absent optional files do not gate cleanup. A capture failure retains rather than losing a present custom artifact.
 
-## Settings migration
+Legacy `skills`, `preferredSkills`, `artifacts.prompt`, and `artifacts.system` remain invalid. Mutation-capable profiles still require isolated linked worktrees.
 
-Delete:
+## Finalization and residue
 
-- `artifacts.retention`
-- `artifacts.maxAgeDays`
-- the entire `compatibilityAliases` object
+After parent result/failure persistence plus clean objective integration/no-change proof, finalization removes:
 
-Unknown old keys now fail validation. There is no age-based garbage collection or historical cleanup command.
+1. Herdr workspace/tabs/panes and linked worktree, non-forcibly;
+2. only the exact manager-generated branch at its expected child HEAD;
+3. transient `.subagents/runs/<id>` metadata/results.
 
-## Artifact migration
+Caller-supplied, moved, dirty, live, unintegrated, tampered, orphaned, and ambiguous resources remain. Verified custom `captured/` content remains intentionally. There is no age/path-only garbage collector or extra cleanup command.
 
-Existing `.subagents/` content is retained. New runs keep parent-checkout `.subagents/runs/<id>/run.json` and a durable handoff. Live metadata temporarily includes the full assignment and bounded output for reload; final metadata removes the assignment after the single proven-stop handoff. No persistent prompt/system files or `<id>-preflight` directories are created.
+## Settings
 
-Internal temporary system/Pi-session files remain only while live or uncertain and are removed after proven stop plus handoff materialization and exact run-bound layout revalidation. Child writers preserve their child file and use a deterministic parent wrapper as the required artifact. For safe writer removal, required wrapper/handoff and present optional progress are copied to parent-owned `captured/` storage and verified first.
-
-Do not delete old prompt/system/preflight files automatically during migration: they may belong to live, uncertain, orphaned, or retained-worktree evidence. Review them manually only after proving ownership and lifecycle state outside this package.
-
-## Rollback
-
-Before rollback, resolve or deliberately retain all new owned runs while authority is available. Preserve run metadata, handoffs, captures, branches, and dirty worktrees. Disabling package loading does not stop live backend resources.
-
-The package remains private and unpublished; migration does not authorize publication metadata or a license.
+Delete obsolete `artifacts.retention`, `artifacts.maxAgeDays`, and `compatibilityAliases`; unknown keys fail validation. Existing writer isolation/security settings are unchanged.

@@ -20,10 +20,10 @@ export class OverlayActions {
   async stopAfterOverlayClosed(id: string): Promise<void> {
     const confirmed = await this.ctx.ui.confirm(
       "Stop owned subagent?",
-      "The child process/session will end. Artifacts and any writer worktree remain.",
+      "The child process/session will end. A writer worktree will be removed automatically only when clean no-change/integration and identity checks pass; otherwise it remains with an action-required notice.",
     );
     if (!confirmed) return;
-    const result = await this.runtime.stop({ id, mode: "graceful", cleanup: "retain" }, this.ctx.signal);
+    const result = await this.runtime.stop({ id, mode: "graceful" }, this.ctx.signal);
     if (!result.ok) {
       this.ctx.ui.notify(`Stop unavailable: ${result.reason}`, result.status === "blocked" ? "warning" : "error");
       return;
@@ -33,7 +33,10 @@ export class OverlayActions {
       this.ctx.ui.notify(stopped.reason ?? `Subagent ${id} was not stopped; artifacts and worktree remain.`, "warning");
       return;
     }
-    this.ctx.ui.notify(`Stopped ${result.run.profile} (${result.run.id}); artifacts and worktree retained.`, "info");
+    const cleanup = result.cleanup as { readonly removed?: boolean; readonly reason?: string } | undefined;
+    this.ctx.ui.notify(cleanup?.removed
+      ? `Stopped ${result.run.profile} (${result.run.id}); writer resources finalized.`
+      : `Stopped ${result.run.profile} (${result.run.id}).${cleanup?.reason ? ` Cleanup requires attention: ${cleanup.reason}` : ""}`, cleanup && !cleanup.removed ? "warning" : "info");
   }
 
   async focusAfterOverlayClosed(id: string): Promise<void> {

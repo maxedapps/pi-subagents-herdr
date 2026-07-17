@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { GenerationSummary, PublicResultView, ResultEnvelopeV1 } from "./contracts.ts";
+import { formatActionNotice, type RunAttention } from "./action-notices.ts";
 import { toPublicResultView } from "./contracts.ts";
 import { ResultCoordinator, type CoordinatorRunView } from "./coordinator.ts";
 import { ResultDeliveryService, type DeliveryItem } from "./delivery.ts";
@@ -34,6 +35,7 @@ export interface ResultManagedRun {
   readonly artifacts?: {
     readonly metadataRoots?: Parameters<typeof listResultEnvelopes>[2];
   };
+  readonly attention?: RunAttention;
 }
 
 export interface ResultServiceHost {
@@ -44,6 +46,8 @@ export interface ResultServiceHost {
   listManagedRuns(): Iterable<ResultManagedRun>;
   getManagedRun(runId: string): ResultManagedRun | undefined;
   persistRunMetadata(runId: string): Promise<void>;
+  refreshAttention?(runId: string): Promise<void>;
+  onResultStageAdvanced?(envelope: ResultEnvelopeV1): void;
   notifyUi(): void;
 }
 
@@ -128,6 +132,7 @@ export function installResultServices(host: ResultServiceHost): {
           };
         }
       }
+      host.onResultStageAdvanced?.(envelope);
       delivery.scheduleFlush();
       host.notifyUi();
     },
@@ -143,6 +148,7 @@ export function installResultServices(host: ResultServiceHost): {
       if (!checkout) return [];
       const items: DeliveryItem[] = [];
       for (const run of host.listManagedRuns()) {
+        await host.refreshAttention?.(run.id);
         const terminalId = run.target?.terminalId ?? run.journal.resources.terminalId;
         const nativeSession = run.target?.nativeSession ?? run.journal.resources.nativeSession;
         const envelopes = await listResultEnvelopes(checkout, run.id, run.artifacts?.metadataRoots);
@@ -157,6 +163,7 @@ export function installResultServices(host: ResultServiceHost): {
               profileName: run.profile.name,
               ...(terminalId === undefined ? {} : { terminalId }),
               ...(nativeSession === undefined ? {} : { nativeSession }),
+              ...(run.attention === undefined ? {} : { actionText: formatActionNotice(run.id, run.attention) }),
             });
           }
         }
@@ -166,6 +173,7 @@ export function installResultServices(host: ResultServiceHost): {
     onStageAdvanced: (envelope: ResultEnvelopeV1) => {
       const run = host.getManagedRun(envelope.runId);
       if (run) run.latestResult = toPublicResultView(envelope);
+      host.onResultStageAdvanced?.(envelope);
       host.notifyUi();
     },
   });
