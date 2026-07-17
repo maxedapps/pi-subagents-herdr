@@ -1,5 +1,6 @@
 import { lstat, readdir, realpath, rm, rmdir } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { parseGenerationResultFileName } from "../results/store.ts";
 import type { ArtifactRoots } from "./paths.ts";
 
 function within(root: string, candidate: string): boolean {
@@ -47,7 +48,9 @@ export async function purgeRuntimeRunArtifacts(roots: ArtifactRoots, runId: stri
   if (results) {
     const resultEntries = await readdir(join(directory, "results"), { withFileTypes: true });
     for (const entry of resultEntries) {
-      if (!entry.isFile() || entry.isSymbolicLink() || !/^generation-[1-9][0-9]*\.json$/.test(entry.name)) throw new Error(`Runtime results directory contains an unsafe entry: ${entry.name}`);
+      if (!entry.isFile() || entry.isSymbolicLink() || parseGenerationResultFileName(entry.name) === undefined) {
+        throw new Error(`Runtime results directory contains an unsafe entry: ${entry.name}`);
+      }
     }
   }
   for (const entry of entries) {

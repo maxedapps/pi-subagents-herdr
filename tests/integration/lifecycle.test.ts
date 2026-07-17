@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { PACKAGE_ASSETS } from "../../src/package-paths.ts";
 import extension from "../../extensions/herdr-subagents/index.ts";
 import {
   registerHerdrSubagentsExtension,
   type SessionRuntime,
 } from "../../src/lifecycle/extension.ts";
+import { ACTION_NOTICE_CUSTOM_TYPE } from "../../src/results/action-notices.ts";
+import { RESULT_CUSTOM_TYPE } from "../../src/results/contracts.ts";
 
 type Handler = (...args: readonly unknown[]) => unknown;
 
@@ -17,12 +19,14 @@ function fakeApi(): {
   tools: Array<{ name: string }>;
   commands: string[];
   messages: Array<{ message: unknown; options: unknown }>;
+  renderers: Map<string, Handler>;
 } {
   const events = new Map<string, Handler>();
   const registrations: string[] = [];
   const tools: Array<{ name: string }> = [];
   const commands: string[] = [];
   const messages: Array<{ message: unknown; options: unknown }> = [];
+  const renderers = new Map<string, Handler>();
   const api = {
     on(event: string, handler: Handler) {
       registrations.push(event);
@@ -30,11 +34,11 @@ function fakeApi(): {
     },
     registerTool(tool: { name: string }) { tools.push(tool); },
     registerCommand(name: string) { commands.push(name); },
-    registerMessageRenderer() {},
+    registerMessageRenderer(customType: string, renderer: Handler) { renderers.set(customType, renderer); },
     getAllTools() { return tools; },
     sendMessage(message: unknown, options: unknown) { messages.push({ message, options }); },
   };
-  return { api: api as unknown as ExtensionAPI, events, registrations, tools, commands, messages };
+  return { api: api as unknown as ExtensionAPI, events, registrations, tools, commands, messages, renderers };
 }
 
 const context = {} as ExtensionContext;
@@ -179,6 +183,53 @@ test("agent_settled notifies delivery queue-drain without status-call reminders"
   fake.events.get("agent_settled")?.({}, context);
   assert.equal(settled, 2);
   assert.equal(fake.messages.length, 0, "reminder loop removed; automatic delivery owns follow-ups");
+});
+
+test("message_end reconciliation runs after Pi's append continuation", async () => {
+  const fake = fakeApi();
+  let reconciled = 0;
+  registerHerdrSubagentsExtension(fake.api, {
+    environment: {},
+    createRuntime() {
+      return {
+        start() {},
+        stop() {},
+        reconcileResultPersistence() { reconciled += 1; },
+      };
+    },
+  });
+  await fake.events.get("session_start")?.({}, context);
+  await fake.events.get("message_end")?.({});
+  await Promise.resolve();
+  assert.equal(reconciled, 0, "a microtask is still inside Pi's pre-append handler boundary");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(reconciled, 1);
+  await fake.events.get("session_shutdown")?.({});
+});
+
+test("result and action custom messages use separate semantic collapsed renderers", () => {
+  const fake = fakeApi();
+  registerHerdrSubagentsExtension(fake.api, { environment: {}, createRuntime: () => ({ start() {}, stop() {} }) });
+  const theme = { fg: (_color: string, text: string) => text } as unknown as Theme;
+  const resultText = [
+    'HERDR_RESULT_V1 {"resultId":"res-1"}',
+    "Subagent result for run-1 (scout) generation 1",
+    "source=pi-final-assistant",
+    "",
+    "Child completed the audit",
+  ].join("\n");
+  const resultRenderer = fake.renderers.get(RESULT_CUSTOM_TYPE)!;
+  const collapsedResult = resultRenderer({ content: resultText }, { expanded: false }, theme) as { render(width: number): string[] };
+  assert.match(collapsedResult.render(160).join("\n"), /Result received · Child completed the audit/);
+  assert.match(collapsedResult.render(160).join("\n"), /Ctrl\+O to expand/);
+  const expandedResult = resultRenderer({ content: resultText }, { expanded: true }, theme) as { render(width: number): string[] };
+  assert.equal(expandedResult.render(500).map((line) => line.trimEnd()).join("\n"), resultText);
+
+  const actionText = 'HERDR_ACTION_REQUIRED_V1 {"noticeId":"act-1"}\nACTION REQUIRED — cleanup required\nreason=inspect retained files';
+  const actionRenderer = fake.renderers.get(ACTION_NOTICE_CUSTOM_TYPE)!;
+  const collapsedAction = actionRenderer({ content: actionText }, { expanded: false }, theme) as { render(width: number): string[] };
+  assert.match(collapsedAction.render(160).join("\n"), /ACTION REQUIRED — cleanup required/);
+  assert.match(collapsedAction.render(160).join("\n"), /reason=inspect retained files/);
 });
 
 test("lifecycle child guard registers only the narrow result bridge", () => {

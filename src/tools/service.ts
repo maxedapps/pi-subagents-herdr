@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { ensureRuntimeGitExcludes } from "../artifacts/git-ignore.ts";
 import { materializeHandoff, parentHandoffWrapperPath } from "../artifacts/handoff.ts";
 import {
@@ -17,7 +17,7 @@ import { ensureSafeArtifactDirectory, writeArtifactAtomic } from "../artifacts/s
 import { purgeRuntimeRunArtifacts } from "../artifacts/purge.ts";
 import { loadSettingsForContext, type HerdrSubagentsSettings } from "../config/settings.ts";
 import type { ArtifactContract } from "../contracts/artifact.ts";
-import { isHarness, type EffectiveLaunchPolicy, type Harness, type LaunchPolicy, type ThinkingLevel, type ToolGrant } from "../contracts/harness.ts";
+import { isHarness, type EffectiveLaunchPolicy, type Harness, type LaunchAdjustment, type LaunchPolicy, type ThinkingLevel, type ToolGrant } from "../contracts/harness.ts";
 import type { AgentProfile } from "../contracts/profile.ts";
 import type { HerdrStatus } from "../contracts/state.ts";
 import type { SessionSnapshot } from "../herdr/protocol.ts";
@@ -57,7 +57,6 @@ import {
   recoverActiveBranchOwnership,
   reconcileOwnership,
   type OwnershipJournalData,
-  type PiBranchEntry,
 } from "../runtime/ownership.ts";
 import { sendToSubagent } from "../runtime/send.ts";
 import {
@@ -250,8 +249,8 @@ function sessionIdentity(context: ExtensionContext): { sessionId: string; sessio
   return { sessionId, ...(sessionPath === undefined ? {} : { sessionPath }) };
 }
 
-function currentBranch(context: ExtensionContext): readonly PiBranchEntry[] {
-  return context.sessionManager.getBranch() as readonly PiBranchEntry[];
+function currentBranch(context: ExtensionContext): readonly SessionEntry[] {
+  return context.sessionManager.getBranch();
 }
 
 function profileTools(pi: ExtensionAPI, profile: AgentProfile): readonly ToolGrant[] {
@@ -997,7 +996,7 @@ export class HerdrToolRuntimeController {
 
     // Full-session entries are never a control source. They preserve abandoned
     // /tree branches and fork/new history as explicit observational records.
-    const manager = context.sessionManager as ExtensionContext["sessionManager"] & { getEntries?: () => readonly PiBranchEntry[] };
+    const manager = context.sessionManager as ExtensionContext["sessionManager"] & { getEntries?: () => readonly SessionEntry[] };
     const allEntries = typeof manager.getEntries === "function" ? manager.getEntries() : currentBranch(context);
     for (const entry of allEntries) {
       if (entry.type !== "custom" || entry.customType !== "herdr-subagents.ownership.v1") continue;
@@ -1129,7 +1128,7 @@ export class HerdrToolRuntimeController {
     );
   }
 
-  async #resolvePolicy(input: StartToolInput, profile: AgentProfile, context: ExtensionContext, settings: HerdrSubagentsSettings): Promise<{ profile: AgentProfile; policy: EffectiveLaunchPolicy } | ToolUnavailableResult> {
+  async #resolvePolicy(input: StartToolInput, profile: AgentProfile, context: ExtensionContext, settings: HerdrSubagentsSettings): Promise<{ profile: AgentProfile; policy: EffectiveLaunchPolicy; adjustments: readonly LaunchAdjustment[] } | ToolUnavailableResult> {
     const harness = input.harness ?? profile.harness ?? settings.defaultHarness;
     const selectedProfile = actualProfile(profile, harness);
     const tools = profileTools(this.#pi, selectedProfile);
@@ -1184,7 +1183,7 @@ export class HerdrToolRuntimeController {
       reviewedExternalResearchTools: childTools.filter((name) => REVIEWED_RESEARCH_TOOLS.has(name)),
     });
     if (soft.research.state === "blocked") return unavailable(soft.diagnostics.map((item) => item.message).join("; "), "blocked");
-    return { profile: selectedProfile, policy: resolution.policy };
+    return { profile: selectedProfile, policy: resolution.policy, adjustments: resolution.adjustments };
   }
 
   start(toolCallId: string, input: StartToolInput, signal?: AbortSignal): Promise<StartToolResult> {
@@ -1220,7 +1219,7 @@ export class HerdrToolRuntimeController {
     if (!discovered) throw new Error(`Unknown or disabled subagent profile: ${input.profile}`);
     const resolved = await this.#resolvePolicy(input, discovered, ready.context, ready.settings);
     if ("ok" in resolved) return resolved;
-    const { profile, policy: parentPolicy } = resolved;
+    const { profile, policy: parentPolicy, adjustments } = resolved;
     const runId = safeRunId();
     await this.#validateArtifactPlan(ready.context.cwd, profile, runId, parentPolicy.harness);
     const runNonce = randomUUID();
@@ -1432,6 +1431,7 @@ export class HerdrToolRuntimeController {
           permissions: policy.permissions,
           isolatedWorktree: policy.requireWorktree,
           broadeningReasons: policy.broadeningReasons,
+          adjustments,
         },
         output: started.output,
         ...(started.started ? {
@@ -1489,6 +1489,7 @@ export class HerdrToolRuntimeController {
             permissions: policy.permissions,
             isolatedWorktree: policy.requireWorktree,
             broadeningReasons: policy.broadeningReasons,
+            adjustments,
           },
           output: EMPTY_OUTPUT,
           reason: managed.failure,
@@ -1681,6 +1682,16 @@ export class HerdrToolRuntimeController {
         }
       } catch { /* optional */ }
     }
+    const resultStatus = result !== undefined
+      ? undefined
+      : run.activeGeneration?.phase === "submitted"
+        ? "capture_pending" as const
+        : run.activeGeneration?.phase === "closed"
+          ? "capture_unavailable" as const
+          : undefined;
+    const resultStatusReason = resultStatus === "capture_unavailable"
+      ? boundUtf8HeadTail(run.activeGeneration?.closedReason ?? "Capture closed without a durable result", 2_048).text
+      : undefined;
     return {
       ok: true,
       run: summary,
@@ -1702,6 +1713,8 @@ export class HerdrToolRuntimeController {
         ...(run.target?.nativeSession === undefined ? {} : { nativeSession: run.target.nativeSession }),
       },
       topology: { ...(summary.workspaceId === undefined ? {} : { workspaceId: summary.workspaceId }), ...(summary.tabId === undefined ? {} : { tabId: summary.tabId }), ...(summary.paneId === undefined ? {} : { paneId: summary.paneId }) },
+      ...(resultStatus === undefined ? {} : { resultStatus }),
+      ...(resultStatusReason === undefined ? {} : { resultStatusReason }),
       ...(result === undefined ? {} : { result }),
       output,
       ...(result === undefined ? {} : { terminalDiagnostic: output }),

@@ -31,8 +31,10 @@ test("skill provides a compact standalone baseline and extension-specific profil
     /`scout`.*Read-only repository reconnaissance/is,
     /`researcher`.*launch blocks/is,
     /`worker`.*isolated writer worktree/is,
-    /Prefer the selected profile's defaults/i,
-    /Broadening can block or require interactive human confirmation/i,
+    /Profiles own their defaults/i,
+    /not merely to improve quality/i,
+    /Higher thinking is clamped and reported/i,
+    /other broadening can block or require human confirmation/i,
   ]) assert.match(skill, contract);
   assert.doesNotMatch(skill, /independent fan-out|staged pipeline|select a runtime|non-interactive agent CLI/i);
 });

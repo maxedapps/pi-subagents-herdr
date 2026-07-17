@@ -1,4 +1,4 @@
-import type { Harness, ThinkingLevel } from "../contracts/harness.ts";
+import type { Harness, LaunchAdjustment, ThinkingLevel } from "../contracts/harness.ts";
 import type { HerdrStatus, RunLifecycle } from "../contracts/state.ts";
 import type { BoundedOutput } from "../runtime/control.ts";
 import type { WorktreeStateView } from "../worktrees/contracts.ts";
@@ -52,6 +52,7 @@ export interface StartToolSuccess {
     readonly permissions: { readonly mutation: boolean; readonly network: boolean };
     readonly isolatedWorktree: boolean;
     readonly broadeningReasons: readonly string[];
+    readonly adjustments: readonly LaunchAdjustment[];
   };
   readonly output: BoundedOutput;
   readonly completion?: StartCompletionPending;
@@ -87,6 +88,8 @@ export interface GetToolSuccess {
   };
   readonly topology: { readonly workspaceId?: string; readonly tabId?: string; readonly paneId?: string };
   /** Captured durable result projection when available (source/stage first). */
+  readonly resultStatus?: "capture_pending" | "capture_unavailable";
+  readonly resultStatusReason?: string;
   readonly result?: {
     readonly resultId: string;
     readonly generation: number;

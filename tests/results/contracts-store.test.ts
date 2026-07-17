@@ -13,11 +13,24 @@ import {
   sha256Text,
 } from "../../src/results/contracts.ts";
 import {
+  generationResultFileName,
   listResultEnvelopes,
+  parseGenerationResultFileName,
   readResultEnvelope,
   updateResultEnvelope,
   writeResultEnvelope,
 } from "../../src/results/store.ts";
+
+test("result filenames use one six-digit positive-generation contract", () => {
+  assert.equal(generationResultFileName(1), "000001.json");
+  assert.equal(generationResultFileName(999_999), "999999.json");
+  assert.equal(parseGenerationResultFileName("000001.json"), 1);
+  assert.equal(parseGenerationResultFileName("999999.json"), 999_999);
+  for (const value of [0, -1, 1_000_000, 1.5, Number.NaN]) assert.throws(() => generationResultFileName(value), /1 through 999999/);
+  for (const name of ["000000.json", "generation-1.json", "000001.txt", "1000000.json", "owner.json"]) {
+    assert.equal(parseGenerationResultFileName(name), undefined);
+  }
+});
 
 test("result IDs are deterministic from immutable facts", () => {
   const a = computeResultId({

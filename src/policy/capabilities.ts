@@ -7,6 +7,7 @@ import type {
   HarnessCapabilities,
   HarnessIntegrationPolicy,
   LaunchFilesystemRevalidation,
+  LaunchAdjustment,
   LaunchOverrides,
   LaunchPolicy,
   OverrideResolution,
@@ -194,6 +195,7 @@ export function resolveMonotonicOverrides(
 
   const broadeningReasons: string[] = [];
   const hardRejections: string[] = [];
+  const adjustments: LaunchAdjustment[] = [];
   const baselineTools = new Map(baseline.tools.map((tool) => [tool.name, tool] as const));
 
   let tools = baseline.tools.map(cloneTool);
@@ -233,9 +235,17 @@ export function resolveMonotonicOverrides(
     }
   }
 
-  const thinking = overrides.thinking ?? baseline.thinking;
-  if (THINKING_ORDER[thinking] > THINKING_ORDER[baseline.thinking]) {
-    broadeningReasons.push(`raises thinking from ${baseline.thinking} to ${thinking}`);
+  const requestedThinking = overrides.thinking ?? baseline.thinking;
+  const thinking = THINKING_ORDER[requestedThinking] > THINKING_ORDER[baseline.thinking]
+    ? baseline.thinking
+    : requestedThinking;
+  if (thinking !== requestedThinking) {
+    adjustments.push({
+      field: "thinking",
+      requested: requestedThinking,
+      effective: thinking,
+      reason: "clamped_to_profile_policy",
+    });
   }
 
   const model = overrides.model ?? baseline.model;
@@ -284,6 +294,6 @@ export function resolveMonotonicOverrides(
     requireWorktree,
     broadeningReasons,
   };
-  if (model !== undefined) return { accepted: true, policy: { ...policy, model } };
-  return { accepted: true, policy };
+  if (model !== undefined) return { accepted: true, policy: { ...policy, model }, adjustments };
+  return { accepted: true, policy, adjustments };
 }

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { PiBranchEntry } from "../runtime/ownership.ts";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { authorizeResultDelivery } from "./delivery.ts";
+import { extractPersistedCustomMessage } from "./persisted-custom-message.ts";
 import { boundUtf8HeadTail } from "./presentation.ts";
 
 export const ACTION_NOTICE_CUSTOM_TYPE = "herdr-subagents.action-required.v1" as const;
@@ -147,23 +147,12 @@ export function formatActionNotice(runId: string, attention: RunAttention): stri
   return lines.join("\n");
 }
 
-function messageText(message: { content?: unknown }): string {
-  if (typeof message.content === "string") return message.content;
-  if (!Array.isArray(message.content)) return "";
-  return message.content
-    .filter((block) => block && typeof block === "object" && (block as { type?: string }).type === "text")
-    .map((block) => String((block as { text?: string }).text ?? ""))
-    .join("");
-}
-
-export function findPersistedActionNotice(branch: readonly PiBranchEntry[], noticeId: string): PiBranchEntry | undefined {
+export function findPersistedActionNotice(branch: readonly SessionEntry[], noticeId: string): SessionEntry | undefined {
   return branch.find((entry) => {
-    if (entry.type !== "message") return false;
-    const message = (entry as { message?: unknown }).message;
-    if (!message || typeof message !== "object") return false;
-    const customType = (message as { customType?: unknown }).customType;
-    if (customType !== ACTION_NOTICE_CUSTOM_TYPE && customType !== "herdr-subagents.result.v1") return false;
-    return messageText(message as { content?: unknown }).split("\n").some((line) => {
+    const message = extractPersistedCustomMessage(entry);
+    if (!message) return false;
+    if (message.customType !== ACTION_NOTICE_CUSTOM_TYPE && message.customType !== "herdr-subagents.result.v1") return false;
+    return message.text.split("\n").some((line) => {
       if (!line.startsWith(`${ACTION_NOTICE_SENTINEL} `)) return false;
       try {
         const parsed = JSON.parse(line.slice(ACTION_NOTICE_SENTINEL.length + 1)) as unknown;
@@ -228,7 +217,7 @@ export class ActionNoticeService {
     if (!context) return;
     const sessionId = context.sessionManager.getSessionId();
     const sessionPath = context.sessionManager.getSessionFile();
-    const branch = context.sessionManager.getBranch() as readonly PiBranchEntry[];
+    const branch = context.sessionManager.getBranch();
     for (const item of await this.#hooks.listQueued()) {
       const auth = authorizeResultDelivery({
         runId: item.runId,
@@ -272,7 +261,7 @@ export class ActionNoticeService {
   async reconcilePersistence(): Promise<void> {
     const context = this.#hooks.getContext();
     if (!context) return;
-    const branch = context.sessionManager.getBranch() as readonly PiBranchEntry[];
+    const branch = context.sessionManager.getBranch();
     for (const item of await this.#hooks.listQueued()) {
       const persisted = findPersistedActionNotice(branch, item.attention.noticeId);
       if (!persisted || item.attention.delivery.stage === "parent_persisted") continue;

@@ -5,7 +5,7 @@ import {
   buildDeliveredText,
   computeDeliveryId,
 } from "../../src/results/delivery.ts";
-import { boundUtf8HeadTail, collapsedPreview, exactToolPayload } from "../../src/results/presentation.ts";
+import { actionCollapsedPreview, boundUtf8HeadTail, collapsedPreview, exactToolPayload, resultCollapsedPreview } from "../../src/results/presentation.ts";
 import { createCapturedResult, capturedToEnvelope } from "../../src/results/contracts.ts";
 import type { PiBranchEntry } from "../../src/runtime/ownership.ts";
 import { ActiveBranchOwnershipJournal } from "../../src/runtime/ownership.ts";
@@ -26,6 +26,25 @@ test("collapsed preview is an ordered prefix of delivered text", () => {
   const preview = collapsedPreview(delivered, 100, 2);
   assert.ok(delivered.startsWith(preview.replace(/…$/, "").split("…")[0] ?? "") || preview.includes("line1"));
   assert.match(preview, /line1/);
+});
+
+test("result and action collapsed previews are semantic and show the expansion hint", () => {
+  const result = [
+    'HERDR_RESULT_V1 {"resultId":"res-1"}',
+    "Subagent result for run-1 (scout) generation 1",
+    "source=pi-final-assistant",
+    "",
+    "## Child summary",
+    "details",
+  ].join("\n");
+  assert.equal(resultCollapsedPreview(result, "Alt+E"), "Result received · ## Child summary\nAlt+E to expand");
+  const action = [
+    'HERDR_ACTION_REQUIRED_V1 {"noticeId":"act-1"}',
+    "ACTION REQUIRED — cleanup required",
+    "run=run-1",
+    "reason=integration missing",
+  ].join("\n");
+  assert.equal(actionCollapsedPreview(action), "ACTION REQUIRED — cleanup required\nreason=integration missing\nCtrl+O to expand");
 });
 
 test("exactToolPayload serializes once for content and details", () => {
@@ -50,7 +69,7 @@ test("delivered text is one result with sentinel and structured-final only", () 
   assert.match(text, /pi-final-assistant/);
   assert.match(text, /structured-final/);
   assert.match(text, /final answer/);
-  assert.doesNotMatch(text, /terminal-fallback|legacy/);
+  assert.doesNotMatch(text, /stage=captured|terminal-fallback|legacy/);
 });
 
 test("terminal results are labeled as bounded transcripts with truncation truth", () => {

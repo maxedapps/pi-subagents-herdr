@@ -36,7 +36,7 @@ Bundled defaults are:
 | `researcher` | Source-backed external research; launch blocks when reviewed research tools are unavailable. |
 | `worker` | Bounded implementation in an isolated writer worktree. |
 
-Custom profiles may exist. Prefer the selected profile's defaults; omit `harness`, `model`, `thinking`, `cwd`, and `worktree` overrides unless the assignment requires them. Broadening can block or require interactive human confirmation.
+Custom profiles may exist. Profiles own their defaults; omit `harness`, `model`, `thinking`, `cwd`, and `worktree` unless the assignment explicitly requires an override—not merely to improve quality. Higher thinking is clamped and reported; other broadening can block or require human confirmation.
 
 ## Run the lifecycle
 

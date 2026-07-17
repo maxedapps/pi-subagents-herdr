@@ -83,6 +83,31 @@ test("capability resolver accepts monotonic narrowing", () => {
   assert.equal(result.policy.thinking, "low");
   assert.equal(result.policy.requireWorktree, true);
   assert.deepEqual(result.policy.broadeningReasons, []);
+  assert.deepEqual(result.adjustments, []);
+});
+
+test("higher thinking is safely clamped and reported without broadening", () => {
+  const restricted = { ...baseline(), thinking: "low" as const };
+  const result = resolveMonotonicOverrides(restricted, { thinking: "high" }, context());
+  assert.equal(result.accepted, true);
+  if (!result.accepted) return;
+  assert.equal(result.policy.thinking, "low");
+  assert.deepEqual(result.policy.broadeningReasons, []);
+  assert.deepEqual(result.adjustments, [{
+    field: "thinking",
+    requested: "high",
+    effective: "low",
+    reason: "clamped_to_profile_policy",
+  }]);
+
+  for (const thinking of ["low", "minimal", "off"] as const) {
+    const narrowed = resolveMonotonicOverrides(restricted, { thinking }, context());
+    assert.equal(narrowed.accepted, true);
+    if (narrowed.accepted) {
+      assert.equal(narrowed.policy.thinking, thinking);
+      assert.deepEqual(narrowed.adjustments, []);
+    }
+  }
 });
 
 test("capability resolver rejects broadening without both trusted setting and human confirmation", () => {

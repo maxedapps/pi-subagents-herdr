@@ -17,6 +17,7 @@ const execFileAsync = promisify(execFile);
 function fixtureApi() {
   const branch: Array<Record<string, unknown>> = [{ type: "message", id: "entry-0", parentId: null }];
   let entry = 0;
+  let confirmations = 0;
   const tools = ["read", "grep", "find", "ls", "bash", "edit", "write"].map((name) => ({ name, description: name, parameters: {}, promptGuidelines: [], sourceInfo: { path: `<builtin:${name}>`, source: "builtin", scope: "temporary", origin: "top-level" } }));
   const api = {
     appendEntry(customType: string, data: unknown) {
@@ -28,7 +29,7 @@ function fixtureApi() {
   const context = (cwd: string) => ({
     cwd, mode: "tui", hasUI: true,
     isProjectTrusted: () => true,
-    ui: { confirm: async () => false },
+    ui: { confirm: async () => { confirmations += 1; return false; } },
     sessionManager: {
       getSessionId: () => "parent-session",
       getSessionFile: () => "/tmp/parent-session.jsonl",
@@ -36,7 +37,7 @@ function fixtureApi() {
       getBranch: () => branch,
     },
   }) as unknown as ExtensionContext;
-  return { api, context, branch };
+  return { api, context, branch, confirmations: () => confirmations };
 }
 
 function reply(request: FakeHerdrRequest, result: JsonValue): JsonValue {
@@ -144,12 +145,15 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
 
     const fullAssignment = `Map every public package export to its defining source and explain any conditional export behavior.\n\n${"Preserve this detailed delegated assignment across runtime reload. ".repeat(8)}`;
     assert.equal(fullAssignment.length > 240, true);
-    const started = await runtime.start("tool-start-1", { profile: "scout", task: fullAssignment });
+    const started = await runtime.start("tool-start-1", { profile: "scout", task: fullAssignment, thinking: "high" });
     assert.equal(started.ok, true);
     if (!started.ok) return;
     assert.equal(started.status, "started");
     assert.equal(started.run.ownership, "current_session");
     assert.equal(started.effective.harness, "pi");
+    assert.equal(started.effective.thinking, "low");
+    assert.deepEqual(started.effective.adjustments, [{ field: "thinking", requested: "high", effective: "low", reason: "clamped_to_profile_policy" }]);
+    assert.equal(fake.confirmations(), 0, "a safe thinking clamp must not prompt for broadening");
     assert.equal(started.effective.isolatedWorktree, false);
     assert.deepEqual(started.completion, {
       pending: true,
@@ -169,6 +173,8 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     const inspected = await runtime.get({ id: started.run.id, lines: 20 });
     assert.equal(inspected.ok, true);
     if (inspected.ok) {
+      assert.equal(inspected.resultStatus, "capture_pending");
+      assert.equal(inspected.resultStatusReason, undefined);
       assert.equal(inspected.output.returnedLines <= 20, true); assert.equal("systemPrompt" in inspected, false);
       assert.deepEqual(Object.keys(inspected.artifacts).sort(), ["metadata"]);
       assert.deepEqual(inspected.runtime, { ephemeralFiles: "retained", piSessionData: "retained" });
@@ -269,6 +275,8 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     const stoppedInspect = await runtime.get({ id: started.run.id });
     assert.equal(stoppedInspect.ok, true);
     if (stoppedInspect.ok) {
+      assert.equal(stoppedInspect.resultStatus, "capture_unavailable");
+      assert.match(stoppedInspect.resultStatusReason ?? "", /capture-unavailable/);
       assert.deepEqual(stoppedInspect.runtime, { ephemeralFiles: "removed", piSessionData: "removed" });
       const stoppedMetadata = JSON.parse(await readFile(stoppedInspect.artifacts.metadata!, "utf8")) as { assignment?: string; runtime: Record<string, unknown> };
       assert.deepEqual(stoppedMetadata.runtime, { ephemeralFiles: "removed" });

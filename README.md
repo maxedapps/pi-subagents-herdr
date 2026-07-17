@@ -45,6 +45,8 @@ subagent_interrupt({ id: "<run>", timeoutMs: 15000 })
 subagent_stop({ id: "<run>", mode: "graceful" })
 ```
 
+Prefer profile defaults and omit optional start overrides unless the task explicitly requires them. A higher `thinking` preference is safely clamped to the profile policy and reported in `effective.adjustments`; other policy broadening remains fail-closed or requires configured human confirmation.
+
 `subagent_status` has one strict flat Google-compatible schema and three execution modes:
 
 - **List:** omit `id`; optional `scope` is `current_session` (default), `project`, `all_owned`, or `global`.
@@ -53,7 +55,7 @@ subagent_stop({ id: "<run>", mode: "graceful" })
 
 Execution rejects cross-mode combinations: `scope` with `id`; `states`, `timeoutMs`, or `lines` without `id`; and `timeoutMs` with `id` but no `states`. Wait preserves semantic `working`, `blocked`, `done`, `idle`, and `unknown` states, abort propagation, timeout errors, ownership defaults, and 50KB/2000-line output bounds. A successful wait returns detailed inspection/output, not only a matched state.
 
-Every successful start reports `completion.pending` with `delivery: "automatic"`. Starts and sends return immediately. Pi children publish the exact structured final assistant response. Claude, Codex, and Grok publish a bounded, ownership-validated Herdr terminal transcript with explicit truncation/revision metadata; it is never presented as an exact final message. Both sources use the same `herdr-subagents.result.v1` store/delivery path. Writer results carry an extension-derived `ACTION REQUIRED` block with exact Git/worktree facts. Later blocked, failed, retained-cleanup, UI, or recovery transitions use deduplicated `herdr-subagents.action-required.v1` follow-ups and the same status/UI attention state. Missing Pi bridge evidence and empty/failed non-Pi terminal reads are capture-unavailable—never an invented result. Parent verification and explicit stop/finalization remain mandatory.
+Every successful start reports `completion.pending` with `delivery: "automatic"`. Starts and sends return immediately. Pi children publish the exact structured final assistant response. Claude, Codex, and Grok publish a bounded, ownership-validated Herdr terminal transcript with explicit truncation/revision metadata; it is never presented as an exact final message. Both sources use the same `herdr-subagents.result.v1` store/delivery path. Automatic results are separate custom messages: collapsed mode shows the first meaningful child line, and Ctrl+O expands the exact bounded parent-visible content. Exact-ID status reports `capture_pending` while a submitted generation awaits its durable envelope and `capture_unavailable` with the close reason when capture ends without one. Writer results carry an extension-derived `ACTION REQUIRED` block with exact Git/worktree facts. Later blocked, failed, retained-cleanup, UI, or recovery transitions use deduplicated `herdr-subagents.action-required.v1` follow-ups and the same status/UI attention state. Missing Pi bridge evidence and empty/failed non-Pi terminal reads are capture-unavailable—never an invented result. Parent verification and explicit stop/finalization remain mandatory.
 
 Placement starts use fresh exact topology checks and retry only explicit `agent_placement_not_found`; exhaustion returns the managed run ID and ordinary stop action. See the architecture and operations guides for details.
 

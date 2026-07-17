@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { PiBranchEntry } from "../runtime/ownership.ts";
 import { recoverActiveBranchOwnership } from "../runtime/ownership.ts";
 import {
@@ -11,6 +11,7 @@ import {
   type DeliveryStage,
   type ResultEnvelopeV1,
 } from "./contracts.ts";
+import { extractPersistedCustomMessage } from "./persisted-custom-message.ts";
 import { boundUtf8HeadTail } from "./presentation.ts";
 import { updateResultEnvelope } from "./store.ts";
 
@@ -45,7 +46,7 @@ export interface DeliveryRuntimeHooks {
 }
 
 const DISPATCH_DEBOUNCE_MS = 50;
-const REDISPATCH_GRACE_MS = 250;
+const PERSISTENCE_SCAN_DELAY_MS = 250;
 
 export function authorizeResultDelivery(input: DeliveryAuthorizationInput): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
   if (input.sessionId !== input.parentSessionId) {
@@ -121,8 +122,8 @@ export function buildDeliveredText(input: {
     })}`,
     `Subagent result for ${envelope.runId} (${profileName}) generation ${envelope.generation}`,
     terminal
-      ? `source=${envelope.source} stage=${envelope.delivery.stage} truncated=${terminal.truncated}; bounded Herdr terminal transcript (not an exact final assistant message)`
-      : `source=${envelope.source} stage=${envelope.delivery.stage}`,
+      ? `source=${envelope.source} truncated=${terminal.truncated}; bounded Herdr terminal transcript (not an exact final assistant message)`
+      : `source=${envelope.source}`,
     "",
   ].join("\n");
   const action = input.actionText ? `\n\n${input.actionText}` : "";
@@ -133,44 +134,47 @@ export function computeDeliveryId(resultId: string, payloadHash: string): string
   return `del-${createHash("sha256").update(`${resultId}\0${payloadHash}`, "utf8").digest("hex").slice(0, 24)}`;
 }
 
-function messageText(message: { content?: unknown }): string {
-  const content = message.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter((block) => block && typeof block === "object" && (block as { type?: string }).type === "text")
-      .map((block) => String((block as { text?: string }).text ?? ""))
-      .join("");
+export interface PersistedResultIdentity {
+  readonly resultId: string;
+  readonly deliveryId: string;
+  readonly runId: string;
+  readonly generation: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseResultSentinel(text: string): PersistedResultIdentity | undefined {
+  const firstLine = text.split("\n", 1)[0] ?? "";
+  if (!firstLine.startsWith(`${RESULT_SENTINEL_PREFIX} `)) return undefined;
+  try {
+    const parsed = JSON.parse(firstLine.slice(RESULT_SENTINEL_PREFIX.length + 1)) as unknown;
+    if (!isRecord(parsed)) return undefined;
+    if (typeof parsed.resultId !== "string" || parsed.resultId.length === 0) return undefined;
+    if (typeof parsed.deliveryId !== "string" || parsed.deliveryId.length === 0) return undefined;
+    if (typeof parsed.runId !== "string" || parsed.runId.length === 0) return undefined;
+    if (!Number.isSafeInteger(parsed.generation) || (parsed.generation as number) < 1) return undefined;
+    return parsed as unknown as PersistedResultIdentity;
+  } catch {
+    return undefined;
   }
-  return "";
 }
 
 export function findPersistedResultMessage(
-  branch: readonly PiBranchEntry[],
-  deliveryId: string,
-): PiBranchEntry | undefined {
+  branch: readonly SessionEntry[],
+  expected: PersistedResultIdentity,
+): SessionEntry | undefined {
   for (const entry of branch) {
-    if (entry.type !== "message") continue;
-    const message = (entry as { message?: unknown }).message;
-    if (!message || typeof message !== "object") continue;
-    if ((message as { customType?: unknown }).customType !== RESULT_CUSTOM_TYPE) continue;
-    const text = messageText(message as { content?: unknown });
-    if (text.includes(deliveryId) || text.includes(`"deliveryId":${JSON.stringify(deliveryId)}`)) return entry;
-  }
-  return undefined;
-}
-
-export function findPersistedResultByResultId(
-  branch: readonly PiBranchEntry[],
-  resultId: string,
-): PiBranchEntry | undefined {
-  for (const entry of branch) {
-    if (entry.type !== "message") continue;
-    const message = (entry as { message?: unknown }).message;
-    if (!message || typeof message !== "object") continue;
-    if ((message as { customType?: unknown }).customType !== RESULT_CUSTOM_TYPE) continue;
-    const text = messageText(message as { content?: unknown });
-    if (text.includes(resultId)) return entry;
+    const message = extractPersistedCustomMessage(entry);
+    if (!message || message.customType !== RESULT_CUSTOM_TYPE) continue;
+    const sentinel = parseResultSentinel(message.text);
+    if (
+      sentinel?.resultId === expected.resultId
+      && sentinel.deliveryId === expected.deliveryId
+      && sentinel.runId === expected.runId
+      && sentinel.generation === expected.generation
+    ) return entry;
   }
   return undefined;
 }
@@ -186,7 +190,6 @@ export class ResultDeliveryService {
   #timer: NodeJS.Timeout | undefined;
   #flushing: Promise<void> | undefined;
   #stopped = false;
-  #parentSettledPending = false;
 
   constructor(hooks: DeliveryRuntimeHooks) {
     this.#hooks = hooks;
@@ -209,8 +212,9 @@ export class ResultDeliveryService {
   }
 
   noteParentSettled(): void {
-    this.#parentSettledPending = true;
-    this.scheduleFlush(REDISPATCH_GRACE_MS);
+    // Settlement is a persistence-scan boundary, never permission to resend a
+    // dispatched result in the same runtime epoch.
+    this.scheduleFlush(PERSISTENCE_SCAN_DELAY_MS);
   }
 
   async flush(): Promise<void> {
@@ -227,7 +231,7 @@ export class ResultDeliveryService {
 
     const sessionId = context.sessionManager.getSessionId();
     const sessionPath = context.sessionManager.getSessionFile();
-    const branch = context.sessionManager.getBranch() as readonly PiBranchEntry[];
+    const branch = context.sessionManager.getBranch();
     const queued = await this.#hooks.listQueued();
     if (queued.length === 0) return;
 
@@ -251,7 +255,16 @@ export class ResultDeliveryService {
       });
       if (!auth.ok) continue;
 
-      const existing = findPersistedResultByResultId(branch, item.envelope.resultId);
+      const provisionalHash = createHash("sha256").update(item.envelope.rawText, "utf8").digest("hex");
+      const deliveryId = item.envelope.delivery.deliveryId
+        ?? computeDeliveryId(item.envelope.resultId, provisionalHash);
+      const identity = {
+        resultId: item.envelope.resultId,
+        deliveryId,
+        runId: item.envelope.runId,
+        generation: item.envelope.generation,
+      };
+      const existing = findPersistedResultMessage(branch, identity);
       if (existing) {
         if (deliveryStageRank(item.envelope.delivery.stage) < deliveryStageRank("parent_persisted")) {
           const advanced = await updateResultEnvelope(checkout, item.envelope.runId, item.envelope.generation, (current) => ({
@@ -281,35 +294,11 @@ export class ResultDeliveryService {
 
       if (item.envelope.delivery.stage === "parent_persisted") continue;
 
-      const inflightSameEpoch = item.envelope.delivery.inFlight
-        && item.envelope.delivery.runtimeEpoch === this.#hooks.runtimeEpoch
-        && item.envelope.delivery.stage === "dispatched"
-        && !this.#parentSettledPending;
-      if (inflightSameEpoch) continue;
+      const dispatchedSameEpoch = item.envelope.delivery.runtimeEpoch === this.#hooks.runtimeEpoch
+        && item.envelope.delivery.stage === "dispatched";
+      if (dispatchedSameEpoch) continue;
 
       // Build payload in memory; freeze deliveredText once at dispatch.
-      const provisionalHash = createHash("sha256").update(item.envelope.rawText, "utf8").digest("hex");
-      const deliveryId = item.envelope.delivery.deliveryId
-        ?? computeDeliveryId(item.envelope.resultId, provisionalHash);
-      const existingDelivery = findPersistedResultMessage(branch, deliveryId);
-      if (existingDelivery) {
-        const advanced = await updateResultEnvelope(checkout, item.envelope.runId, item.envelope.generation, (current) => ({
-          ...current,
-          ...(current.deliveredText === undefined
-            ? { deliveredText: buildDeliveredText({ envelope: current, profileName: item.profileName, deliveryId, ...(item.actionText === undefined ? {} : { actionText: item.actionText }) }) }
-            : {}),
-          delivery: {
-            ...current.delivery,
-            stage: advanceStage(current.delivery.stage, "parent_persisted"),
-            deliveryId: current.delivery.deliveryId ?? deliveryId,
-            parentEntryId: existingDelivery.id,
-            inFlight: false,
-          },
-        }));
-        this.#hooks.onStageAdvanced?.(advanced);
-        continue;
-      }
-
       let sendText = item.envelope.deliveredText;
       const advanced = await updateResultEnvelope(checkout, item.envelope.runId, item.envelope.generation, (current) => {
         const frozen = current.deliveredText ?? buildDeliveredText({
@@ -344,7 +333,6 @@ export class ResultDeliveryService {
       }, { deliverAs: "followUp", triggerTurn: true });
     }
 
-    this.#parentSettledPending = false;
     setTimeout(() => {
       void this.reconcilePersistence().catch(() => undefined);
     }, 0).unref?.();
@@ -354,15 +342,18 @@ export class ResultDeliveryService {
     const context = this.#hooks.getContext();
     const checkout = this.#hooks.getCheckout();
     if (!context || !checkout) return;
-    const branch = context.sessionManager.getBranch() as readonly PiBranchEntry[];
+    const branch = context.sessionManager.getBranch();
     const queued = await this.#hooks.listQueued();
     for (const item of queued) {
       if (item.envelope.delivery.stage !== "dispatched" && item.envelope.delivery.stage !== "captured") continue;
-      const byResult = findPersistedResultByResultId(branch, item.envelope.resultId);
-      const byDelivery = item.envelope.delivery.deliveryId
-        ? findPersistedResultMessage(branch, item.envelope.delivery.deliveryId)
-        : undefined;
-      const entry = byResult ?? byDelivery;
+      const deliveryId = item.envelope.delivery.deliveryId
+        ?? computeDeliveryId(item.envelope.resultId, createHash("sha256").update(item.envelope.rawText, "utf8").digest("hex"));
+      const entry = findPersistedResultMessage(branch, {
+        resultId: item.envelope.resultId,
+        deliveryId,
+        runId: item.envelope.runId,
+        generation: item.envelope.generation,
+      });
       if (!entry) continue;
       const advanced = await updateResultEnvelope(checkout, item.envelope.runId, item.envelope.generation, (current) => ({
         ...current,

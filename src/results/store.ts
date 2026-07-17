@@ -12,10 +12,19 @@ import {
   type ResultEnvelopeV1,
 } from "./contracts.ts";
 
-const GENERATION_FILE = /^\d{6}\.json$/;
+const GENERATION_FILE = /^(\d{6})\.json$/;
+
+export function parseGenerationResultFileName(name: string): number | undefined {
+  const match = GENERATION_FILE.exec(name);
+  if (!match) return undefined;
+  const generation = Number.parseInt(match[1]!, 10);
+  return generation >= 1 ? generation : undefined;
+}
 
 export function generationResultFileName(generation: number): string {
-  if (!Number.isSafeInteger(generation) || generation < 1) throw new Error("Result generation must be a positive integer");
+  if (!Number.isSafeInteger(generation) || generation < 1 || generation > 999_999) {
+    throw new Error("Result generation must be an integer from 1 through 999999");
+  }
   return `${String(generation).padStart(6, "0")}.json`;
 }
 
@@ -121,9 +130,8 @@ export async function listResultEnvelopes(
     throw error;
   }
   const generations = names
-    .filter((name) => GENERATION_FILE.test(name))
-    .map((name) => Number.parseInt(name.slice(0, 6), 10))
-    .filter((value) => Number.isSafeInteger(value) && value >= 1)
+    .map(parseGenerationResultFileName)
+    .filter((value): value is number => value !== undefined)
     .sort((left, right) => left - right);
   const envelopes: ResultEnvelopeV1[] = [];
   for (const generation of generations) {

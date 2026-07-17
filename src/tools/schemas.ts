@@ -5,18 +5,22 @@ import { HARNESSES } from "../contracts/harness.ts";
 const strict = { additionalProperties: false } as const;
 const RunId = Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$" });
 const Timeout = Type.Integer({ minimum: 1, maximum: 86_400_000 });
-const Thinking = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const);
-const Harness = StringEnum(HARNESSES);
+const Thinking = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
+  description: "Optional preference; omit to use the profile default. Higher values may be clamped and reported.",
+});
+const Harness = StringEnum(HARNESSES, {
+  description: "Omit to use the profile/default harness; set only when the task explicitly requires another harness.",
+});
 const SubagentState = StringEnum(["working", "blocked", "done", "idle", "unknown"] as const);
 
 export const StartToolSchema = Type.Object({
   profile: Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$", description: "Discovered subagent profile runtime name" }),
   task: Type.String({ minLength: 1, maxLength: 262_144, description: "One bounded delegated task" }),
   harness: Type.Optional(Harness),
-  model: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Omit by default; set only when the task explicitly requires a reviewed model override." })),
   thinking: Type.Optional(Thinking),
-  cwd: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
-  worktree: Type.Optional(StringEnum(["auto", "shared", "isolated"] as const)),
+  cwd: Type.Optional(Type.String({ minLength: 1, maxLength: 4096, description: "Omit by default; set only when the task explicitly requires another trusted directory." })),
+  worktree: Type.Optional(StringEnum(["auto", "shared", "isolated"] as const, { description: "Omit by default; set only when the task explicitly requires a worktree mode." })),
 }, strict);
 
 /**

@@ -28,7 +28,7 @@ subagent_status({ id: "<id>", lines: 160 })
 subagent_status({ scope: "all_owned" })
 ```
 
-Results arrive automatically: Pi delivers an exact structured final; Claude, Codex, and Grok deliver a bounded Herdr terminal transcript labeled with source/truncation. A writer result can include `ACTION REQUIRED` with exact checkout/branch/base/HEAD/clean/ahead facts and the next stop/integration step. Later blockers, failures, cleanup refusals, and recovery issues use a deduplicated follow-up message and the same `run.attention` status/TUI state. Treat it as unresolved until cleanup succeeds or an explicit blocker is reported.
+Results arrive automatically as separate custom messages: Pi delivers an exact structured final; Claude, Codex, and Grok deliver a bounded Herdr terminal transcript labeled with source/truncation. Collapsed result messages show the first meaningful child line; Ctrl+O expands the exact bounded parent-visible content. Exact-ID status shows `capture_pending` while a submitted generation has no durable envelope and `capture_unavailable` plus its bounded close reason when capture closes without one. A writer result can include `ACTION REQUIRED` with exact checkout/branch/base/HEAD/clean/ahead facts and the next stop/integration step. Later blockers, failures, cleanup refusals, and recovery issues use a deduplicated follow-up message and the same `run.attention` status/TUI state. Treat it as unresolved until cleanup succeeds or an explicit blocker is reported.
 
 Blocked state is not permission to self-approve. Use one bounded same-assignment follow-up when appropriate. For send/interrupt, inspect `unconfirmed` and `uncertain`; never retry uncertain input automatically.
 

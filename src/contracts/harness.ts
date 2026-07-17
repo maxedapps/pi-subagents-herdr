@@ -67,8 +67,15 @@ export interface EffectiveLaunchPolicy extends LaunchPolicy {
   readonly broadeningReasons: readonly string[];
 }
 
+export interface LaunchAdjustment {
+  readonly field: "thinking";
+  readonly requested: ThinkingLevel;
+  readonly effective: ThinkingLevel;
+  readonly reason: "clamped_to_profile_policy";
+}
+
 export type OverrideResolution =
-  | { readonly accepted: true; readonly policy: EffectiveLaunchPolicy }
+  | { readonly accepted: true; readonly policy: EffectiveLaunchPolicy; readonly adjustments: readonly LaunchAdjustment[] }
   | { readonly accepted: false; readonly reasons: readonly string[] };
 
 /** Result of the mandatory filesystem check immediately before process/resource launch. */

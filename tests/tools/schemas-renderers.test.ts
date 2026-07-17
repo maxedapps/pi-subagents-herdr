@@ -5,6 +5,7 @@ import { StartToolSchema, StatusToolSchema, StopToolSchema, assertStatusToolInpu
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { boundedResultText, renderToolResult } from "../../src/tools/renderers.ts";
 import { TOOL_NAMES, TOOL_KEYS } from "../../src/tools/names.ts";
+import { registerStartTool } from "../../src/tools/start.ts";
 import { registerStatusTool } from "../../src/tools/status.ts";
 
 test("tool schemas are strict, bounded, and Google-compatible", () => {
@@ -21,6 +22,23 @@ test("tool schemas are strict, bounded, and Google-compatible", () => {
   assert.equal(Value.Check(StopToolSchema, { id: "run-1", mode: "force", cleanup: "remove_if_safe", integration: { kind: "no_changes" } }), true);
   assert.equal(Value.Check(StopToolSchema, { id: "run-1", mode: "discard" }), false);
   for (const schema of [StartToolSchema, StatusToolSchema, StopToolSchema]) assert.doesNotMatch(JSON.stringify(schema), /anyOf|oneOf/);
+});
+
+test("subagent_start metadata prefers profile defaults and reports thinking clamps concisely", () => {
+  let definition: { description: string; promptGuidelines?: string[] } | undefined;
+  const pi = { registerTool(value: typeof definition) { definition = value; } } as unknown as ExtensionAPI;
+  registerStartTool(pi, { start: async () => ({ ok: false, status: "blocked", reason: "unused" }) } as never, "subagent_start");
+  assert.match(definition!.description, /Prefer profile defaults/);
+  assert.match(definition!.description, /thinking may be clamped and reported/);
+  assert.match(definition!.description, /delivers results automatically/);
+  assert.equal((definition!.promptGuidelines ?? []).length <= 2, true);
+  assert.match((definition!.promptGuidelines ?? []).join("\n"), /Omit optional overrides unless required/);
+  assert.match((definition!.promptGuidelines ?? []).join("\n"), /adjustments and ACTION REQUIRED/);
+
+  const properties = (StartToolSchema as unknown as { properties: Record<string, { description?: string }> }).properties;
+  for (const field of ["harness", "model", "thinking", "cwd", "worktree"]) assert.equal(typeof properties[field]?.description, "string", `${field} needs actionable guidance`);
+  assert.match(properties.thinking!.description!, /may be clamped and reported/);
+  for (const field of ["harness", "model", "cwd", "worktree"]) assert.match(properties[field]!.description!, /Omit/);
 });
 
 test("subagent_status execution modes reject every invalid cross-field combination", () => {
