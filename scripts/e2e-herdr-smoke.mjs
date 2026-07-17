@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --throw-deprecation
 import "tsx/esm";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
@@ -35,7 +35,7 @@ if (!confirmed) {
       "Provide exactly one current Pi identity: --parent-session-id <id> or --parent-session-path <jsonl>.",
       `Ensure ${harness} is installed, integrated with Herdr, authenticated, and authorized to consume model quota.`,
     ],
-    command: `node scripts/e2e-herdr-smoke.mjs --harness ${harness} --scenario ${scenario} --confirm-model --parent-session-path <current-pi-session.jsonl>`,
+    command: `node --throw-deprecation scripts/e2e-herdr-smoke.mjs --harness ${harness} --scenario ${scenario} --confirm-model --parent-session-path <current-pi-session.jsonl>`,
   }, null, 2)}\n`);
   process.exit(0);
 }

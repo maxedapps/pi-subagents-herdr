@@ -24,6 +24,8 @@ npm run check
 pi install /absolute/path/to/pi-subagents-herdr
 ```
 
+`npm ci` currently reports `node-domexception@1.0.0` from Pi's dev-only Google authentication graph. This is a reviewed upstream exception pending [fetch-blob's unreleased removal](https://github.com/node-fetch/fetch-blob/pull/176); overrides and warning suppression are intentionally rejected. `npm run deps:deprecations` audits lock metadata and fails for any new, widened, or stale exception.
+
 Remove with `pi remove /absolute/path/to/pi-subagents-herdr`. Restart Pi or use `/reload`, then run `/subagents-doctor` and `/subagents`.
 
 For an exact private archive install/load qualification, use `npm run pack:inspect`. It packs once, installs that exact archive under a temporary prefix, verifies the parent-only package skill, verifies ordinary child fixture-skill discovery without `--no-skills`, checks child guards/package-relative resources, and removes the temporary environment.

@@ -9,6 +9,7 @@ import { reconcileWriterLeaseWithHerdr, identifyCheckout, WriterLeaseStore, Writ
 import type { HerdrRequestClient } from "../../src/herdr/client.ts";
 import type { WriterBinding } from "../../src/worktrees/contracts.ts";
 import { agent, pane, snapshot } from "../herdr/fixtures.ts";
+import { strictTsxArgs } from "../support/strict-node.ts";
 
 const execFileAsync = promisify(execFile);
 async function repository(): Promise<{ root: string; dispose(): Promise<void> }> {
@@ -27,8 +28,7 @@ function proof(value: WriterBinding, state: "live" | "gone" | "uncertain", reaso
 }
 
 async function runChild(args: readonly string[]): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
-  const loader = import.meta.resolve("tsx");
-  const child = spawn(process.execPath, ["--import", loader, "tests/support/writer-lease-child.ts", ...args], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, strictTsxArgs("tests/support/writer-lease-child.ts", ...args), { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
   let stdout = ""; let stderr = ""; child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8"); child.stdout.on("data", (value) => { stdout += value; }); child.stderr.on("data", (value) => { stderr += value; });
   const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.on("close", (code, signal) => resolve({ code, signal })));
   return { ...result, stdout, stderr };

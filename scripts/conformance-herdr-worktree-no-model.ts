@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --throw-deprecation --import tsx
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { access, realpath } from "node:fs/promises";

@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ensureRuntimeGitExcludes, PROGRESS_EXCLUDE_RULE, SUBAGENTS_EXCLUDE_RULE } from "../../src/artifacts/git-ignore.ts";
+import { strictTsxArgs } from "../support/strict-node.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -79,11 +80,10 @@ test("pre-existing untracked .progress is not hidden without confirmation", asyn
 test("cross-process lock prevents duplicate or torn exclude rules", async () => {
   const fx = await repository();
   try {
-    const loader = import.meta.resolve("tsx");
     const helper = resolve("tests/support/git-ignore-child.ts");
     await Promise.all(Array.from({ length: 8 }, () => execFileAsync(
       process.execPath,
-      ["--import", loader, helper, fx.root],
+      strictTsxArgs(helper, fx.root),
       { cwd: process.cwd(), timeout: 30_000 },
     )));
     const exclude = await readFile(await excludePath(fx.root), "utf8");

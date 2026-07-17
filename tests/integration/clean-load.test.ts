@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { strictTsxArgs } from "../support/strict-node.ts";
 
 const execFileAsync = promisify(execFile);
 
 test("clean load imports and invokes the factory without runtime side effects", async () => {
-  const result = await execFileAsync(process.execPath, ["--import", "tsx", "scripts/smoke-load.ts"], {
+  const result = await execFileAsync(process.execPath, strictTsxArgs("scripts/smoke-load.ts"), {
     cwd: process.cwd(),
     env: { ...process.env, PI_HERDR_SUBAGENT: "0" },
   });

@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import test from "node:test";
 import { startFakeHerdrServer, type FakeHerdrServer } from "../support/fake-herdr-server.ts";
+import { strictTsxArgs } from "../support/strict-node.ts";
 import { layout, pane, snapshot, success, tab } from "./fixtures.ts";
 
 const execFileAsync = promisify(execFile);
@@ -29,7 +30,7 @@ test("operator no-model conformance script creates no-focus and closes only its 
     }
   });
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "scripts/conformance-herdr-no-model.ts"], { cwd: process.cwd(), timeout: 10_000, env: { ...process.env, HERDR_ENV: "1", HERDR_SOCKET_PATH: server.socketPath, HERDR_PANE_ID: "w1:p1", HERDR_TAB_ID: "w1:t1", HERDR_WORKSPACE_ID: "w1" } });
+    const result = await execFileAsync(process.execPath, strictTsxArgs("scripts/conformance-herdr-no-model.ts"), { cwd: process.cwd(), timeout: 10_000, env: { ...process.env, HERDR_ENV: "1", HERDR_SOCKET_PATH: server.socketPath, HERDR_PANE_ID: "w1:p1", HERDR_TAB_ID: "w1:t1", HERDR_WORKSPACE_ID: "w1" } });
     const report = JSON.parse(result.stdout); assert.equal(report.ok, true); assert.equal(report.retained.length, 0);
     assert.deepEqual(server.requests.filter((request) => request.method === "pane.close").map((request) => request.params), [{ pane_id: "w1:p-test" }]);
     assert.equal(server.requests.some((request) => request.method === "agent.start"), false);

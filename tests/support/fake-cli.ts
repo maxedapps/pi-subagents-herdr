@@ -20,7 +20,7 @@ export async function createFakeCliFixture(environmentKeys: readonly string[] = 
   const directory = await realpath(await mkdtemp(join(tmpdir(), "pi-herdr-fake-cli-")));
   const executable = join(directory, "fake-cli.mjs");
   const capturePath = join(directory, "capture.json");
-  const source = `#!/usr/bin/env node
+  const source = `#!/usr/bin/env -S node --throw-deprecation
 import { writeFile } from "node:fs/promises";
 let stdin = "";
 process.stdin.setEncoding("utf8");

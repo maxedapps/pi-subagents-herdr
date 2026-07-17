@@ -14,7 +14,7 @@ export interface FakePtyCliFixture {
 export async function createFakePtyCliFixture(): Promise<FakePtyCliFixture> {
   const directory = await mkdtemp(join(tmpdir(), "pi-herdr-pty-"));
   const executable = join(directory, "interactive.mjs");
-  await writeFile(executable, `#!/usr/bin/env node
+  await writeFile(executable, `#!/usr/bin/env -S node --throw-deprecation
 if (process.stdin.isTTY && process.stdin.setRawMode) process.stdin.setRawMode(true);
 process.stdin.resume();
 process.stdout.write("SCREEN:READY\\n");

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --throw-deprecation --import tsx
 import { randomUUID } from "node:crypto";
 import { HerdrClient } from "../src/herdr/client.ts";
 import { HerdrNdjsonTransport } from "../src/herdr/transport.ts";

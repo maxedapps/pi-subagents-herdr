@@ -48,6 +48,7 @@ const required = [
   "package/scripts/smoke-load.ts",
   "package/scripts/e2e-herdr-smoke.mjs",
   "package/scripts/check-doc-links.mjs",
+  "package/scripts/check-deprecated-dependencies.mjs",
   "package/docs/architecture.md",
   "package/docs/profile-reference.md",
   "package/docs/operations.md",
@@ -77,17 +78,18 @@ for (const path of expectedPublishedFiles) {
 
 const packedManifest = JSON.parse(execFileSync("tar", ["-xOzf", archivePath, "package/package.json"], { encoding: "utf8" }));
 const packedScriptContracts = {
-  "conformance:herdr:no-model": { command: "tsx scripts/conformance-herdr-no-model.ts", file: "package/scripts/conformance-herdr-no-model.ts" },
-  "conformance:herdr:worktree:no-model": { command: "tsx scripts/conformance-herdr-worktree-no-model.ts", file: "package/scripts/conformance-herdr-worktree-no-model.ts" },
-  "protocol:fixtures": { command: "node scripts/update-herdr-protocol-fixtures.mjs", file: "package/scripts/update-herdr-protocol-fixtures.mjs" },
-  "e2e:herdr:real": { command: "node scripts/e2e-herdr-smoke.mjs", file: "package/scripts/e2e-herdr-smoke.mjs" },
-  "docs:check": { command: "node scripts/check-doc-links.mjs", file: "package/scripts/check-doc-links.mjs" },
+  "conformance:herdr:no-model": { command: "node --throw-deprecation --import tsx scripts/conformance-herdr-no-model.ts", file: "package/scripts/conformance-herdr-no-model.ts" },
+  "conformance:herdr:worktree:no-model": { command: "node --throw-deprecation --import tsx scripts/conformance-herdr-worktree-no-model.ts", file: "package/scripts/conformance-herdr-worktree-no-model.ts" },
+  "protocol:fixtures": { command: "node --throw-deprecation scripts/update-herdr-protocol-fixtures.mjs", file: "package/scripts/update-herdr-protocol-fixtures.mjs" },
+  "e2e:herdr:real": { command: "node --throw-deprecation scripts/e2e-herdr-smoke.mjs", file: "package/scripts/e2e-herdr-smoke.mjs" },
+  "docs:check": { command: "node --throw-deprecation scripts/check-doc-links.mjs", file: "package/scripts/check-doc-links.mjs" },
+  "deps:deprecations": { command: "node --throw-deprecation scripts/check-deprecated-dependencies.mjs package-lock.json", file: "package/scripts/check-deprecated-dependencies.mjs" },
 };
 for (const [name, contract] of Object.entries(packedScriptContracts)) {
   if (packedManifest.scripts?.[name] !== contract.command) throw new Error(`Packed script ${name} does not match its executable contract`);
   if (!listing.includes(contract.file)) throw new Error(`Packed script ${name} points to missing archive file ${contract.file}`);
 }
-if (packedManifest.dependencies?.tsx !== "4.20.6") throw new Error("Packed no-model TypeScript operator script requires tsx as an exact runtime dependency");
+if (packedManifest.dependencies?.tsx !== "4.23.1") throw new Error("Packed no-model TypeScript operator script requires tsx as an exact runtime dependency");
 if (packedManifest.private !== true || packedManifest.license !== undefined || packedManifest.repository !== undefined || packedManifest.publishConfig !== undefined) throw new Error("Packed manifest violates the private legal/publication hold");
 
 const forbiddenFragments = ["/.plans/", "/.progress/", "/.subagents/", "/tests/", "/node_modules/"];
@@ -211,13 +213,14 @@ process.stdout.write("packed-isolated-load ok: extension import closure + contra
   };
   delete environment.NODE_OPTIONS;
   delete environment.NODE_PATH;
+  const strictExecutionEnvironment = { ...environment, NODE_OPTIONS: "--throw-deprecation" };
 
   const tsxBin = join(installRoot, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
   if (!existsSync(tsxBin)) throw new Error("Exact archive runtime dependency did not install an isolated tsx executable");
   isolatedLoadOutput = execFileSync(
     tsxBin,
     [join(temporaryRoot, "runner.mjs"), installedPackage],
-    { cwd: temporaryRoot, env: environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: temporaryRoot, env: strictExecutionEnvironment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
   ).trim();
   if (!isolatedLoadOutput.startsWith("packed-isolated-load ok:")) throw new Error(`Unexpected isolated load result: ${isolatedLoadOutput}`);
 
@@ -225,7 +228,7 @@ process.stdout.write("packed-isolated-load ok: extension import closure + contra
     const output = execFileSync(
       "pi",
       ["--mode", "rpc", "--no-session", "--no-builtin-tools", "--no-context-files", ...extraArgs],
-      { cwd: temporaryRoot, env: { ...environment, ...extraEnvironment }, input: '{"id":"commands","type":"get_commands"}\n', encoding: "utf8", timeout: 20_000, stdio: ["pipe", "pipe", "pipe"] },
+      { cwd: temporaryRoot, env: { ...strictExecutionEnvironment, ...extraEnvironment }, input: '{"id":"commands","type":"get_commands"}\n', encoding: "utf8", timeout: 20_000, stdio: ["pipe", "pipe", "pipe"] },
     );
     const response = output.trim().split("\n").map((line) => JSON.parse(line)).find((item) => item.id === "commands");
     if (!response?.success || !Array.isArray(response.data?.commands)) throw new Error(`Isolated Pi RPC package load failed: ${output}`);

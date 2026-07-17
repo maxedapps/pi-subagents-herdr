@@ -8,7 +8,7 @@ const execFileAsync = promisify(execFile);
 
 test("real Herdr E2E is dry-run by default for every selected harness", async (t) => {
   for (const harness of ["pi", "claude", "codex"] as const) await t.test(harness, async () => {
-    const result = await execFileAsync(process.execPath, ["scripts/e2e-herdr-smoke.mjs", "--harness", harness], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000, env: { ...process.env, HERDR_ENV: "", HERDR_SOCKET_PATH: "", HERDR_PANE_ID: "" } });
+    const result = await execFileAsync(process.execPath, ["--throw-deprecation", "scripts/e2e-herdr-smoke.mjs", "--harness", harness], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000, env: { ...process.env, HERDR_ENV: "", HERDR_SOCKET_PATH: "", HERDR_PANE_ID: "" } });
     const report = JSON.parse(result.stdout) as { dryRun: boolean; modelStarted: boolean; harness: string; safety: string[] };
     assert.deepEqual({ dryRun: report.dryRun, modelStarted: report.modelStarted, harness: report.harness }, { dryRun: true, modelStarted: false, harness });
     assert.match(report.safety.join("\n"), /no-focus|No Herdr resource/i);
