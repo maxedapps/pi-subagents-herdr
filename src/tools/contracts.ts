@@ -35,13 +35,6 @@ export interface StartCompletionPending {
   readonly pending: true;
   readonly delivery: "automatic";
   readonly note: string;
-  /** @deprecated Retained for transitional tooling; automatic delivery replaced mandatory status. */
-  readonly requiredTool?: "subagent_status";
-  readonly suggestedInput?: {
-    readonly id: string;
-    readonly states: readonly ["done", "idle", "blocked"];
-    readonly timeoutMs: number;
-  };
 }
 
 export interface StartToolSuccess {

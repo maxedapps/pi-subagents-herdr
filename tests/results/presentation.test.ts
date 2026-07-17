@@ -11,11 +11,14 @@ test("tool renderer expanded mode shows exact deliveredText", () => {
   const collapsed = renderToolResult(payload.details, false, theme).render(120).map((line) => line.trimEnd()).join("\n");
   // Compare source string identity before terminal width padding (plan: pre-wrap byte identity).
   assert.equal(payload.details.deliveredText, payload.content[0].text);
+  assert.deepEqual(result.completion, { pending: true, delivery: "automatic", note: "auto" });
   assert.match(collapsed, /automatic delivery/);
   assert.ok(collapsed.includes("run-1"));
   const expandedSource = payload.details.deliveredText;
   assert.ok(expandedSource.includes('"status": "started"'));
   assert.ok(expandedSource.includes("automatic"));
+  const serialized = JSON.parse(expandedSource) as { completion: Record<string, unknown> };
+  assert.deepEqual(Object.keys(serialized.completion).sort(), ["delivery", "note", "pending"]);
 });
 
 test("boundedResultText remains under model-visible ceiling with valid UTF-8", () => {

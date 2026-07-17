@@ -92,6 +92,8 @@ test("successful start renderer shows automatic delivery pending instead of an u
       completion: { pending: true, delivery: "automatic", note: "auto" },
     },
   };
+  assert.deepEqual(details.result.completion, { pending: true, delivery: "automatic", note: "auto" });
+  assert.deepEqual(Object.keys(JSON.parse(details.deliveredText).completion).sort(), ["delivery", "note", "pending"]);
   const component = renderToolResult(details, false, theme);
   assert.match(component.render(120).join("\n"), /started · result pending · automatic delivery/);
   assert.doesNotMatch(component.render(120).join("\n"), /✓/);

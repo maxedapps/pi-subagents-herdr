@@ -133,9 +133,12 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     assert.equal(started.run.ownership, "current_session");
     assert.equal(started.effective.harness, "pi");
     assert.equal(started.effective.isolatedWorktree, false);
-    assert.equal(started.completion?.pending, true);
-    assert.equal(started.completion?.delivery, "automatic");
-    assert.match(started.completion?.note ?? "", /automatically/i);
+    assert.deepEqual(started.completion, {
+      pending: true,
+      delivery: "automatic",
+      note: "Result will be captured and injected into this parent branch automatically when the child settles. Use subagent_status with the exact ID for live inspection, blockers, or recovery.",
+    });
+    assert.deepEqual(Object.keys(started.completion).sort(), ["delivery", "note", "pending"]);
     const launchRequest = server.requests.find((request) => request.method === "agent.start")!;
     const launchArgv = (launchRequest.params as { argv: string[] }).argv;
     for (const removed of ["--approve", "--no-approve", "--no-skills", "--skill", "--no-prompt-templates"]) {
