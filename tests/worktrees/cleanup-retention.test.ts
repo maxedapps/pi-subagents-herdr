@@ -96,7 +96,7 @@ test("safe removal captures the deterministic parent wrapper for a valid child h
   try {
     await rm(value.handoff);
     await writeFile(value.childHandoff, "validated child result\n");
-    const final = await materializeHandoff({ profile: childWriterProfile(), effectiveMutationCapable: true, handoffPath: value.childHandoff, roots: value.sourceRoots, assignment: "full delegated assignment", finalOutput: "unused fallback" });
+    const final = await materializeHandoff({ profile: childWriterProfile(), effectiveMutationCapable: true, handoffPath: value.childHandoff, roots: value.sourceRoots, assignment: "full delegated assignment", finalOutput: "unused for child writer" });
     assert.equal(final.path, value.handoff);
     assert.equal(final.writer, "parent-wrapper");
     const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1", "reviewed");
@@ -107,21 +107,24 @@ test("safe removal captures the deterministic parent wrapper for a valid child h
   } finally { await value.dispose(); }
 });
 
-test("safe removal captures fallback wrappers for invalid or missing child handoffs", async (t) => {
+test("invalid or missing child handoffs fail closed and block handoff materialization", async (t) => {
   for (const mode of ["invalid", "missing"] as const) await t.test(mode, async () => {
     const value = await fixture();
     try {
       await rm(value.handoff);
       if (mode === "invalid") await writeFile(value.childHandoff, " \n");
-      const final = await materializeHandoff({ profile: childWriterProfile(), effectiveMutationCapable: true, handoffPath: value.childHandoff, roots: value.sourceRoots, assignment: `full ${mode} assignment`, finalOutput: `${mode} terminal fallback` });
-      assert.equal(final.path, value.handoff);
-      const wrapper = await readFile(value.handoff, "utf8");
-      assert.match(wrapper, new RegExp(`full ${mode} assignment`));
-      assert.match(wrapper, new RegExp(`${mode} terminal fallback`));
-      const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1", "reviewed");
-      const fake = fakeHerdr(value.record);
-      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
-      assert.equal(result.removed, true);
+      if (mode === "missing") await rm(value.childHandoff, { force: true });
+      await assert.rejects(
+        materializeHandoff({
+          profile: childWriterProfile(),
+          effectiveMutationCapable: true,
+          handoffPath: value.childHandoff,
+          roots: value.sourceRoots,
+          assignment: `full ${mode} assignment`,
+          finalOutput: "must not substitute for child handoff",
+        }),
+        /Child handoff|not a regular file|ENOENT|must contain non-whitespace/i,
+      );
     } finally { await value.dispose(); }
   });
 });

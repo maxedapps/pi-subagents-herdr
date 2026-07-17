@@ -39,6 +39,8 @@ export interface ChildMetadata {
   readonly profileName: string;
   readonly parentSessionId: string;
   readonly parentSessionPath?: string;
+  /** Pi-only private result-exchange directory for the child bridge. */
+  readonly resultExchangeDirectory?: string;
 }
 
 export interface LaunchContext {

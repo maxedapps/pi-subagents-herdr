@@ -30,6 +30,7 @@ function fakeApi(): {
     },
     registerTool(tool: { name: string }) { tools.push(tool); },
     registerCommand(name: string) { commands.push(name); },
+    registerMessageRenderer() {},
     getAllTools() { return tools; },
     sendMessage(message: unknown, options: unknown) { messages.push({ message, options }); },
   };
@@ -41,7 +42,14 @@ const context = {} as ExtensionContext;
 test("lifecycle extension factory registers strict parent tools and lifecycle without starting resources", () => {
   const fake = fakeApi();
   extension(fake.api);
-  assert.deepEqual(fake.registrations, ["resources_discover", "session_start", "agent_settled", "session_shutdown"]);
+  assert.deepEqual(fake.registrations, [
+    "resources_discover",
+    "session_start",
+    "agent_settled",
+    "message_end",
+
+    "session_shutdown",
+  ]);
   assert.deepEqual(fake.events.get("resources_discover")?.({}), { skillPaths: [PACKAGE_ASSETS.skill] });
   assert.deepEqual(fake.tools.map((tool) => tool.name), [
     "subagent_start", "subagent_status", "subagent_send", "subagent_interrupt", "subagent_stop",
@@ -153,46 +161,44 @@ test("concurrent shutdown waits for startup and stops the runtime once", async (
   assert.equal(stopped, 1);
 });
 
-test("agent_settled sends at most one result-inspection follow-up per claimed generation", async () => {
+test("agent_settled notifies delivery queue-drain without status-call reminders", async () => {
   const fake = fakeApi();
-  let claims = 0;
+  let settled = 0;
   registerHerdrSubagentsExtension(fake.api, {
     environment: {},
     createRuntime() {
       return {
         start() {},
         stop() {},
-        claimResultInspectionReminders() {
-          claims += 1;
-          return claims === 1 ? [
-            { id: "run-1", generation: 1, timeoutMs: 900_000 },
-            { id: "run-2", generation: 1, timeoutMs: 60_000 },
-          ] : [];
-        },
+        noteParentSettled() { settled += 1; },
       };
     },
   });
   await fake.events.get("session_start")?.({}, context);
   fake.events.get("agent_settled")?.({}, context);
   fake.events.get("agent_settled")?.({}, context);
-  assert.equal(fake.messages.length, 1);
-  assert.deepEqual(fake.messages[0]?.options, { deliverAs: "followUp", triggerTurn: true });
-  assert.match(JSON.stringify(fake.messages[0]?.message), /run-1.*run-2/);
-  assert.match(JSON.stringify(fake.messages[0]?.message), /list call does not inspect results/);
+  assert.equal(settled, 2);
+  assert.equal(fake.messages.length, 0, "reminder loop removed; automatic delivery owns follow-ups");
 });
 
-test("lifecycle child guard omits all parent registrations", () => {
+test("lifecycle child guard registers only the narrow result bridge", () => {
   const fake = fakeApi();
   let created = 0;
   const result = registerHerdrSubagentsExtension(fake.api, {
-    environment: { PI_HERDR_SUBAGENT: "1" },
+    environment: {
+      PI_HERDR_SUBAGENT: "1",
+      PI_HERDR_SUBAGENT_RUN_ID: "run-1",
+      PI_HERDR_SUBAGENT_RUN_NONCE: "nonce",
+      PI_HERDR_SUBAGENT_RESULT_EXCHANGE: "/tmp/exchange",
+    },
     createRuntime() {
       created += 1;
       return { start() {}, stop() {} };
     },
   });
-  assert.deepEqual(result, { mode: "child", registeredEvents: [], registeredTools: [] });
-  assert.deepEqual(fake.registrations, []);
+  assert.equal(result.mode, "child");
+  assert.deepEqual(result.registeredTools, []);
+  assert.deepEqual([...result.registeredEvents].sort(), ["agent_settled", "message_end"]);
   assert.deepEqual(fake.tools, []);
   assert.deepEqual(fake.commands, []);
   assert.equal(created, 0);

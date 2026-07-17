@@ -100,17 +100,19 @@ test("run-scoped child wrappers never consume stale cross-run evidence", async (
     const firstPath = resolveArtifactPath(template, firstValues, fx.parentRoots);
     const secondPath = resolveArtifactPath(template, secondValues, fx.parentRoots);
     await writeArtifactAtomic(firstPath, "First-run child evidence.", fx.parentRoots);
+    await writeArtifactAtomic(secondPath, "Second-run child evidence.", fx.parentRoots);
     const second = await materializeHandoff({
       profile: profile("write", "child"), effectiveMutationCapable: true, handoffPath: secondPath, roots: fx.parentRoots,
-      assignment: "Second full assignment", finalOutput: "Second-run final-output fallback.",
+      assignment: "Second full assignment", finalOutput: "unused for child writer",
     });
     assert.equal(second.path, parentHandoffWrapperPath(secondPath));
     assert.equal(await readFile(firstPath, "utf8"), "First-run child evidence.");
-    assert.match(await readFile(second.path, "utf8"), /Second-run final-output fallback/);
+    assert.match(await readFile(second.path, "utf8"), /Second-run child evidence/);
+    assert.doesNotMatch(await readFile(second.path, "utf8"), /First-run child evidence/);
   } finally { await fx.cleanup(); }
 });
 
-test("missing or invalid child handoff is preserved while deterministic wrapper uses final-output fallback", async (t) => {
+test("missing or invalid child handoff fails closed without inventing wrapper body", async (t) => {
   for (const mode of ["missing", "empty", "conflict"] as const) await t.test(mode, async () => {
     const fx = await fixture();
     try {
@@ -119,33 +121,23 @@ test("missing or invalid child handoff is preserved while deterministic wrapper 
       if (mode === "conflict") await mkdir(childPath, { recursive: true });
       const input = {
         profile: profile("write", "child"), effectiveMutationCapable: true, handoffPath: childPath, roots: fx.parentRoots,
-        assignment: `Full ${mode} assignment`, finalOutput: `Fallback for ${mode} child handoff.`,
+        assignment: `Full ${mode} assignment`, finalOutput: `Must not be used for ${mode} child handoff.`,
       } as const;
-      const first = await materializeHandoff(input);
-      const repeated = await materializeHandoff(input);
-      assert.equal(first.writer, "parent-wrapper");
-      assert.equal(first.path, parentHandoffWrapperPath(childPath));
-      assert.equal(repeated.path, first.path);
-      const content = await readFile(first.path, "utf8");
-      assert.match(content, new RegExp(`Full ${mode} assignment`));
-      assert.match(content, new RegExp(`Fallback for ${mode} child handoff`));
+      await assert.rejects(materializeHandoff(input), /Child handoff|not a regular file|ENOENT|must contain non-whitespace/i);
       if (mode === "empty") assert.equal(await readFile(childPath, "utf8"), "  \n");
       if (mode === "conflict") assert.equal((await lstat(childPath)).isDirectory(), true);
     } finally { await fx.cleanup(); }
   });
 });
 
-test("missing child handoff still gets a deterministic wrapper when bounded final output is empty", async () => {
+test("parent writer rejects empty final output", async () => {
   const fx = await fixture();
   try {
-    const childPath = join(fx.parentRoots.checkout, ".subagents", "empty-output-run.handoff.md");
-    const wrapped = await materializeHandoff({
-      profile: profile("write", "child"), effectiveMutationCapable: true, handoffPath: childPath, roots: fx.parentRoots,
-      assignment: "Full assignment retained despite empty output", finalOutput: "  \n",
-    });
-    const content = await readFile(wrapped.path, "utf8");
-    assert.match(content, /Full assignment retained despite empty output/);
-    assert.match(content, /No valid non-empty bounded final output was available at proven stop/);
+    const parentPath = join(fx.parentRoots.checkout, ".subagents", "empty-output-run.handoff.md");
+    await assert.rejects(materializeHandoff({
+      profile: profile("read-only"), effectiveMutationCapable: false, handoffPath: parentPath, roots: fx.parentRoots,
+      assignment: "Full assignment", finalOutput: "  \n",
+    }), /non-empty text/);
   } finally { await fx.cleanup(); }
 });
 

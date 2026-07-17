@@ -1,6 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { Component } from "@earendil-works/pi-tui";
+import { boundUtf8HeadTail, collapsedPreview, extractDeliveredText } from "../results/presentation.ts";
 import type { RunSummary, ToolUnavailableResult } from "./contracts.ts";
 
 function statusColor(theme: Theme, status: string, text: string): string {
@@ -31,6 +32,29 @@ function runLine(run: RunSummary, theme: Theme): string {
 }
 
 export function renderToolResult(result: unknown, expanded: boolean, theme: Theme): Component {
+  // Prefer exact deliveredText when tools use ExactRenderDetails.
+  const delivered = extractDeliveredText(result);
+  if (typeof delivered === "string") {
+    if (!expanded) {
+      const value = result as Record<string, unknown>;
+      const nested = value.result as Record<string, unknown> | undefined;
+      const run = (nested?.run ?? value.run) as RunSummary | undefined;
+      const completion = (nested?.completion ?? value.completion) as { pending?: boolean; delivery?: string } | undefined;
+      if (run && completion?.pending === true) {
+        const label = completion.delivery === "automatic"
+          ? "started · result pending · automatic delivery"
+          : "started · result pending · automatic delivery";
+        return new Text(`${theme.fg("accent", "●")} ${theme.fg("accent", run.id)} ${theme.fg("muted", `${run.profile}/${run.harness}`)} ${theme.fg("warning", label)}\n${theme.fg("muted", collapsedPreview(delivered))}`, 0, 0);
+      }
+      if (run) {
+        return new Text(`${runLine(run, theme)}\n${theme.fg("muted", collapsedPreview(delivered))}`, 0, 0);
+      }
+      return new Text(theme.fg("muted", collapsedPreview(delivered)), 0, 0);
+    }
+    // Expanded: exact model-visible text, nothing reconstructed from richer details.
+    return new Text(delivered, 0, 0);
+  }
+
   if (!result || typeof result !== "object") return new Text(theme.fg("dim", "No result"), 0, 0);
   const value = result as Record<string, unknown>;
   if (value.ok === false) {
@@ -39,28 +63,19 @@ export function renderToolResult(result: unknown, expanded: boolean, theme: Them
   }
   const run = value.run as RunSummary | undefined;
   const runs = value.runs as readonly RunSummary[] | undefined;
-  const completion = value.completion as { pending?: boolean } | undefined;
+  const completion = value.completion as { pending?: boolean; delivery?: string } | undefined;
   let text = run && completion?.pending === true
-    ? `${theme.fg("accent", "●")} ${theme.fg("accent", run.id)} ${theme.fg("muted", `${run.profile}/${run.harness}`)} ${theme.fg("warning", "started · result pending · call subagent_status")}`
+    ? `${theme.fg("accent", "●")} ${theme.fg("accent", run.id)} ${theme.fg("muted", `${run.profile}/${run.harness}`)} ${theme.fg("warning", "started · result pending · automatic delivery")}`
     : run ? runLine(run, theme) : runs ? theme.fg("accent", `${runs.length} subagent${runs.length === 1 ? "" : "s"}`) : theme.fg("success", "✓ Subagent operation complete");
   if (expanded) {
-    const details = run ? {
-      ownership: run.ownership,
-      topology: { workspaceId: run.workspaceId, tabId: run.tabId, paneId: run.paneId, terminalId: run.terminalId },
-      task: run.taskSynopsis,
-      worktree: run.worktree,
-    } : runs?.slice(0, 20).map((item) => ({ id: item.id, status: item.lifecycle === "running" ? item.herdrStatus : item.lifecycle, ownership: item.ownership }));
-    if (details !== undefined) text += `\n${theme.fg("dim", JSON.stringify(details, null, 2))}`;
+    // Fallback only when deliveredText was not provided: show the serialized payload path is preferred.
+    text += `\n${theme.fg("dim", "[expanded metadata unavailable without deliveredText]")}`;
   }
   return new Text(text, 0, 0);
 }
 
+/** Serialize once for model content; UTF-8 head+tail bound. */
 export function boundedResultText(value: unknown): string {
   const text = JSON.stringify(value, null, 2);
-  const maximum = 48 * 1024;
-  if (Buffer.byteLength(text, "utf8") <= maximum) return text;
-  const bytes = Buffer.from(text, "utf8");
-  let end = maximum;
-  while (end > 0 && (bytes[end]! & 0b1100_0000) === 0b1000_0000) end -= 1;
-  return `${bytes.subarray(0, end).toString("utf8")}\n[Tool result text truncated; bounded structured details remain available.]`;
+  return boundUtf8HeadTail(text).text;
 }

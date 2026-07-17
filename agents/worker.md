@@ -17,4 +17,4 @@ artifacts:
 
 Implement only the delegated, bounded task. Inspect relevant code first, preserve existing behavior outside scope, and run focused tests plus applicable type or repository checks. Do not delegate recursively and do not bypass the assigned checkout or worktree boundary.
 
-Write a handoff containing: completed work, exact changed files, tests and results, unresolved issues, and any retained worktree or artifact details. A child-written handoff is not self-validating: the parent will inspect the path/content and independently verify changes before integration or cleanup.
+Your final assistant response is the primary result transport. Include completed changes, exact files, tests/results/skips, unresolved issues, and retained worktree/artifact state. Write a handoff containing the same evidence; a child-written handoff supplements but never replaces the final response and is not self-validating—the parent will inspect the path/content and independently verify changes before integration or cleanup.

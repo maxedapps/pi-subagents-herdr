@@ -68,14 +68,20 @@ export function parentHandoffWrapperPath(path: string): string {
 }
 
 function finalHandoffText(assignment: string, heading: string, output: string): string {
-  if (assignment.trim().length === 0 || assignment.includes("\0")) throw new Error("Full delegated assignment is required for final handoff materialization");
-  const safeOutput = output.trim().length === 0 || output.includes("\0")
-    ? "No valid non-empty bounded final output was available at proven stop."
-    : output;
-  return ["# Subagent handoff", "", "## Assignment", assignment, "", `## ${heading}`, safeOutput].join("\n");
+  if (assignment.trim().length === 0 || assignment.includes("\0")) {
+    throw new Error("Full delegated assignment is required for final handoff materialization");
+  }
+  if (output.trim().length === 0 || output.includes("\0")) {
+    throw new Error("Final handoff requires non-empty text without NUL bytes");
+  }
+  return ["# Subagent handoff", "", "## Assignment", assignment, "", `## ${heading}`, output].join("\n");
 }
 
-/** Preserve child output and always materialize one deterministic parent-owned final handoff. */
+/**
+ * Materialize one deterministic parent-owned final handoff.
+ * Parent writers use the provided final output. Child writers require a valid child handoff file
+ * and wrap it — missing/invalid child content fails closed (no invented substitute body).
+ */
 export async function materializeHandoff(options: MaterializeHandoffOptions): Promise<MaterializedHandoff> {
   const resolution = resolveArtifactWriter(options.profile, options.effectiveMutationCapable);
   const childOrParentPath = assertArtifactPathAllowed(resolve(options.handoffPath), options.roots);
@@ -84,12 +90,8 @@ export async function materializeHandoff(options: MaterializeHandoffOptions): Pr
   let output = options.finalOutput;
   if (resolution.writer === "child") {
     capturePath = assertArtifactPathAllowed(parentHandoffWrapperPath(childOrParentPath), options.roots);
-    try {
-      output = contentText(await readArtifactSafe(childOrParentPath, options.roots), "Child handoff");
-      heading = "Validated child handoff";
-    } catch {
-      heading = "Final output fallback";
-    }
+    output = contentText(await readArtifactSafe(childOrParentPath, options.roots), "Child handoff");
+    heading = "Validated child handoff";
   }
   const content = Buffer.from(finalHandoffText(options.assignment, heading, output), "utf8");
   await writeArtifactExclusiveOrVerifyExact(capturePath, content, options.roots);

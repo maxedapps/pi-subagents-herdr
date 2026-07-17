@@ -133,11 +133,9 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     assert.equal(started.run.ownership, "current_session");
     assert.equal(started.effective.harness, "pi");
     assert.equal(started.effective.isolatedWorktree, false);
-    assert.deepEqual(started.completion, {
-      pending: true,
-      requiredTool: "subagent_status",
-      suggestedInput: { id: started.run.id, states: ["done", "idle", "blocked"], timeoutMs: 900_000 },
-    });
+    assert.equal(started.completion?.pending, true);
+    assert.equal(started.completion?.delivery, "automatic");
+    assert.match(started.completion?.note ?? "", /automatically/i);
     const launchRequest = server.requests.find((request) => request.method === "agent.start")!;
     const launchArgv = (launchRequest.params as { argv: string[] }).argv;
     for (const removed of ["--approve", "--no-approve", "--no-skills", "--skill", "--no-prompt-templates"]) {
@@ -166,9 +164,6 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     childStatus = "blocked"; childRevision += 1; outputRevision += 1; output += "\nneeds clarification";
     const blocked = await runtime.wait({ id: started.run.id, states: ["blocked"], timeoutMs: 2_000 });
     assert.equal(blocked.ok, true);
-    runtime.recordModelResultInspection(started.run.id, "blocked");
-    assert.deepEqual(runtime.claimResultInspectionReminders().map((item) => ({ id: item.id, generation: item.generation })), [{ id: started.run.id, generation: 1 }], "list/UI/direct get and blocked status must not consume the model result obligation");
-    assert.deepEqual(runtime.claimResultInspectionReminders(), [], "one reminder is claimed at most once per generation");
     const sent = await runtime.send({ id: started.run.id, message: "Limit the map to exported symbols", timeoutMs: 2_000 });
     assert.equal(sent.ok, true);
     if (sent.ok) assert.equal((sent.result as { state: string }).state, "working");
@@ -178,8 +173,6 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     childStatus = "done"; childRevision += 1; outputRevision += 1; output += "\ncompleted";
     const waited = await runtime.wait({ id: started.run.id, states: ["done"], timeoutMs: 2_000 });
     assert.equal(waited.ok, true);
-    runtime.recordModelResultInspection(started.run.id, "done");
-    assert.deepEqual(runtime.claimResultInspectionReminders(), [], "terminal ID-specific inspection consumes the latest send generation");
     if (waited.ok) assert.equal((waited.result as { state: string }).state, "done");
     const repeatedWait = await runtime.wait({ id: started.run.id, states: ["done"], timeoutMs: 2_000 });
     assert.equal(repeatedWait.ok, true);
@@ -218,8 +211,9 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
     await writeFile(join(externalPrivateDirectory, "system.md"), "must survive tampered metadata", { mode: 0o600 });
     const untamperedRuntime = beforeReloadMetadata.runtime;
     beforeReloadMetadata.runtime = { ephemeralFiles: "retained", directory: externalPrivateDirectory, systemPrompt: join(externalPrivateDirectory, "system.md"), sessionDirectory: join(externalPrivateDirectory, "sessions") };
-    await writeFile(metadataPath, `${JSON.stringify(beforeReloadMetadata, null, 2)}\n`);
+    // Stop first so background result reconciliation cannot rewrite run.json over the tamper fixture.
     await runtime.stopSession();
+    await writeFile(metadataPath, `${JSON.stringify(beforeReloadMetadata, null, 2)}\n`);
     runtime = new HerdrToolRuntimeController(fake.api, { environment });
     await runtime.startSession(fake.context(root));
     const observed = await runtime.list({ scope: "all_owned" });
@@ -259,7 +253,7 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
       const handoff = await readFile(stoppedInspect.artifacts.handoff!, "utf8");
       assert.match(handoff, /Map every public package export/);
       assert.match(handoff, /completed/);
-      assert.deepEqual((await readdir(join(root, ".subagents", "runs", started.run.id))).sort(), ["handoff.md", "run.json"]);
+      assert.deepEqual((await readdir(join(root, ".subagents", "runs", started.run.id))).sort(), ["handoff.md", "results", "run.json"]);
     }
     await assert.rejects(lstat(liveMetadata.runtime.systemPrompt), /ENOENT/);
     await assert.rejects(lstat(liveMetadata.runtime.sessionDirectory), /ENOENT/);
@@ -272,7 +266,6 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
       childStatus = "done"; childRevision += 1;
       const sequentialStop = await runtime.stop({ id: sequential.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 });
       assert.equal(sequentialStop.ok, true);
-      assert.deepEqual(runtime.claimResultInspectionReminders(), [], "proven stop clears the live result obligation");
       if (sequentialStop.ok) assert.equal((sequentialStop.result as { tabClosed: boolean }).tabClosed, true);
     }
     assert.equal(server.requests.filter((request) => request.method === "tab.create").length, 3, "a freshly closed exact delegation group must be recreated for every sequential run");

@@ -33,8 +33,11 @@ export interface RunSummary {
 
 export interface StartCompletionPending {
   readonly pending: true;
-  readonly requiredTool: "subagent_status";
-  readonly suggestedInput: {
+  readonly delivery: "automatic";
+  readonly note: string;
+  /** @deprecated Retained for transitional tooling; automatic delivery replaced mandatory status. */
+  readonly requiredTool?: "subagent_status";
+  readonly suggestedInput?: {
     readonly id: string;
     readonly states: readonly ["done", "idle", "blocked"];
     readonly timeoutMs: number;
@@ -88,7 +91,21 @@ export interface GetToolSuccess {
     readonly nativeSession?: { readonly kind: "id" | "path"; readonly value: string; readonly source: string };
   };
   readonly topology: { readonly workspaceId?: string; readonly tabId?: string; readonly paneId?: string };
+  /** Captured durable result projection when available (source/stage first). */
+  readonly result?: {
+    readonly resultId: string;
+    readonly generation: number;
+    readonly source: string;
+    readonly deliveryStage: string;
+    readonly rawTextSha256: string;
+    readonly emptyFinal?: boolean;
+    readonly stopReason?: string;
+    readonly deliveredText?: string;
+  };
   readonly output: BoundedOutput;
+  /** Terminal output retained as diagnostics when a structured result exists. */
+  readonly terminalDiagnostic?: BoundedOutput;
+  readonly capturedResultText?: string;
   readonly artifacts: Readonly<Record<string, string>>;
   readonly runtime: {
     readonly ephemeralFiles: "retained" | "removed";

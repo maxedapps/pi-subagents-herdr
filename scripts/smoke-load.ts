@@ -8,11 +8,13 @@ const fakeApi = {
   on(event: string) { events.push(event); },
   registerTool(tool: { name: string }) { tools.push(tool.name); },
   registerCommand(name: string) { commands.push(name); },
+  registerMessageRenderer() {},
   getAllTools() { return []; },
 };
 
 extension(fakeApi as unknown as ExtensionAPI);
-if (events.join(",") !== "resources_discover,session_start,agent_settled,session_shutdown") {
+const expectedEvents = "resources_discover,session_start,agent_settled,message_end,session_shutdown";
+if (events.join(",") !== expectedEvents) {
   throw new Error(`Unexpected clean-load event registrations: ${events.join(",")}`);
 }
 if (tools.join(",") !== "subagent_start,subagent_status,subagent_send,subagent_interrupt,subagent_stop") {

@@ -15,8 +15,40 @@ function journal() {
   value = writer.append(value, "started", { nativeSession: { kind: "id", value: "native-1", source: "herdr:pi" } });
   return { entries, value };
 }
+
 function metadata(root: string) {
-  return { schemaVersion: 3, runId: "run-1", runNonce: "nonce-1", terminalId: "term-1", nativeSession: { kind: "id", value: "native-1", source: "herdr:pi" }, profileName: "scout", profileSource: "/profile.md", harness: "pi", taskSynopsis: "inspect", artifactWriter: "parent", createdAt: 1, policy: { thinking: "low", cwd: root, tools: ["read"], mutation: false, network: false, requireWorktree: false }, artifacts: { metadata: join(root, ".subagents", "runs", "run-1", "run.json"), handoff: join(root, ".subagents", "runs", "run-1", "handoff.md") }, output: { text: "", revision: 0, source: "recent_unwrapped", truncated: false, herdrTruncated: false, localTruncated: false, returnedBytes: 0, returnedLines: 0, maxBytes: 49152, maxLines: 200 }, runtime: { ephemeralFiles: "removed" } } as const;
+  return {
+    schemaVersion: 4,
+    runId: "run-1",
+    runNonce: "nonce-1",
+    terminalId: "term-1",
+    nativeSession: { kind: "id", value: "native-1", source: "herdr:pi" },
+    profileName: "scout",
+    profileSource: "/profile.md",
+    harness: "pi",
+    taskSynopsis: "inspect",
+    artifactWriter: "parent",
+    createdAt: 1,
+    policy: { thinking: "low", cwd: root, tools: ["read"], mutation: false, network: false, requireWorktree: false },
+    artifacts: {
+      metadata: join(root, ".subagents", "runs", "run-1", "run.json"),
+      handoff: join(root, ".subagents", "runs", "run-1", "handoff.md"),
+    },
+    output: {
+      text: "",
+      revision: 0,
+      source: "recent_unwrapped",
+      truncated: false,
+      herdrTruncated: false,
+      localTruncated: false,
+      returnedBytes: 0,
+      returnedLines: 0,
+      maxBytes: 49152,
+      maxLines: 200,
+    },
+    runtime: { ephemeralFiles: "removed" },
+    generation: { nextGeneration: 1, bridgeAvailable: false },
+  } as const;
 }
 
 test("readiness-time native identity extends the monotonic started journal without rebinding terminal identity", () => {
@@ -28,16 +60,13 @@ test("readiness-time native identity extends the monotonic started journal witho
   assert.throws(() => writer.append(value, "started", {}), /must add immutable resource evidence/);
 });
 
-test("legacy schema-3 policy skills remain readable but malformed legacy values are rejected", () => {
-  const root = "/tmp/legacy-metadata";
-  assert.doesNotThrow(() => parseRuntimeRunMetadata({
-    ...metadata(root),
-    policy: { ...metadata(root).policy, skills: [{ name: "legacy", path: "/tmp/legacy-skill/SKILL.md" }] },
-  }));
+test("schema versions other than 4 and policy.skills are rejected", () => {
+  const root = "/tmp/metadata-v4-only";
+  assert.throws(() => parseRuntimeRunMetadata({ ...metadata(root), schemaVersion: 3 }), /malformed/);
   assert.throws(() => parseRuntimeRunMetadata({
     ...metadata(root),
-    policy: { ...metadata(root).policy, skills: [{ name: "legacy", path: "relative.md" }] },
-  }), /policy skills are malformed/);
+    policy: { ...metadata(root).policy, skills: [{ name: "x", path: "/tmp/x/SKILL.md" }] },
+  }), /policy\.skills is not supported/);
 });
 
 test("operational metadata is containment-checked and must exactly match active-branch nonce, terminal, and native session", async () => {

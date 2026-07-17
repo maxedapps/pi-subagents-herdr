@@ -56,10 +56,21 @@ import {
   type PiBranchEntry,
 } from "../runtime/ownership.ts";
 import { sendToSubagent } from "../runtime/send.ts";
-import { assertRuntimeFilesMatchMetadata, assertRuntimeMetadataMatchesJournal, readRuntimeRunMetadata, type RuntimeRunMetadata } from "../runtime/metadata.ts";
-import { StartCleanupError, startSubagent } from "../runtime/start.ts";
+import {
+  assertRuntimeFilesMatchMetadata,
+  assertRuntimeMetadataMatchesJournal,
+  readRuntimeRunMetadata,
+  type RuntimeRunMetadata,
+} from "../runtime/metadata.ts";
+import { StartCleanupError, TurnSubmissionUncertainError, startSubagent } from "../runtime/start.ts";
 import { stopSubagent } from "../runtime/stop.ts";
 import { waitForSubagent } from "../runtime/wait.ts";
+import { toPublicResultView, type GenerationSummary, type PublicResultView } from "../results/contracts.ts";
+import { ResultCoordinator } from "../results/coordinator.ts";
+import { ResultDeliveryService } from "../results/delivery.ts";
+import { boundUtf8HeadTail } from "../results/presentation.ts";
+import { installResultServices, toCoordinatorView } from "../results/service-bridge.ts";
+import { listResultEnvelopes, readResultEnvelope } from "../results/store.ts";
 import type { WorktreeRecord } from "../worktrees/contracts.ts";
 import { WorktreeCleanupManager, type IntegrationVerificationRequest } from "../worktrees/cleanup.ts";
 import { WorktreeManager, WorktreeRegistry } from "../worktrees/manager.ts";
@@ -168,22 +179,20 @@ interface ManagedRun {
   ephemeral?: EphemeralRuntimeFiles;
   worktreeId?: string;
   lastOutput: BoundedOutput;
-  resultGeneration: number;
-  inspectedResultGeneration: number;
-  remindedResultGeneration: number;
+  nextGeneration: number;
+  activeGeneration?: GenerationSummary;
+  schemaVersion: 4;
+  latestResult?: PublicResultView;
   failure?: string;
-}
-
-export interface ResultInspectionReminder {
-  readonly id: string;
-  readonly generation: number;
-  readonly timeoutMs: number;
 }
 
 export interface SessionToolRuntime {
   start(context: ExtensionContext): Promise<void>;
   stop(): Promise<void>;
-  claimResultInspectionReminders(): readonly ResultInspectionReminder[];
+  /** Notify delivery that the parent agent run has settled (queue-drain boundary). */
+  noteParentSettled?(): void;
+  /** Reconcile parent-persisted custom messages after message_end returns. */
+  reconcileResultPersistence?(): Promise<void>;
 }
 
 export interface ToolRuntimeOptions {
@@ -275,7 +284,7 @@ function limitOutputLines(output: BoundedOutput, lines: number): BoundedOutput {
 function runtimeMetadata(run: ManagedRun, terminalId: string, nativeSession = run.journal.resources.nativeSession): RuntimeRunMetadata {
   if (!run.artifacts) throw new Error("Run artifacts must exist before runtime metadata is persisted");
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     runId: run.id,
     runNonce: run.runNonce,
     terminalId,
@@ -304,7 +313,13 @@ function runtimeMetadata(run: ManagedRun, terminalId: string, nativeSession = ru
           directory: run.ephemeral.directory,
           systemPrompt: run.ephemeral.systemPrompt,
           ...(run.ephemeral.sessionDirectory === undefined ? {} : { sessionDirectory: run.ephemeral.sessionDirectory }),
+          ...(run.ephemeral.resultExchangeDirectory === undefined ? {} : { resultExchangeDirectory: run.ephemeral.resultExchangeDirectory }),
         },
+    generation: {
+      nextGeneration: run.nextGeneration,
+      ...(run.activeGeneration === undefined ? {} : { active: run.activeGeneration }),
+      bridgeAvailable: run.policy.harness === "pi" && run.ephemeral?.resultExchangeDirectory !== undefined,
+    },
   };
 }
 
@@ -326,6 +341,9 @@ export class HerdrToolRuntimeController {
   #worktreeManager: WorktreeManager | undefined;
   #worktreeCleanup: WorktreeCleanupManager | undefined;
   #startupIssue: string | undefined;
+  #coordinator: ResultCoordinator | undefined;
+  #delivery: ResultDeliveryService | undefined;
+  #runtimeEpoch = randomUUID();
   readonly #uiListeners = new Set<() => void>();
 
   constructor(pi: ExtensionAPI, options: ToolRuntimeOptions = {}) {
@@ -337,27 +355,20 @@ export class HerdrToolRuntimeController {
     return {
       start: (context) => this.startSession(context),
       stop: () => this.stopSession(),
-      claimResultInspectionReminders: () => this.claimResultInspectionReminders(),
+      noteParentSettled: () => this.noteParentSettled(),
+      reconcileResultPersistence: () => this.reconcileResultPersistence(),
     };
   }
 
-  recordModelResultInspection(id: string, state: HerdrStatus): void {
-    const run = this.#runs.get(id);
-    if (!run || (state !== "done" && state !== "idle")) return;
-    run.inspectedResultGeneration = run.resultGeneration;
+  noteParentSettled(): void {
+    this.#delivery?.noteParentSettled();
+    this.#coordinator?.wake();
   }
 
-  claimResultInspectionReminders(): readonly ResultInspectionReminder[] {
-    const reminders: ResultInspectionReminder[] = [];
-    for (const run of this.#runs.values()) {
-      if (run.resultGeneration <= run.inspectedResultGeneration
-        || run.resultGeneration <= run.remindedResultGeneration
-        || run.lifecycle === "stopped") continue;
-      run.remindedResultGeneration = run.resultGeneration;
-      reminders.push({ id: run.id, generation: run.resultGeneration, timeoutMs: run.profile.timeout ?? 900_000 });
-    }
-    return reminders;
+  async reconcileResultPersistence(): Promise<void> {
+    await this.#delivery?.reconcilePersistence();
   }
+
 
   async startSession(context: ExtensionContext): Promise<void> {
     await this.stopSession();
@@ -365,6 +376,7 @@ export class HerdrToolRuntimeController {
     this.#runs.clear();
     this.#observational.clear();
     this.#startupIssue = undefined;
+    this.#runtimeEpoch = randomUUID();
     try {
       const loaded = await loadSettingsForContext(context);
       this.#settings = loaded.settings;
@@ -384,18 +396,58 @@ export class HerdrToolRuntimeController {
       this.#worktrees = WorktreeRegistry.recover(currentBranch(context), this.#pi);
       this.#worktreeManager = new WorktreeManager(client, this.#groups, this.#worktrees);
       this.#worktreeCleanup = new WorktreeCleanupManager(client, this.#worktrees);
+      this.#installResultServices();
       await this.#recoverLiveRuns();
       this.#subscriptions = new HerdrSubscriptionManager({
         client,
         ownedPaneIds: () => [...this.#runs.values()].flatMap((run) => run.journal.resources.paneId ? [run.journal.resources.paneId] : []),
-        onChange: () => this.#notifyUi(),
+        onChange: () => {
+          this.#notifyUi();
+          this.#coordinator?.wake();
+        },
       });
       await this.#subscriptions.start();
+      this.#coordinator?.start();
+      this.#delivery?.scheduleFlush(0);
     } catch (error) {
       this.#startupIssue = error instanceof Error ? error.message : String(error);
       this.#client = undefined;
       this.#preflight = undefined;
     }
+  }
+
+  #installResultServices(): void {
+    const installed = installResultServices({
+      pi: this.#pi,
+      runtimeEpoch: this.#runtimeEpoch,
+      getContext: () => this.#context,
+      getCheckout: () => this.#context?.cwd,
+      listManagedRuns: () => this.#runs.values(),
+      getManagedRun: (runId) => this.#runs.get(runId),
+      persistRunMetadata: async (runId) => {
+        const run = this.#runs.get(runId);
+        if (run) await this.#persistMetadata(run);
+      },
+      notifyUi: () => this.#notifyUi(),
+    });
+    this.#coordinator = installed.coordinator;
+    this.#delivery = installed.delivery;
+  }
+
+  #resultHost() {
+    return {
+      pi: this.#pi,
+      runtimeEpoch: this.#runtimeEpoch,
+      getContext: () => this.#context,
+      getCheckout: () => this.#context?.cwd,
+      listManagedRuns: () => this.#runs.values(),
+      getManagedRun: (runId: string) => this.#runs.get(runId),
+      persistRunMetadata: async (runId: string) => {
+        const run = this.#runs.get(runId);
+        if (run) await this.#persistMetadata(run);
+      },
+      notifyUi: () => this.#notifyUi(),
+    };
   }
 
   subscribeUi(listener: () => void): () => void {
@@ -414,6 +466,10 @@ export class HerdrToolRuntimeController {
   }
 
   async stopSession(): Promise<void> {
+    await this.#coordinator?.stop();
+    this.#delivery?.stop();
+    this.#coordinator = undefined;
+    this.#delivery = undefined;
     await this.#subscriptions?.stop();
     this.#subscriptions = undefined;
     this.#client = undefined;
@@ -529,8 +585,16 @@ export class HerdrToolRuntimeController {
             directory: metadata.runtime.directory!,
             systemPrompt: metadata.runtime.systemPrompt!,
             ...(metadata.runtime.sessionDirectory === undefined ? {} : { sessionDirectory: metadata.runtime.sessionDirectory }),
+            ...(metadata.runtime.resultExchangeDirectory === undefined ? {} : { resultExchangeDirectory: metadata.runtime.resultExchangeDirectory }),
           }
         : undefined;
+      const generation = metadata.generation;
+      let latestResult: PublicResultView | undefined;
+      try {
+        const envelopes = await listResultEnvelopes(context.cwd, journal.runId, metadataRoots);
+        const last = envelopes.at(-1);
+        if (last) latestResult = toPublicResultView(last);
+      } catch { /* Result files are optional at recovery. */ }
       this.#runs.set(journal.runId, {
         id: journal.runId,
         runNonce: journal.runNonce,
@@ -550,9 +614,10 @@ export class HerdrToolRuntimeController {
         ...(ephemeral === undefined ? {} : { ephemeral }),
         ...(this.#worktrees?.get(journal.runId) === undefined ? {} : { worktreeId: journal.runId }),
         lastOutput: metadata.output,
-        resultGeneration: 0,
-        inspectedResultGeneration: 0,
-        remindedResultGeneration: 0,
+        nextGeneration: generation.nextGeneration,
+        ...(generation.active === undefined ? {} : { activeGeneration: generation.active }),
+        schemaVersion: 4,
+        ...(latestResult === undefined ? {} : { latestResult }),
       });
     }
 
@@ -815,9 +880,8 @@ export class HerdrToolRuntimeController {
       parentBranchEntryId: branchEntryId,
       journal: journalState,
       lastOutput: EMPTY_OUTPUT,
-      resultGeneration: 0,
-      inspectedResultGeneration: 0,
-      remindedResultGeneration: 0,
+      nextGeneration: 1,
+      schemaVersion: 4,
     };
     this.#runs.set(runId, managed);
 
@@ -918,7 +982,14 @@ export class HerdrToolRuntimeController {
         sessionName: `sub-${runId}`,
         ...(managed.ephemeral.sessionDirectory === undefined ? {} : { sessionDirectory: managed.ephemeral.sessionDirectory }),
         systemPromptPath: managed.ephemeral.systemPrompt,
-        metadata: { runId, runNonce, profileName: profile.name, parentSessionId: parent.sessionId, ...(parent.sessionPath === undefined ? {} : { parentSessionPath: parent.sessionPath }) },
+        metadata: {
+          runId,
+          runNonce,
+          profileName: profile.name,
+          parentSessionId: parent.sessionId,
+          ...(parent.sessionPath === undefined ? {} : { parentSessionPath: parent.sessionPath }),
+          ...(managed.ephemeral.resultExchangeDirectory === undefined ? {} : { resultExchangeDirectory: managed.ephemeral.resultExchangeDirectory }),
+        },
       });
       const authorization = this.#authorization(runId, runNonce);
       const started = await startSubagent({
@@ -928,6 +999,11 @@ export class HerdrToolRuntimeController {
         tabId: group.tabId,
         instructions,
         authorization,
+        prepareSubmission: async (raw) => {
+          if (!this.#coordinator) throw new Error("Result coordinator is not available");
+          const preparedGen = await this.#coordinator.prepareGeneration({ runId, originalInput: raw });
+          return preparedGen.wrappedInput;
+        },
         recordStarted: async (agent) => {
           journalState = journal.append(journalState, "started", {
             paneId: agent.pane_id,
@@ -958,10 +1034,15 @@ export class HerdrToolRuntimeController {
       managed.updatedAt = Date.now();
       managed.lastOutput = started.output;
       managed.policy = policy;
-      if (started.started) managed.resultGeneration += 1;
+      if (started.started) {
+        await this.#coordinator?.recordSubmission(runId, "confirmed");
+      } else {
+        await this.#coordinator?.recordSubmission(runId, "blocked");
+      }
       await this.#persistMetadata(managed);
       if (worktree && target.nativeSession) ready.worktrees.bindWriter(worktree.id, { terminalId: target.terminalId, nativeSession: target.nativeSession });
       this.#subscriptions?.ownershipChanged(); this.#notifyUi();
+      this.#coordinator?.wake();
       return {
         ok: true,
         status: started.started ? "started" : "blocked",
@@ -980,12 +1061,8 @@ export class HerdrToolRuntimeController {
         ...(started.started ? {
           completion: {
             pending: true,
-            requiredTool: "subagent_status",
-            suggestedInput: {
-              id: runId,
-              states: ["done", "idle", "blocked"],
-              timeoutMs: profile.timeout ?? 900_000,
-            },
+            delivery: "automatic",
+            note: "Result will be captured and injected into this parent branch automatically when the child settles. Use subagent_status with the exact ID for live inspection, blockers, or recovery.",
           },
         } : { reason: started.reason }),
       };
@@ -994,9 +1071,17 @@ export class HerdrToolRuntimeController {
       managed.herdrStatus = "unknown";
       managed.updatedAt = Date.now();
       managed.failure = error instanceof Error ? error.message : String(error);
+      // Input may have been attempted: never leave the generation stuck in "prepared".
+      if (error instanceof TurnSubmissionUncertainError) {
+        await this.#coordinator?.recordSubmission(runId, "uncertain").catch(() => undefined);
+        managed.target = error.target;
+      }
       const terminalRecorded = managed.journal.resources.terminalId !== undefined;
       const provenGone = error instanceof StartCleanupError && error.cleanup !== "retained";
-      if (!terminalRecorded || provenGone) {
+      // Uncertain submission retains the child and ephemeral exchange for recovery capture.
+      if (error instanceof TurnSubmissionUncertainError) {
+        await this.#persistMetadata(managed).catch(() => undefined);
+      } else if (!terminalRecorded || provenGone) {
         await this.#removeEphemeral(managed).catch(() => undefined);
         await this.#persistMetadata(managed).catch(() => undefined);
       }
@@ -1138,6 +1223,32 @@ export class HerdrToolRuntimeController {
     output = limitOutputLines(output, input.lines ?? 160);
     const summary = await this.#summary(run);
     const parent = sessionIdentity(this.#context!);
+    let result = run.latestResult;
+    if (!result && this.#context) {
+      try {
+        const envelopes = await listResultEnvelopes(this.#context.cwd, run.id, run.artifacts?.metadataRoots);
+        const last = envelopes.at(-1);
+        if (last) {
+          result = toPublicResultView(last);
+          run.latestResult = result;
+        }
+      } catch { /* optional */ }
+    }
+    // Prefer deliveredText when assigned; otherwise surface a bounded raw capture for inspection.
+    let capturedText = result?.deliveredText;
+    if (capturedText === undefined && this.#context) {
+      try {
+        const envelopes = await listResultEnvelopes(this.#context.cwd, run.id, run.artifacts?.metadataRoots);
+        const last = envelopes.at(-1);
+        if (last) {
+          if (!result) {
+            result = toPublicResultView(last);
+            run.latestResult = result;
+          }
+          capturedText = last.deliveredText ?? boundUtf8HeadTail(last.rawText).text;
+        }
+      } catch { /* optional */ }
+    }
     return {
       ok: true,
       run: summary,
@@ -1159,7 +1270,9 @@ export class HerdrToolRuntimeController {
         ...(run.target?.nativeSession === undefined ? {} : { nativeSession: run.target.nativeSession }),
       },
       topology: { ...(summary.workspaceId === undefined ? {} : { workspaceId: summary.workspaceId }), ...(summary.tabId === undefined ? {} : { tabId: summary.tabId }), ...(summary.paneId === undefined ? {} : { paneId: summary.paneId }) },
+      ...(result === undefined ? {} : { result }),
       output,
+      ...(result === undefined ? {} : { terminalDiagnostic: output }),
       artifacts: run.artifacts ? run.artifacts.paths : {},
       runtime: {
         ephemeralFiles: run.ephemeral === undefined ? "removed" : "retained",
@@ -1169,6 +1282,7 @@ export class HerdrToolRuntimeController {
       },
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
+      ...(capturedText === undefined ? {} : { capturedResultText: capturedText }),
     };
   }
 
@@ -1200,22 +1314,66 @@ export class HerdrToolRuntimeController {
     const ready = this.#ready(); if ("ok" in ready) return ready;
     const run = this.#managed(input.id);
     try {
-      const result = await sendToSubagent({ client: ready.client, target: this.#ownedTarget(run), message: input.message, ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }), ...(signal === undefined ? {} : { signal }) });
-      run.herdrStatus = result.state; run.lastOutput = result.output; run.updatedAt = Date.now();
-      run.resultGeneration += 1;
-      await this.#persistMetadata(run); this.#notifyUi();
-      return { ok: true, action: "send", run: await this.#summary(run), result };
+      if (!this.#coordinator) throw new Error("Result coordinator is not available");
+      // End-to-end per-run lock: prepare → pane input → recordSubmission (no interleaving).
+      return await this.#coordinator.runExclusive(run.id, async () => {
+        const allowed = this.#coordinator!.canSubmitGeneration(toCoordinatorView(this.#resultHost(), run));
+        if (!allowed.ok) throw new Error(allowed.reason);
+        const prepared = await this.#coordinator!.prepareGenerationUnlocked({
+          runId: run.id,
+          originalInput: input.message,
+        });
+        const result = await sendToSubagent({
+          client: ready.client,
+          target: this.#ownedTarget(run),
+          message: prepared.wrappedInput,
+          ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+          ...(signal === undefined ? {} : { signal }),
+        });
+        run.herdrStatus = result.state; run.lastOutput = result.output; run.updatedAt = Date.now();
+        if (result.delivery === "confirmed") await this.#coordinator!.recordSubmissionUnlocked(run.id, "confirmed");
+        else if (result.delivery === "unconfirmed") await this.#coordinator!.recordSubmissionUnlocked(run.id, "unconfirmed");
+        else await this.#coordinator!.recordSubmissionUnlocked(run.id, "uncertain");
+        await this.#persistMetadata(run); this.#notifyUi();
+        this.#coordinator!.wake();
+        return {
+          ok: true as const,
+          action: "send" as const,
+          run: await this.#summary(run),
+          result: { ...result, generation: prepared.generation, requestNonce: prepared.requestNonce },
+        };
+      });
     } catch (error) { if (isUnavailableError(error)) return unavailable(error instanceof Error ? error.message : String(error)); throw error; }
+  }
+
+  async #captureHandoffText(run: ManagedRun): Promise<string> {
+    // Prefer full raw capture over bounded model-visible deliveredText.
+    if (this.#context && run.activeGeneration?.generation) {
+      try {
+        const envelope = await readResultEnvelope(this.#context.cwd, run.id, run.activeGeneration.generation, run.artifacts?.metadataRoots);
+        if (envelope?.rawText !== undefined) return envelope.rawText;
+      } catch { /* fall through */ }
+    }
+    if (this.#context) {
+      try {
+        const envelopes = await listResultEnvelopes(this.#context.cwd, run.id, run.artifacts?.metadataRoots);
+        const last = envelopes.at(-1);
+        if (last?.rawText !== undefined) return last.rawText;
+      } catch { /* fall through */ }
+    }
+    if (run.latestResult?.deliveredText) return run.latestResult.deliveredText;
+    return run.lastOutput.text;
   }
 
   async #captureHandoff(run: ManagedRun): Promise<string | undefined> {
     if (!run.artifacts || run.assignment === undefined) return undefined;
+    const finalOutput = await this.#captureHandoffText(run);
     const materialized = await materializeHandoff({
       profile: run.profile,
       effectiveMutationCapable: run.policy.permissions.mutation,
       handoffPath: run.artifacts.paths.handoff!,
       roots: run.artifacts.roots,
-      finalOutput: run.lastOutput.text,
+      finalOutput,
       assignment: run.assignment,
     });
     return materialized.path;
@@ -1250,10 +1408,18 @@ export class HerdrToolRuntimeController {
       const run = this.#managed(input.id); run.lifecycle = "stopping";
       let provenStopped = false;
       try {
+        // Pre-stop reconcile any already-written bridge response.
+        await this.#coordinator?.reconcileRun(run.id);
         const result = await stopSubagent({ client: ready.client, target: this.#ownedTarget(run), ...(input.mode === undefined ? {} : { mode: input.mode }), ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }), ...(signal === undefined ? {} : { signal }) });
         if (result.output.text.trim().length > 0) run.lastOutput = result.output;
         provenStopped = result.stopped;
-        if (result.stopped) run.inspectedResultGeneration = run.resultGeneration;
+        let captureUncertain = false;
+        if (result.stopped) {
+          // Capture barrier: structured Pi bridge only (no terminal invent).
+          const barrier = await this.#coordinator?.captureBarrier(run.id);
+          if (barrier?.envelope) run.latestResult = toPublicResultView(barrier.envelope);
+          captureUncertain = barrier?.uncertain === true || barrier?.durable === false;
+        }
         if (result.tabClosed && !run.worktreeId && run.group) {
           const cached = ready.groups.get(run.group.workspaceId, run.group.group);
           if (cached) ready.groups.forgetClosed(run.group);
@@ -1263,9 +1429,10 @@ export class HerdrToolRuntimeController {
         run.updatedAt = Date.now();
         const finalHandoffPath = result.stopped ? await this.#captureHandoff(run) : undefined;
         if (result.stopped && finalHandoffPath !== undefined) {
-          // Keep the assignment and original child path retryable until both the
-          // ephemeral deletion revalidation and final metadata rewrite succeed.
-          await this.#removeEphemeral(run);
+          // Retain the temporary tree when capture/persistence is uncertain.
+          if (!captureUncertain) {
+            await this.#removeEphemeral(run);
+          }
           const assignment = run.assignment!;
           const priorPaths = run.artifacts!.paths;
           run.artifacts!.paths = { ...priorPaths, handoff: finalHandoffPath };
@@ -1278,6 +1445,11 @@ export class HerdrToolRuntimeController {
             throw error;
           }
         } else if (result.stopped) {
+          // No handoff materialization (missing assignment/artifacts): still remove temp tree
+          // when capture is durable so OS-temp exchange directories do not leak.
+          if (!captureUncertain) {
+            await this.#removeEphemeral(run).catch(() => undefined);
+          }
           await this.#persistMetadata(run);
         }
         let cleanup: unknown;

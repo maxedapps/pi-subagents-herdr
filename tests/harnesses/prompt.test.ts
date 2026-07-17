@@ -26,6 +26,7 @@ test("child instructions preserve mandatory runtime/profile/task/artifact/handof
   assert.match(prompt, /Expanded artifact contract/);
   assert.match(prompt, /the parent owns parent-writer artifacts/);
   assert.match(prompt, /Final handoff shape/);
+  assert.match(prompt, /final assistant response is the primary result transport/i);
   assert.equal(prompt.includes(JSON.stringify(task)), true);
 });
 

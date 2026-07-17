@@ -2,12 +2,19 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Harness, ThinkingLevel } from "../contracts/harness.ts";
 import type { NativeSessionIdentity } from "../contracts/ownership.ts";
+import { parseGenerationSummary, type GenerationSummary } from "../results/contracts.ts";
 import { assertEphemeralRuntimeLayout, type EphemeralRuntimeFiles } from "./ephemeral.ts";
 import type { BoundedOutput } from "./control.ts";
 import type { OwnershipJournalData } from "./ownership.ts";
 
+export interface RuntimeGenerationState {
+  readonly nextGeneration: number;
+  readonly active?: GenerationSummary;
+  readonly bridgeAvailable: boolean;
+}
+
 export interface RuntimeRunMetadata {
-  readonly schemaVersion: 3;
+  readonly schemaVersion: 4;
   readonly runId: string;
   readonly runNonce: string;
   readonly terminalId: string;
@@ -37,7 +44,10 @@ export interface RuntimeRunMetadata {
     readonly directory?: string;
     readonly systemPrompt?: string;
     readonly sessionDirectory?: string;
+    readonly resultExchangeDirectory?: string;
   };
+  /** Live generation/bridge summary. Full captures live in results/*.json. */
+  readonly generation: RuntimeGenerationState;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -71,8 +81,20 @@ function parseOutput(value: unknown): BoundedOutput {
   return value as unknown as BoundedOutput;
 }
 
+function parseGenerationState(value: unknown): RuntimeGenerationState {
+  if (!isRecord(value)) throw new Error("runtime metadata generation state is malformed");
+  if (!Number.isSafeInteger(value.nextGeneration) || (value.nextGeneration as number) < 1) {
+    throw new Error("runtime metadata nextGeneration is malformed");
+  }
+  if (typeof value.bridgeAvailable !== "boolean") throw new Error("runtime metadata bridgeAvailable is malformed");
+  if (value.active !== undefined) parseGenerationSummary(value.active);
+  return value as unknown as RuntimeGenerationState;
+}
+
 export function parseRuntimeRunMetadata(value: unknown): RuntimeRunMetadata {
-  if (!isRecord(value) || value.schemaVersion !== 3 || !isRecord(value.policy) || !isRecord(value.artifacts) || !isRecord(value.runtime)) throw new Error("runtime run metadata is malformed");
+  if (!isRecord(value) || value.schemaVersion !== 4 || !isRecord(value.policy) || !isRecord(value.artifacts) || !isRecord(value.runtime)) {
+    throw new Error("runtime run metadata is malformed");
+  }
   for (const key of ["runId", "runNonce", "terminalId", "profileName", "profileSource", "harness", "taskSynopsis"] as const) nonEmpty(value[key], `runtime metadata ${key}`);
   if (value.assignment !== undefined) nonEmpty(value.assignment, "runtime metadata assignment");
   if (value.artifactWriter !== "parent" && value.artifactWriter !== "child") throw new Error("runtime metadata artifactWriter is malformed");
@@ -80,23 +102,29 @@ export function parseRuntimeRunMetadata(value: unknown): RuntimeRunMetadata {
   if (!Number.isSafeInteger(value.createdAt) || (value.createdAt as number) <= 0) throw new Error("runtime metadata createdAt is malformed");
   const policy = value.policy;
   if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(policy.thinking)) || typeof policy.cwd !== "string" || !Array.isArray(policy.tools) || !policy.tools.every((item) => typeof item === "string") || typeof policy.mutation !== "boolean" || typeof policy.network !== "boolean" || typeof policy.requireWorktree !== "boolean") throw new Error("runtime metadata policy is malformed");
-  if (policy.skills !== undefined && (!Array.isArray(policy.skills) || !policy.skills.every((item) => isRecord(item) && typeof item.name === "string" && item.name.length > 0 && typeof item.path === "string" && isAbsolute(item.path)))) throw new Error("runtime metadata policy skills are malformed");
+  if (policy.skills !== undefined) throw new Error("runtime metadata policy.skills is not supported; remove this field");
   for (const [key, path] of Object.entries(value.artifacts)) { nonEmpty(key, "runtime metadata artifact key"); nonEmpty(path, `runtime metadata artifact ${key}`); if (!isAbsolute(path)) throw new Error(`runtime metadata artifact ${key} must be absolute`); }
   parseOutput(value.output);
   const runtime = value.runtime;
   if (runtime.ephemeralFiles !== "retained" && runtime.ephemeralFiles !== "removed") throw new Error("runtime metadata ephemeralFiles is malformed");
-  for (const key of ["directory", "systemPrompt", "sessionDirectory"] as const) {
+  for (const key of ["directory", "systemPrompt", "sessionDirectory", "resultExchangeDirectory"] as const) {
     if (runtime[key] !== undefined) { nonEmpty(runtime[key], `runtime metadata ${key}`); if (!isAbsolute(runtime[key])) throw new Error(`runtime metadata ${key} must be absolute`); }
   }
   if (runtime.ephemeralFiles === "retained" && (typeof runtime.directory !== "string" || typeof runtime.systemPrompt !== "string" || typeof value.assignment !== "string")) {
     throw new Error("retained runtime metadata requires its run-bound directory, system prompt, and full assignment");
   }
-  if (runtime.ephemeralFiles === "removed" && (runtime.directory !== undefined || runtime.systemPrompt !== undefined || runtime.sessionDirectory !== undefined)) {
+  if (runtime.ephemeralFiles === "removed" && (runtime.directory !== undefined || runtime.systemPrompt !== undefined || runtime.sessionDirectory !== undefined || runtime.resultExchangeDirectory !== undefined)) {
     throw new Error("removed runtime metadata must not claim ephemeral paths");
   }
   if (value.harness === "pi" && runtime.ephemeralFiles === "retained" && typeof runtime.sessionDirectory !== "string") throw new Error("retained Pi runtime metadata requires sessionDirectory");
+  if (value.harness === "pi" && runtime.ephemeralFiles === "retained" && typeof runtime.resultExchangeDirectory !== "string") {
+    throw new Error("retained Pi runtime metadata requires resultExchangeDirectory");
+  }
   if (value.harness !== "pi" && runtime.sessionDirectory !== undefined) throw new Error("Claude/Codex runtime metadata must not claim an unused Pi session directory");
+  if (value.harness !== "pi" && runtime.resultExchangeDirectory !== undefined) throw new Error("Claude/Codex runtime metadata must not claim a Pi result-exchange directory");
   parseNative(value.nativeSession);
+  if (value.generation === undefined) throw new Error("runtime metadata requires generation state");
+  parseGenerationState(value.generation);
   return value as unknown as RuntimeRunMetadata;
 }
 
@@ -106,6 +134,7 @@ function metadataRuntimeFiles(metadata: RuntimeRunMetadata): EphemeralRuntimeFil
     directory: metadata.runtime.directory!,
     systemPrompt: metadata.runtime.systemPrompt!,
     ...(metadata.runtime.sessionDirectory === undefined ? {} : { sessionDirectory: metadata.runtime.sessionDirectory }),
+    ...(metadata.runtime.resultExchangeDirectory === undefined ? {} : { resultExchangeDirectory: metadata.runtime.resultExchangeDirectory }),
   };
 }
 

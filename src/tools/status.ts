@@ -3,22 +3,24 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { HerdrToolRuntimeController } from "./service.ts";
 import { StatusToolSchema, assertStatusToolInput } from "./schemas.ts";
 import { boundedResultText, renderToolCall, renderToolResult } from "./renderers.ts";
+import { exactToolPayload } from "../results/presentation.ts";
 
 export function registerStatusTool(pi: ExtensionAPI, runtime: HerdrToolRuntimeController, name: string): void {
   pi.registerTool({
     name,
     label: "Subagent Status",
-    description: "Observe subagents in exactly one mode: omit id to list an optional scope; provide id without states to inspect details and bounded recent output; provide id with explicit states to wait with a bounded timeout and then return the same detailed inspection. Scope is list-only, timeoutMs is wait-only, and invalid combinations fail.",
+    description: "Observe subagents in exactly one mode: omit id to list an optional scope; provide id without states to inspect details, captured result/source/stage when available, and bounded terminal diagnostics; provide id with explicit states to wait with a bounded timeout and then return the same detailed inspection. Scope is list-only, timeoutMs is wait-only, and invalid combinations fail. Automatic result delivery does not require this tool, but exact-ID inspection remains the recovery path.",
     promptSnippet: "List subagents, inspect one, or wait for states then inspect output",
     promptGuidelines: [
-      "Use subagent_status without id to list; with id to inspect; and with id plus states to wait then inspect. Always resolve blocked, failed, timed-out, or unknown subagents rather than firing and forgetting.",
+      "Use subagent_status without id to list; with id to inspect; and with id plus states to wait then inspect. Resolve blocked, failed, timed-out, or unknown subagents. Results usually arrive automatically; use exact-ID status for live inspection and recovery.",
     ],
     parameters: StatusToolSchema,
     async execute(_toolCallId, params, signal): Promise<AgentToolResult<unknown>> {
       const mode = assertStatusToolInput(params);
       if (mode === "list") {
         const result = await runtime.list(params.scope === undefined ? {} : { scope: params.scope });
-        return { content: [{ type: "text", text: boundedResultText(result) }], details: result };
+        const payload = exactToolPayload(result, boundedResultText);
+        return { content: payload.content, details: payload.details };
       }
       if (mode === "wait") {
         const waited = await runtime.wait({
@@ -26,16 +28,19 @@ export function registerStatusTool(pi: ExtensionAPI, runtime: HerdrToolRuntimeCo
           states: params.states!,
           ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }),
         }, signal);
-        if (!waited.ok) return { content: [{ type: "text", text: boundedResultText(waited) }], details: waited };
+        if (!waited.ok) {
+          const payload = exactToolPayload(waited, boundedResultText);
+          return { content: payload.content, details: payload.details };
+        }
         const inspected = await runtime.get({ id: params.id!, ...(params.lines === undefined ? {} : { lines: params.lines }) }, signal);
-        if (inspected.ok) runtime.recordModelResultInspection(params.id!, inspected.run.herdrStatus);
         const result = inspected.ok ? { ...inspected, observation: { mode: "wait" as const, wait: waited.result } } : inspected;
-        return { content: [{ type: "text", text: boundedResultText(result) }], details: result };
+        const payload = exactToolPayload(result, boundedResultText);
+        return { content: payload.content, details: payload.details };
       }
       const result = await runtime.get({ id: params.id!, ...(params.lines === undefined ? {} : { lines: params.lines }) }, signal);
-      if (result.ok) runtime.recordModelResultInspection(params.id!, result.run.herdrStatus);
       const details = result.ok ? { ...result, observation: { mode: "inspect" as const } } : result;
-      return { content: [{ type: "text", text: boundedResultText(details) }], details };
+      const payload = exactToolPayload(details, boundedResultText);
+      return { content: payload.content, details: payload.details };
     },
     renderCall(args, theme) {
       const mode = args.id === undefined ? "list" : args.states === undefined ? "inspect" : "wait";

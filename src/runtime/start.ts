@@ -31,6 +31,11 @@ export interface StartSubagentInput {
   readonly recordStarted: (agent: AgentInfo) => void | Promise<void>;
   /** Persist readiness-time native identity before task submission when it was not present in agent.start. */
   readonly recordReady?: (agent: AgentInfo) => void | Promise<void>;
+  /**
+   * Called after readiness and before baseline capture/input mutation.
+   * May wrap instructions with a result-request marker and persist generation state.
+   */
+  readonly prepareSubmission?: (instructions: string) => string | Promise<string>;
   readonly startupTimeoutMs?: number;
   readonly turnStartTimeoutMs?: number;
   readonly pollIntervalMs?: number;
@@ -214,9 +219,14 @@ export async function startSubagent(input: StartSubagentInput): Promise<StartSub
         output,
       };
     }
+    const instructions = input.prepareSubmission
+      ? await input.prepareSubmission(input.instructions)
+      : input.instructions;
+    if (!instructions.trim()) throw new Error("Child instructions must be assembled before start");
+    if (instructions.includes("\0")) throw new Error("Child instructions must not contain NUL bytes");
     const baseline = await captureTurnBaseline(input.client, target, input.signal);
     try {
-      await input.client.sendInput(readiness.agent.pane_id, input.instructions, ["enter"], input.signal);
+      await input.client.sendInput(readiness.agent.pane_id, instructions, ["enter"], input.signal);
     } catch (error) {
       if (error instanceof HerdrApiError) throw error;
       throw new TurnSubmissionUncertainError(

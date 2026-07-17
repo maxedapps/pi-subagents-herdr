@@ -53,6 +53,9 @@ export class PiHarnessAdapter implements HarnessAdapter {
       ...(input.metadata.parentSessionPath === undefined ? {} : {
         PI_HERDR_SUBAGENT_PARENT_SESSION_PATH: input.metadata.parentSessionPath,
       }),
+      ...(input.metadata.resultExchangeDirectory === undefined ? {} : {
+        PI_HERDR_SUBAGENT_RESULT_EXCHANGE: input.metadata.resultExchangeDirectory,
+      }),
     };
     return { argv, env, cwd: paths.cwd, capabilities: this.capabilities };
   }

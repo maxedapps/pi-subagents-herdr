@@ -23,6 +23,13 @@ const required = [
   "package/package.json",
   "package/src/index.ts",
   "package/src/lifecycle/extension.ts",
+  "package/src/results/contracts.ts",
+  "package/src/results/store.ts",
+  "package/src/results/child-bridge.ts",
+  "package/src/results/coordinator.ts",
+  "package/src/results/delivery.ts",
+  "package/src/results/extractors.ts",
+  "package/src/results/presentation.ts",
   "package/src/config/settings.ts",
   "package/src/policy/capabilities.ts",
   "package/src/profiles/discovery.ts",
@@ -121,8 +128,8 @@ const registrations = [];
 const handlers = new Map();
 const tools = [];
 const commands = [];
-entry.default({ on(event, handler) { registrations.push(event); handlers.set(event, handler); }, registerTool(tool) { tools.push(tool.name); }, registerCommand(name) { commands.push(name); }, getAllTools() { return []; } });
-if (registrations.join(",") !== "resources_discover,session_start,agent_settled,session_shutdown") {
+entry.default({ on(event, handler) { registrations.push(event); handlers.set(event, handler); }, registerTool(tool) { tools.push(tool.name); }, registerCommand(name) { commands.push(name); }, registerMessageRenderer() {}, getAllTools() { return []; } });
+if (registrations.join(",") !== "resources_discover,session_start,agent_settled,message_end,session_shutdown") {
   throw new Error(\`Unexpected packed-extension registrations: \${registrations.join(",")}\`);
 }
 const discovered = handlers.get("resources_discover")?.({});
@@ -148,11 +155,14 @@ for (const name of ["scout", "researcher", "worker"]) {
 }
 const childRegistrations = [];
 const child = lifecycle.registerHerdrSubagentsExtension(
-  { on(event) { childRegistrations.push(event); } },
-  { environment: { PI_HERDR_SUBAGENT: "1" } },
+  { on(event) { childRegistrations.push(event); }, registerTool() { throw new Error("child must not register tools"); }, registerCommand() { throw new Error("child must not register commands"); } },
+  { environment: { PI_HERDR_SUBAGENT: "1", PI_HERDR_SUBAGENT_RUN_ID: "run-1", PI_HERDR_SUBAGENT_RUN_NONCE: "nonce", PI_HERDR_SUBAGENT_RESULT_EXCHANGE: "/tmp/exchange" } },
 );
-if (child.mode !== "child" || childRegistrations.length !== 0) {
-  throw new Error("Packed child guard registered parent resources");
+if (child.mode !== "child" || child.registeredTools.length !== 0) {
+  throw new Error("Packed child guard registered parent tools");
+}
+if (childRegistrations.sort().join(",") !== "agent_settled,message_end") {
+  throw new Error("Packed child bridge must register only message_end and agent_settled: " + childRegistrations.join(","));
 }
 process.stdout.write("packed-isolated-load ok: extension import closure + contracts/policy/worktrees + assets + child guard\\n");
 `);

@@ -49,6 +49,14 @@ The bundled runtime skill is now `skills/use-herdr-subagents/SKILL.md` with comm
 
 Child mode contributes neither `use-herdr-subagents` nor recursive orchestration tools.
 
+## Result delivery migration
+
+Runs write schema-v4 `run.json` only (generation/bridge summaries and durable captures under `.subagents/runs/<id>/results/`). Older schema versions are not readable for control recovery. The previous in-memory “must call `subagent_status`” reminder loop is removed: starts/sends stay asynchronous, and completed Pi generations are injected automatically into the active owning parent branch as `herdr-subagents.result.v1` custom messages.
+
+Same-run `subagent_send` requires the child to be `blocked`/`done`/`idle` with the prior generation captured or closed. There is no terminal/legacy result invent path and no final-output handoff substitute for missing child writer content.
+
+Rollback requires resolving or retaining v4 runs and preserving `results/` files; never edit metadata to fake delivery stages. Automatic result capture applies only to Pi children with a working result bridge.
+
 ## Profile migration
 
 Remove `skills` and `preferredSkills`; child Pi now uses normal skill discovery and these legacy fields produce a migration error. Remove `artifacts.prompt` and `artifacts.system`; they are invalid. Remove progress from read-only scout/research profiles unless it is intentionally needed. Progress remains optional evidence even when configured.

@@ -40,15 +40,16 @@ test("skill provides a compact standalone baseline and extension-specific profil
 test("skill teaches the mandatory start, inspect, follow-up, stop, and verification lifecycle", async () => {
   const [skill, reference] = await Promise.all([readFile(skillPath, "utf8"), readFile(referencePath, "utf8")]);
   for (const contract of [
-    /completion\.pending: true.*mandatory next action/is,
-    /List mode never satisfies result inspection/i,
-    /inspect every parallel run individually/i,
-    /accepted follow-up creates another exact-ID result obligation/i,
+    /completion\.pending: true.*automatic result delivery/is,
+    /Results arrive automatically/i,
+    /exact-ID `subagent_status`/i,
+    /Same-run sends are serialized/i,
     /confirmed.*unconfirmed.*uncertain/is,
     /never resend uncertain input automatically/i,
     /interrupt.*current turn.*preserving the session/is,
     /Check `result\.stopped`.*outer tool success does not prove/is,
     /Resolve each owned run before finalizing/i,
+    /Parent verification remains mandatory/i,
     /Child output, status, artifacts, exit state, and test claims are evidence, not proof/i,
   ]) assert.match(skill, contract);
   assert.match(reference, /Use `subagent_status` in exactly one mode/i);

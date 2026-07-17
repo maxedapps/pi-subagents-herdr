@@ -42,7 +42,6 @@ test("subagent_status dispatches list, inspect, and bounded wait-then-inspect", 
     async list(input: unknown) { calls.push(`list:${JSON.stringify(input)}`); return { ok: true, scope: "current_session", runs: [summary], counts: { done: 1 } }; },
     async get(input: unknown) { calls.push(`get:${JSON.stringify(input)}`); return { ok: true, run: summary, effectiveProfile: { description: "x", harness: "pi", thinking: "low", cwd: "/x", tools: [] }, ownership: { runNonce: "n", parentSessionId: "p", branchEntryId: "b" }, topology: {}, output: { text: "done" }, artifacts: {}, runtime: { ephemeralFiles: "retained", piSessionData: "retained" }, createdAt: 1, updatedAt: 2 }; },
     async wait(input: unknown) { calls.push(`wait:${JSON.stringify(input)}`); return { ok: true, action: "wait", run: summary, result: { matched: true, state: "done" } }; },
-    recordModelResultInspection(id: string, state: string) { calls.push(`inspect:${id}:${state}`); },
   };
   const pi = { registerTool(value: typeof definition) { definition = value; } } as unknown as ExtensionAPI;
   registerStatusTool(pi, runtime as never, "subagent_status");
@@ -52,13 +51,13 @@ test("subagent_status dispatches list, inspect, and bounded wait-then-inspect", 
   assert.deepEqual(calls, [
     "list:{\"scope\":\"current_session\"}",
     "get:{\"id\":\"run-1\",\"lines\":20}",
-    "inspect:run-1:done",
     "wait:{\"id\":\"run-1\",\"states\":[\"done\"],\"timeoutMs\":100}",
     "get:{\"id\":\"run-1\",\"lines\":40}",
-    "inspect:run-1:done",
   ]);
-  assert.equal(waited.details.observation.mode, "wait");
-  assert.equal(waited.details.output.text, "done");
+  assert.equal(waited.details.result.observation.mode, "wait");
+  assert.equal(waited.details.result.output.text, "done");
+  assert.equal(typeof waited.details.deliveredText, "string");
+  assert.ok(waited.details.deliveredText.includes("done"));
 });
 
 test("exactly five canonical model-facing names are centralized with no aliases", () => {
@@ -77,23 +76,36 @@ test("LLM-facing serialized results remain below the tool output convention", ()
   assert.equal(result.includes("�"), false);
 });
 
-test("successful start renderer shows result pending instead of an unqualified completion check", () => {
+test("successful start renderer shows automatic delivery pending instead of an unqualified completion check", () => {
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
-  const component = renderToolResult({
-    ok: true,
-    status: "started",
-    run: { id: "run-1", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "working", ownership: "current_session", live: true, elapsedMs: 5, taskSynopsis: "Map auth" },
-    completion: { pending: true, requiredTool: "subagent_status", suggestedInput: { id: "run-1", states: ["done", "idle", "blocked"], timeoutMs: 900_000 } },
-  }, false, theme);
-  assert.match(component.render(120).join("\n"), /started · result pending · call subagent_status/);
+  const details = {
+    deliveredText: JSON.stringify({
+      ok: true,
+      status: "started",
+      run: { id: "run-1", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "working", ownership: "current_session", live: true, elapsedMs: 5, taskSynopsis: "Map auth" },
+      completion: { pending: true, delivery: "automatic", note: "auto" },
+    }, null, 2),
+    result: {
+      ok: true,
+      status: "started",
+      run: { id: "run-1", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "working", ownership: "current_session", live: true, elapsedMs: 5, taskSynopsis: "Map auth" },
+      completion: { pending: true, delivery: "automatic", note: "auto" },
+    },
+  };
+  const component = renderToolResult(details, false, theme);
+  assert.match(component.render(120).join("\n"), /started · result pending · automatic delivery/);
   assert.doesNotMatch(component.render(120).join("\n"), /✓/);
+  // Terminal width padding is display-only; source deliveredText remains exact.
+  assert.equal(
+    renderToolResult(details, true, theme).render(120).map((line) => line.trimEnd()).join("\n"),
+    details.deliveredText,
+  );
 });
 
-test("compact renderer preserves semantic status text and bounded expanded metadata", () => {
+test("compact renderer preserves semantic status text and exact expanded deliveredText", () => {
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
-  const component = renderToolResult({ ok: true, run: { id: "run-1", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "blocked", ownership: "current_session", live: true, elapsedMs: 5, taskSynopsis: "Map auth" } }, true, theme);
-  const lines = component.render(120);
-  assert.match(lines.join("\n"), /! run-1 scout\/pi blocked/);
-  assert.match(lines.join("\n"), /current_session/);
-  assert.ok(lines.length < 20);
+  const deliveredText = JSON.stringify({ ok: true, run: { id: "run-1", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "blocked", ownership: "current_session", live: true, elapsedMs: 5, taskSynopsis: "Map auth" } }, null, 2);
+  const component = renderToolResult({ deliveredText, result: { ok: true, run: { id: "run-1", profile: "scout", harness: "pi", lifecycle: "running", herdrStatus: "blocked", ownership: "current_session", live: true, elapsedMs: 5, taskSynopsis: "Map auth" } } }, true, theme);
+  const lines = component.render(120).map((line) => line.trimEnd());
+  assert.equal(lines.join("\n"), deliveredText);
 });

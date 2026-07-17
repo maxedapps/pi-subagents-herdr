@@ -1,12 +1,17 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { PACKAGE_ASSETS } from "../package-paths.ts";
+import { RESULT_CUSTOM_TYPE } from "../results/contracts.ts";
+import { collapsedPreview } from "../results/presentation.ts";
+import { registerChildResultBridge } from "../results/child-bridge.ts";
 import { registerHerdrToolSurface } from "../tools/index.ts";
 import { registerHerdrSubagentsUi } from "../ui/index.ts";
 
 export interface SessionRuntime {
   start(context: ExtensionContext): void | Promise<void>;
   stop(): void | Promise<void>;
-  claimResultInspectionReminders?(): readonly { readonly id: string; readonly generation: number; readonly timeoutMs: number }[];
+  noteParentSettled?(): void;
+  reconcileResultPersistence?(): void | Promise<void>;
 }
 
 export interface ExtensionRegistrationOptions {
@@ -17,8 +22,20 @@ export interface ExtensionRegistrationOptions {
 
 export interface ExtensionRegistration {
   readonly mode: "parent" | "child";
-  readonly registeredEvents: readonly ("resources_discover" | "session_start" | "agent_settled" | "session_shutdown")[];
+  readonly registeredEvents: readonly string[];
   readonly registeredTools: readonly string[];
+}
+
+function messageContentText(message: { content?: unknown }): string {
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((block) => block && typeof block === "object" && (block as { type?: string }).type === "text")
+      .map((block) => String((block as { text?: string }).text ?? ""))
+      .join("");
+  }
+  return "";
 }
 
 export function registerHerdrSubagentsExtension(
@@ -27,10 +44,15 @@ export function registerHerdrSubagentsExtension(
 ): ExtensionRegistration {
   const environment = options.environment ?? process.env;
   if (environment.PI_HERDR_SUBAGENT === "1") {
-    // Code-enforced child boundary: this package registers no parent tools,
-    // commands, UI, lifecycle runtime, skill injection, or prompt
-    // metadata. Herdr's separately installed Pi integration remains loaded.
-    return { mode: "child", registeredEvents: [], registeredTools: [] };
+    // Code-enforced child boundary: register only the narrow result bridge.
+    // No parent tools, commands, UI, lifecycle runtime, skill injection, or
+    // prompt metadata. Herdr's separately installed Pi integration remains loaded.
+    const bridge = registerChildResultBridge(pi, environment);
+    return {
+      mode: "child",
+      registeredEvents: bridge?.registeredEvents ?? [],
+      registeredTools: [],
+    };
   }
 
   pi.on("resources_discover", () => ({ skillPaths: [PACKAGE_ASSETS.skill] }));
@@ -44,7 +66,8 @@ export function registerHerdrSubagentsExtension(
     return {
       async start(context: ExtensionContext) { await core.start(context); await ui!.start(context); },
       async stop() { await ui!.stop(); await core.stop(); },
-      claimResultInspectionReminders() { return core.claimResultInspectionReminders(); },
+      noteParentSettled() { core.noteParentSettled?.(); },
+      async reconcileResultPersistence() { await core.reconcileResultPersistence?.(); },
     };
   });
   let runtime: SessionRuntime | undefined;
@@ -75,20 +98,31 @@ export function registerHerdrSubagentsExtension(
   });
 
   pi.on("agent_settled", () => {
-    const reminders = runtime?.claimResultInspectionReminders?.() ?? [];
-    if (reminders.length === 0) return;
-    const calls = reminders.map((reminder) => JSON.stringify({
-      id: reminder.id,
-      states: ["done", "idle", "blocked"],
-      timeoutMs: reminder.timeoutMs,
-    }));
-    pi.sendMessage({
-      customType: "herdr-subagents.result-inspection-required",
-      content: `Subagent result inspection is still required. Call subagent_status once for each exact ID; a list call does not inspect results:\n${calls.join("\n")}`,
-      display: true,
-      details: { reminders },
-    }, { deliverAs: "followUp", triggerTurn: true });
+    // Automatic result delivery replaces the old status-call reminder loop.
+    runtime?.noteParentSettled?.();
   });
+
+  pi.on("message_end", async (event) => {
+    // Pi invokes extension message_end before the custom message is appended to the
+    // session branch. Always schedule a deferred persistence scan so in-flight
+    // herdr-subagents.result.v1 deliveries can advance once the branch is durable.
+    // Filtering only RESULT_CUSTOM_TYPE would miss the pre-append window.
+    void event;
+    queueMicrotask(() => {
+      void Promise.resolve(runtime?.reconcileResultPersistence?.()).catch(() => undefined);
+    });
+  });
+
+  if (typeof pi.registerMessageRenderer === "function") {
+    pi.registerMessageRenderer(RESULT_CUSTOM_TYPE, (message, options, theme: Theme) => {
+      const text = messageContentText(message as { content?: unknown });
+      if (!options.expanded) {
+        return new Text(theme.fg("muted", collapsedPreview(text)), 0, 0);
+      }
+      // Expanded Ctrl+O must show exactly the model-visible content bytes.
+      return new Text(text, 0, 0);
+    });
+  }
 
   pi.on("session_shutdown", async () => {
     if (stopPromise !== undefined) return stopPromise;
@@ -107,7 +141,13 @@ export function registerHerdrSubagentsExtension(
 
   return {
     mode: "parent",
-    registeredEvents: ["resources_discover", "session_start", "agent_settled", "session_shutdown"],
+    registeredEvents: [
+      "resources_discover",
+      "session_start",
+      "agent_settled",
+      "message_end",
+      "session_shutdown",
+    ],
     registeredTools: surface?.names ?? [],
   };
 }

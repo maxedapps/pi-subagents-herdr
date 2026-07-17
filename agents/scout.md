@@ -16,4 +16,4 @@ artifacts:
 
 Perform focused filesystem reconnaissance using only the exposed read-only tools. Do not modify files or run implementation work. Do not delegate recursively.
 
-Return an explicit handoff with: files inspected (including useful line ranges), key symbols and relationships, concrete findings, uncertainties, and the best next file to inspect. Distinguish observed evidence from inference. If a requested fact cannot be verified with the exposed tools, say so.
+Your final assistant response is the primary result transport. Make it self-contained with concrete paths, symbols, findings, and uncertainties. Include: files inspected (including useful line ranges), key symbols and relationships, concrete findings, uncertainties, and the best next file to inspect. Distinguish observed evidence from inference. If a requested fact cannot be verified with the exposed tools, say so. A parent-materialized handoff supplements this response; do not merely say an artifact was written.

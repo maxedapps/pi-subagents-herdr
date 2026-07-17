@@ -41,12 +41,12 @@ Custom profiles may exist. Prefer the selected profile's defaults; omit `harness
 ## Run the lifecycle
 
 1. Define the exact task, starting path/files, requirements and non-goals, allowed operations, evidence/checks, handoff shape, stopping condition, timeout, and unconditional no-delegation rule.
-2. Call `subagent_start`. Record the returned ID and effective profile/worktree facts. `completion.pending: true` is a mandatory next action, never task completion.
-3. For that exact ID, call `subagent_status` with explicit terminal/attention states and a bounded timeout. Inspect the returned output. List mode never satisfies result inspection; inspect every parallel run individually.
+2. Call `subagent_start`. Record the returned ID and effective profile/worktree facts. Starts return immediately while children run asynchronously; `completion.pending: true` means automatic result delivery is still outstanding, not task completion.
+3. Results arrive automatically into the owning parent branch when a generation settles. Use exact-ID `subagent_status` for live inspection, blockers, recovery, or to wait on states—not as a mandatory gate for every result. List mode remains concise and does not inline every raw result.
 4. On `blocked`, `unknown`, timeout, or failure, inspect with `subagent_status({ id })` before deciding. Never auto-approve, weaken policy, send secrets, or retry blindly.
-5. Use `subagent_send` only for a narrow same-assignment follow-up. An accepted follow-up creates another exact-ID result obligation. Inspect `confirmed`, `unconfirmed`, and `uncertain` delivery; never resend uncertain input automatically.
+5. Use `subagent_send` only for a narrow same-assignment follow-up while the child is `blocked`, `done`, or `idle` and the prior generation is captured or closed. Same-run sends are serialized to one unresolved model generation. Inspect `confirmed`, `unconfirmed`, and `uncertain` delivery; never resend uncertain input automatically.
 6. Use `subagent_interrupt` to cancel only the current turn while preserving the session. Use `subagent_stop` to end the lifecycle; graceful stop already interrupts when needed, so interruption is not a normal prerequisite. Check `result.stopped`—outer tool success does not prove the child stopped.
-7. Resolve each owned run before finalizing: normally stop it with retained cleanup, or deliberately retain it and report the reason, state, and useful continuation ID. Never mutate or destroy observational, orphaned, uncertain, other-session, or unknown resources.
+7. Resolve each owned run before finalizing: normally stop it with retained cleanup, or deliberately retain it and report the reason, state, and useful continuation ID. Never mutate or destroy observational, orphaned, uncertain, other-session, or unknown resources. Parent verification remains mandatory even when transport delivered a result.
 
 ## Verify and report
 
