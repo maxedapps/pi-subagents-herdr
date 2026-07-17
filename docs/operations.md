@@ -32,6 +32,8 @@ Results arrive automatically. A writer result can include `ACTION REQUIRED` with
 
 Blocked state is not permission to self-approve. Use one bounded same-assignment follow-up when appropriate. For send/interrupt, inspect `unconfirmed` and `uncertain`; never retry uncertain input automatically.
 
+Placement exhaustion returns `status: "blocked"` with the exact run ID and `subagent_stop({ id })` action. New read-only tabs use exact partial cleanup; reused, ambiguous, and writer resources remain visible for ordinary stop/finalization.
+
 ## Parent verification, integration, and stop
 
 Child output and test claims are evidence, not proof. For a writer, inspect the complete diff/status, rerun relevant checks, and integrate manually. Then call:
@@ -100,7 +102,8 @@ Git-local excludes protect `/.subagents/` and only explicitly requested `/.progr
 npm run check
 npm run check:full
 npm run pack:inspect
+npm run conformance:herdr:no-model
 npm run conformance:herdr:worktree:no-model -- --confirm-create --source-cwd <clean-repo>
 ```
 
-The conformance command is no-model and opt-in because it creates and fully finalizes a real disposable worktree. Model-backed smoke remains separately opt-in; never use model/focus/force flags without explicit authorization.
+Both conformance commands are no-model and opt-in. `conformance:herdr:no-model` creates one uniquely labeled no-focus tab, reconciles its exact placement, starts `/bin/sh` with a harmless short-lived command through `agent.start`, and closes only the returned child pane and exact idle root tab; failures print retained IDs. The worktree command creates and fully finalizes a real disposable worktree. Model-backed smoke remains separately opt-in; never use model/focus/force flags without explicit authorization.

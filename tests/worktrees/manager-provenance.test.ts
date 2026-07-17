@@ -25,6 +25,7 @@ function owner(runId = "run-1") { return { runId, runNonce: `nonce-${runId}`, pa
 
 function fakeHerdr(root: string, failGroupBaseline = false) {
   let sequence = 1; const creates: WorktreeCreateInput[] = []; let childWorkspace: WorkspaceInfo | undefined;
+  let createdTab: typeof tab | undefined; let createdRoot: PaneInfo | undefined; let groupTab: typeof tab | undefined; let groupRoot: PaneInfo | undefined;
   const client = {
     async listWorktrees() { return { source: { repo_key: "repo-key", repo_name: "repo", repo_root: root, source_checkout_path: root, source_workspace_id: "w1" }, worktrees: [] }; },
     async createWorktree(input: WorktreeCreateInput) {
@@ -32,9 +33,16 @@ function fakeHerdr(root: string, failGroupBaseline = false) {
       execFileSync("git", ["-C", root, "worktree", "add", "-q", "-b", input.branch!, input.path!, input.base!]);
       const workspaceId = "w2"; const tabId = "w2:t1"; const rootPane = { ...pane, pane_id: "w2:p1", terminal_id: "term-wt-root", workspace_id: workspaceId, tab_id: tabId, focused: false };
       childWorkspace = { ...workspace, workspace_id: workspaceId, active_tab_id: tabId, focused: false, worktree: { repo_key: "repo-key", repo_name: "repo", repo_root: root, checkout_path: input.path!, is_linked_worktree: true } };
-      return { workspace: childWorkspace, tab: { ...tab, workspace_id: workspaceId, tab_id: tabId, focused: false }, rootPane, worktree: { path: input.path!, branch: input.branch!, is_bare: false, is_detached: false, is_prunable: false, is_linked_worktree: true, label: input.label ?? "", open_workspace_id: workspaceId } };
+      createdTab = { ...tab, workspace_id: workspaceId, tab_id: tabId, focused: false }; createdRoot = rootPane;
+      return { workspace: childWorkspace, tab: createdTab, rootPane, worktree: { path: input.path!, branch: input.branch!, is_bare: false, is_detached: false, is_prunable: false, is_linked_worktree: true, label: input.label ?? "", open_workspace_id: workspaceId } };
     },
-    async createTab(input: { workspace_id?: string; focus?: boolean }) { assert.equal(input.workspace_id, "w2"); assert.equal(input.focus, false); sequence += 1; return { tab: { ...tab, workspace_id: "w2", tab_id: `w2:t${sequence}`, focused: false }, rootPane: { ...pane, workspace_id: "w2", tab_id: `w2:t${sequence}`, pane_id: `w2:p${sequence}`, terminal_id: `term-group-${sequence}`, focused: false } }; },
+    async createTab(input: { workspace_id?: string; focus?: boolean }) {
+      assert.equal(input.workspace_id, "w2"); assert.equal(input.focus, false); sequence += 1;
+      groupTab = { ...tab, workspace_id: "w2", tab_id: `w2:t${sequence}`, focused: false };
+      groupRoot = { ...pane, workspace_id: "w2", tab_id: `w2:t${sequence}`, pane_id: `w2:p${sequence}`, terminal_id: `term-group-${sequence}`, focused: false };
+      return { tab: groupTab, rootPane: groupRoot };
+    },
+    async snapshot() { return { version: "0.7.3", protocol: 16, workspaces: childWorkspace ? [childWorkspace] : [], tabs: [createdTab, groupTab].filter(Boolean), panes: [createdRoot, groupRoot].filter(Boolean), layouts: [], agents: [] }; },
     async getPaneProcessInfo(paneId: string) { if (failGroupBaseline) throw new Error("baseline unavailable"); return { pane_id: paneId, shell_pid: 10, tty: "/dev/tty", foreground_process_group_id: 10, foreground_processes: [] }; },
   } as unknown as HerdrRequestClient;
   return { client, creates, get workspace() { return childWorkspace; } };

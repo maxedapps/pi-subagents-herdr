@@ -55,6 +55,8 @@ Execution rejects cross-mode combinations: `scope` with `id`; `states`, `timeout
 
 Every successful start reports `completion.pending` with `delivery: "automatic"`. Starts and sends return immediately. For Pi children, the structured final assistant response is captured and injected into the owning parent branch as `herdr-subagents.result.v1`. Writer results carry an extension-derived `ACTION REQUIRED` block with exact Git/worktree facts. Later blocked, failed, retained-cleanup, UI, or recovery transitions use deduplicated `herdr-subagents.action-required.v1` follow-ups and the same status/UI attention state. Missing bridge evidence is capture-unavailable—never an invented result. Parent verification and explicit stop/finalization remain mandatory.
 
+Placement starts use fresh exact topology checks and retry only explicit `agent_placement_not_found`; exhaustion returns the managed run ID and ordinary stop action. See the architecture and operations guides for details.
+
 ## Bundled profiles and skill
 
 - `scout`: Pi, read-only reconnaissance with a self-contained delivered final response.
@@ -125,9 +127,10 @@ npm run check
 `check` runs typecheck, core tests, and docs links. Explicit layers:
 
 ```sh
-npm run test:e2e      # deterministic no-model subprocess matrix
-npm run pack:inspect  # one exact pack/install/Pi-load pass
-npm run skill:check   # local pinned skills-ref validation
+npm run test:e2e                    # deterministic no-model subprocess matrix
+npm run pack:inspect                # one exact pack/install/Pi-load pass
+npm run skill:check                 # local pinned skills-ref validation
+npm run conformance:herdr:no-model  # opt-in real placement check; harmless shell command, no coding model
 ```
 
 Full release qualification runs typecheck, core tests, docs, deterministic E2E, exact archive qualification, and skill validation once each:

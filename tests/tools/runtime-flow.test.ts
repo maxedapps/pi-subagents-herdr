@@ -60,6 +60,8 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
   let output = "ready";
   let induceSubmissionUncertain = false;
   let failNextTurnSnapshot = false;
+  let placementRejections = 0;
+  let anchorBusy = false;
   const parentPane = { pane_id: "w1:p1", terminal_id: "term-parent", workspace_id: "w1", tab_id: "w1:t1", focused: true, agent_status: "idle", revision: 1, agent: "pi", agent_session: parentNative, cwd: root };
   const parentAgent = { ...parentPane };
   const anchor = { pane_id: "w1:p2", terminal_id: "term-anchor", workspace_id: "w1", tab_id: "w1:t2", focused: false, agent_status: "idle", revision: 1, agent: null };
@@ -89,8 +91,12 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
       }
       case "events.subscribe": return reply(request, { type: "subscription_started" });
       case "tab.create": groupLive = true; return reply(request, { type: "tab_created", tab: groupTab, root_pane: anchor });
-      case "pane.process_info": return reply(request, { type: "pane_process_info", process_info: { pane_id: String((request.params as Record<string, unknown>).pane_id), shell_pid: 10, tty: "/dev/ttys-test", foreground_process_group_id: 10, foreground_processes: [{ pid: 10, name: "zsh", argv: ["zsh"] }] } });
-      case "agent.start": childLive = true; childStatus = "idle"; return reply(request, { type: "agent_started", agent: child(), argv: Array.isArray((request.params as Record<string, unknown>).argv) ? (request.params as Record<string, JsonValue>).argv as JsonValue : [] });
+      case "pane.process_info": return reply(request, { type: "pane_process_info", process_info: { pane_id: String((request.params as Record<string, unknown>).pane_id), shell_pid: 10, tty: "/dev/ttys-test", foreground_process_group_id: 10, foreground_processes: anchorBusy ? [{ pid: 11, name: "busy-command", argv: ["busy-command"] }] : [{ pid: 10, name: "zsh", argv: ["zsh"] }] } });
+      case "pane.list": return reply(request, { type: "pane_list", panes: snapshot().panes });
+      case "agent.start": {
+        if (placementRejections > 0) { placementRejections -= 1; return { id: request.id ?? "", error: { code: "agent_placement_not_found", message: "placement resolver has not observed the tab" } }; }
+        childLive = true; childStatus = "idle"; return reply(request, { type: "agent_started", agent: child(), argv: Array.isArray((request.params as Record<string, unknown>).argv) ? (request.params as Record<string, JsonValue>).argv as JsonValue : [] });
+      }
       case "agent.read": return reply(request, { type: "pane_read", read: { pane_id: "w1:p3", workspace_id: "w1", tab_id: "w1:t2", source: "recent_unwrapped", format: "text", text: output, revision: outputRevision, truncated: false } });
       case "pane.send_input": {
         childRevision += 1; outputRevision += 1; output += "\ntask submitted";
@@ -303,6 +309,36 @@ test("real tool runtime handles protected starts, normal Pi resources, bounded s
       const finalStop = await runtime.stop({ id: afterProvenAbsence.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 });
       assert.equal(finalStop.ok, true);
     }
+
+    const startsBeforePlacementExhaustion = server.requests.filter((request) => request.method === "agent.start").length;
+    const closesBeforePlacementExhaustion = server.requests.filter((request) => request.method === "tab.close").length;
+    placementRejections = 3;
+    const exhausted = await runtime.start("tool-placement-exhausted", { profile: "scout", task: "Return an actionable failed run without an anonymous tab" });
+    assert.equal(exhausted.ok, true);
+    if (exhausted.ok) {
+      assert.equal(exhausted.status, "blocked"); assert.equal(exhausted.run.lifecycle, "failed"); assert.equal(exhausted.run.live, false);
+      assert.ok((exhausted.reason ?? "").includes(`subagent_stop({ id: ${JSON.stringify(exhausted.run.id)} })`));
+      assert.equal(exhausted.run.attention?.kind, "failed"); assert.equal(exhausted.run.worktree, undefined);
+      const exhaustedStop = await runtime.stop({ id: exhausted.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 });
+      assert.equal(exhaustedStop.ok, true);
+      if (exhaustedStop.ok) assert.equal((exhaustedStop.result as { stopped: boolean }).stopped, true);
+    }
+    assert.equal(server.requests.filter((request) => request.method === "agent.start").length, startsBeforePlacementExhaustion + 3);
+    assert.equal(server.requests.filter((request) => request.method === "tab.close").length, closesBeforePlacementExhaustion + 1);
+    assert.equal(groupLive, false, "new read-only group must be closed after proven placement exhaustion");
+
+    placementRejections = 3; anchorBusy = true;
+    const retainedExhaustion = await runtime.start("tool-placement-exhausted-retained", { profile: "scout", task: "Retain an uncertain busy anchor, then retry ordinary stop" });
+    assert.equal(retainedExhaustion.ok, true);
+    if (retainedExhaustion.ok) {
+      assert.equal(retainedExhaustion.status, "blocked"); assert.match(retainedExhaustion.reason ?? "", /retained.*idle shell/i); assert.equal(groupLive, true);
+      assert.deepEqual({ workspaceId: retainedExhaustion.run.attention?.facts?.workspaceId, tabId: retainedExhaustion.run.attention?.facts?.tabId }, { workspaceId: "w1", tabId: "w1:t2" });
+      anchorBusy = false;
+      const retainedStop = await runtime.stop({ id: retainedExhaustion.run.id, mode: "graceful", cleanup: "retain", timeoutMs: 2_000 });
+      assert.equal(retainedStop.ok, true);
+      if (retainedStop.ok) assert.equal((retainedStop.result as { stopped: boolean; tabClosed: boolean }).tabClosed, true);
+    }
+    assert.equal(groupLive, false, "ordinary exact-ID stop must retry the existing partial-start cleanup proof");
   } finally {
     await runtime.stopSession();
     await server.close();

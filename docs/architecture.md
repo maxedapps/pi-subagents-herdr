@@ -35,6 +35,10 @@ A stopped run has a terminal `stopped` ownership phase. `subagent_stop` can ther
 
 Adapters validate executable, canonical cwd/roots, capabilities, model/thinking, and prohibited options before topology creation. Writers always create a linked worktree under the run-bound sibling container and a dedicated group tab inside its Herdr worktree workspace. Read-only profiles share the verified checkout but use a dedicated group tab. The group and writer terminal are journaled before task mutation.
 
+A group is launch-ready only after a fresh snapshot contains its exact workspace, tab, root pane, and root terminal and the root process probe returns the same pane. Creation waits within a short fixed bound; cached groups are freshly revalidated and stale/moved provenance is never replaced implicitly. `agent.start` performs the same exact check before each call and retries only `HerdrApiError.code === "agent_placement_not_found"`, with three total attempts and fixed abort-aware waits. All transport, timeout, malformed, abort, and other API outcomes remain non-retryable because acceptance could be uncertain.
+
+Exhausted explicit placement rejection proves no child identity, not absence of extension-owned topology. The managed run and journal enter failed attention and return a blocked start payload with the exact run ID. A new read-only group uses the existing partial-start idle/identity cleanup proof; reused/ambiguous groups retain. Writer workspace/worktree provenance remains durable and the existing stop/finalization state machine skips process control, waits for parent-persisted failure evidence, derives no-change/integration, and performs normal exact cleanup—there is no provisioning rollback path.
+
 Pi children independently resolve ordinary trust/resources; transient parent approval is not inherited. Recursive orchestration tools are rejected.
 
 ## Artifacts
@@ -78,5 +82,6 @@ A crash resumes only unfinished milestones. Dirty discard remains separate inter
 - deterministic fake E2E;
 - exact pack/install/isolated Pi RPC load via `pack:inspect`;
 - pinned skill validation;
+- opt-in no-model real Herdr placement conformance using a harmless short-lived `/bin/sh` command with exact pane/tab cleanup and retained-ID reporting;
 - opt-in no-model real Herdr worktree conformance proving zero workspace/tab/pane/worktree/generated-branch/runtime-artifact residue;
 - opt-in model-backed smoke, dry-run by default.

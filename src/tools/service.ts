@@ -49,6 +49,7 @@ import {
 } from "../runtime/control.ts";
 import { createEphemeralRuntimeFiles, removeEphemeralRuntimeFiles, type EphemeralRuntimeFiles } from "../runtime/ephemeral.ts";
 import { DelegationGroupManager, verifyIdleShell, type DelegationGroup } from "../runtime/groups.ts";
+import { cleanupPartialStart } from "../runtime/reconcile.ts";
 import { interruptSubagent } from "../runtime/interrupt.ts";
 import {
   ActiveBranchOwnershipJournal,
@@ -66,7 +67,7 @@ import {
   listRuntimeRunMetadata,
   type RuntimeRunMetadata,
 } from "../runtime/metadata.ts";
-import { StartCleanupError, TurnSubmissionUncertainError, startSubagent } from "../runtime/start.ts";
+import { PlacementStartExhaustedError, StartCleanupError, TurnSubmissionUncertainError, startSubagent } from "../runtime/start.ts";
 import { closeDedicatedTabIfSafe, stopSubagent, type StopSubagentResult } from "../runtime/stop.ts";
 import { waitForSubagent } from "../runtime/wait.ts";
 import { toPublicResultView, type GenerationSummary, type PublicResultView, type ResultEnvelopeV1 } from "../results/contracts.ts";
@@ -183,6 +184,7 @@ interface ManagedRun {
   journal: OwnershipJournalData;
   target?: OwnedRunTarget;
   group?: DelegationGroup;
+  groupCreatedByRun?: boolean;
   artifacts?: RunArtifacts;
   ephemeral?: EphemeralRuntimeFiles;
   worktreeId?: string;
@@ -543,6 +545,7 @@ export class HerdrToolRuntimeController {
       return;
     }
     if (run.attention?.kind === "cleanup_required" || run.attention?.kind === "recovery_required") return;
+    if (run.lifecycle === "failed" && run.attention?.kind === "failed") return;
     if (run.lifecycle === "failed") {
       await this.#setAttention(run, {
         kind: "failed",
@@ -1313,6 +1316,7 @@ export class HerdrToolRuntimeController {
         managed.worktreeId = worktree.id;
       } else {
         group = await ready.groups.ensure(ready.preflight.pane.workspace_id, "default", signal, (created) => {
+          managed.groupCreatedByRun = true;
           journalState = journal.append(journalState, "created", { tabId: created.tab.tab_id, rootPaneId: created.rootPane.pane_id, rootTerminalId: created.rootPane.terminal_id });
           managed.journal = journalState;
         });
@@ -1346,8 +1350,7 @@ export class HerdrToolRuntimeController {
       const started = await startSubagent({
         client: ready.client,
         prepared,
-        workspaceId: group.workspaceId,
-        tabId: group.tabId,
+        placement: group,
         instructions,
         authorization,
         prepareSubmission: async (raw) => {
@@ -1425,6 +1428,53 @@ export class HerdrToolRuntimeController {
       managed.herdrStatus = "unknown";
       managed.updatedAt = Date.now();
       managed.failure = error instanceof Error ? error.message : String(error);
+      if (error instanceof PlacementStartExhaustedError) {
+        try {
+          if (journalState.phase !== "failed") {
+            journalState = journal.append(journalState, "failed", {});
+            managed.journal = journalState;
+          }
+        } catch { /* Preserve the last valid write-ahead state. */ }
+        const failedGroup = managed.group;
+        let cleanupDetail = worktree
+          ? `writer workspace/worktree retained for ${stopCall(runId)}`
+          : managed.groupCreatedByRun ? "new read-only group cleanup was not attempted" : "reused read-only group retained";
+        if (!worktree && managed.groupCreatedByRun && failedGroup) {
+          const cleanup = await cleanupPartialStart({ client: ready.client, groupManager: ready.groups, group: failedGroup, journal: managed.journal, groupCreatedThisAttempt: true, ...(signal === undefined ? {} : { signal }) });
+          cleanupDetail = cleanup.retained.length > 0
+            ? `new read-only group retained: ${cleanup.retained.join("; ")}`
+            : `new read-only group cleanup closed tabs [${cleanup.closedTabIds.join(", ") || "none"}] and panes [${cleanup.closedPaneIds.join(", ") || "none"}]`;
+        }
+        managed.failure = `${error.message}; ${cleanupDetail}. No child identity was returned. Resolve with ${stopCall(runId)}`;
+        const failedWorktree = managed.worktreeId === undefined ? undefined : ready.worktrees.get(managed.worktreeId);
+        await this.#setAttention(managed, {
+          kind: "failed",
+          reason: managed.failure,
+          nextActions: [`Inspect ${statusCall(runId)}`, `${stopCall(runId)} skips child process control and uses the existing exact cleanup path`],
+          facts: failedWorktree === undefined
+            ? { ...(failedGroup === undefined ? {} : { workspaceId: failedGroup.workspaceId, tabId: failedGroup.tabId }) }
+            : { checkoutPath: failedWorktree.checkoutPath, branch: failedWorktree.branch, base: failedWorktree.base, workspaceId: failedWorktree.workspaceId, ...(failedWorktree.tab === undefined ? {} : { tabId: failedWorktree.tab.tabId }) },
+        }).catch(() => undefined);
+        await this.#removeEphemeral(managed).catch(() => undefined);
+        this.#subscriptions?.ownershipChanged(); this.#notifyUi();
+        return {
+          ok: true,
+          status: "blocked",
+          run: await this.#summary(managed),
+          effective: {
+            harness: policy.harness,
+            ...(policy.model === undefined ? {} : { model: policy.model }),
+            thinking: policy.thinking,
+            cwd: policy.cwd,
+            tools: policy.tools.map((tool) => tool.name),
+            permissions: policy.permissions,
+            isolatedWorktree: policy.requireWorktree,
+            broadeningReasons: policy.broadeningReasons,
+          },
+          output: EMPTY_OUTPUT,
+          reason: managed.failure,
+        };
+      }
       // Input may have been attempted: never leave the generation stuck in "prepared".
       if (error instanceof TurnSubmissionUncertainError) {
         await this.#coordinator?.recordSubmission(runId, "uncertain").catch(() => undefined);
@@ -1819,6 +1869,12 @@ export class HerdrToolRuntimeController {
             tabClosed = tab.closed;
             reason += `. ${tab.reason}`;
             if (tab.closed && run.group && ready.groups.get(run.group.workspaceId, run.group.group)) ready.groups.forgetClosed(run.group);
+          } else if (!run.worktreeId && !run.target && run.groupCreatedByRun && run.group && ready.groups.get(run.group.workspaceId, run.group.group)) {
+            const partial = await cleanupPartialStart({ client: ready.client, groupManager: ready.groups, group: run.group, journal: run.journal, groupCreatedThisAttempt: true, ...(signal === undefined ? {} : { signal }) });
+            tabClosed = partial.closedTabIds.includes(run.group.tabId);
+            reason += partial.retained.length > 0
+              ? `. Read-only group retained: ${partial.retained.join("; ")}`
+              : `. Existing partial-start cleanup closed tabs [${partial.closedTabIds.join(", ") || "none"}] and panes [${partial.closedPaneIds.join(", ") || "none"}]`;
           }
           result = { stopped: true, forced: false, tabClosed, retained: false, reason, output: run.lastOutput };
         } else {

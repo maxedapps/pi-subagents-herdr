@@ -3,6 +3,7 @@ import { revalidateLaunchFilesystemBoundary } from "../policy/capabilities.ts";
 import { HerdrApiError, type AgentInfo } from "../herdr/protocol.ts";
 import type { HerdrRequestClient } from "../herdr/client.ts";
 import { assertPreparedHarnessLaunch, validateResolvedExecutable, type PreparedHarnessLaunch } from "../harnesses/index.ts";
+import { reconcileExactPlacement, type DelegationPlacementIdentity } from "./groups.ts";
 import {
   abortError,
   boundRecentOutput,
@@ -22,8 +23,7 @@ import {
 export interface StartSubagentInput {
   readonly client: HerdrRequestClient;
   readonly prepared: PreparedHarnessLaunch;
-  readonly workspaceId: string;
-  readonly tabId: string;
+  readonly placement: DelegationPlacementIdentity;
   readonly instructions: string;
   /** Must consult current active-branch journal/session state on every invocation. */
   readonly authorization: RuntimeOwnershipAuthorization;
@@ -69,6 +69,21 @@ export class StartCleanupError extends Error {
     options?: ErrorOptions,
   ) {
     super(message, options); this.name = "StartCleanupError";
+  }
+}
+
+export class PlacementStartExhaustedError extends StartCleanupError {
+  readonly attempts: number;
+  constructor(attempts: number, options?: ErrorOptions) {
+    super(
+      `Herdr rejected the exact delegation placement with agent_placement_not_found on all ${attempts} bounded attempts; no child identity was returned`,
+      "not-created",
+      "agent.start explicitly rejected the placement before creating a child; extension-owned group/worktree resources may still exist",
+      undefined,
+      options,
+    );
+    this.name = "PlacementStartExhaustedError";
+    this.attempts = attempts;
   }
 }
 
@@ -123,6 +138,32 @@ function rootCauseMessage(error: unknown): string {
   return messages.join(" <- ");
 }
 
+const PLACEMENT_START_ATTEMPTS = 3;
+const PLACEMENT_RETRY_DELAY_MS = 50;
+
+async function startAgentAtExactPlacement(input: StartSubagentInput, launchBoundary: { readonly cwd: string }): Promise<AgentInfo> {
+  for (let attempt = 1; attempt <= PLACEMENT_START_ATTEMPTS; attempt += 1) {
+    if (input.signal?.aborted) throw abortError(input.signal);
+    await reconcileExactPlacement(input.client, input.placement, input.signal, 0);
+    try {
+      return await input.client.startAgent({
+        name: input.prepared.context.sessionName,
+        argv: input.prepared.launch.argv,
+        workspace_id: input.placement.workspaceId,
+        tab_id: input.placement.tabId,
+        cwd: launchBoundary.cwd,
+        env: input.prepared.launch.env,
+        focus: false,
+      }, input.signal);
+    } catch (error) {
+      if (!(error instanceof HerdrApiError) || error.code !== "agent_placement_not_found") throw error;
+      if (attempt === PLACEMENT_START_ATTEMPTS) throw new PlacementStartExhaustedError(attempt, { cause: error });
+      await delay(PLACEMENT_RETRY_DELAY_MS, input.signal);
+    }
+  }
+  throw new Error("Unreachable placement retry state");
+}
+
 async function preSubmitOutput(client: HerdrRequestClient, target: OwnedRunTarget, signal?: AbortSignal): Promise<BoundedOutput | undefined> {
   try {
     const read = await client.readAgent(target.terminalId, { source: "recent_unwrapped", lines: 160, strip_ansi: true, format: "text" }, signal);
@@ -170,15 +211,7 @@ export async function startSubagent(input: StartSubagentInput): Promise<StartSub
 
   let target: OwnedRunTarget | undefined;
   try {
-    const started = await input.client.startAgent({
-      name: input.prepared.context.sessionName,
-      argv: input.prepared.launch.argv,
-      workspace_id: input.workspaceId,
-      tab_id: input.tabId,
-      cwd: launchBoundary.cwd,
-      env: input.prepared.launch.env,
-      focus: false,
-    }, input.signal);
+    const started = await startAgentAtExactPlacement(input, launchBoundary);
     const initialNative = nativeFor(started);
     const initialTarget: OwnedRunTarget = {
       runId: input.prepared.context.metadata.runId,
@@ -191,7 +224,7 @@ export async function startSubagent(input: StartSubagentInput): Promise<StartSub
     };
     target = initialTarget;
     await input.recordStarted(started);
-    if (started.workspace_id !== input.workspaceId || started.tab_id !== input.tabId) {
+    if (started.workspace_id !== input.placement.workspaceId || started.tab_id !== input.placement.tabId) {
       throw new RuntimeIdentityError("agent.start returned a child outside the requested dedicated tab/workspace");
     }
     if (started.agent !== undefined && started.agent !== null && started.agent !== input.prepared.adapter.kind) {
@@ -253,7 +286,7 @@ export async function startSubagent(input: StartSubagentInput): Promise<StartSub
       );
     }
   } catch (error) {
-    if (error instanceof TurnSubmissionUncertainError) throw error;
+    if (error instanceof TurnSubmissionUncertainError || error instanceof PlacementStartExhaustedError) throw error;
     if (target === undefined) throw new StartCleanupError(rootCauseMessage(error), "not-created", "agent.start returned no resource identity", undefined, { cause: error });
     const output = await preSubmitOutput(input.client, target, input.signal);
     const cleanup = await cleanupPreSubmitFailure(input.client, target, input.signal);

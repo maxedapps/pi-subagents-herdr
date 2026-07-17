@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { HerdrApiError, type AgentInfo, type AgentStartInput, type PaneInfo, type PaneProcessInfo, type ReadResult, type SessionSnapshot, type TabInfo, type WorkspaceInfo } from "../../src/herdr/protocol.ts";
 import type { HerdrRequestClient } from "../../src/herdr/client.ts";
+import { HerdrUnavailableError } from "../../src/herdr/transport.ts";
 import type { EffectiveLaunchPolicy } from "../../src/contracts/harness.ts";
 import type { AgentProfile } from "../../src/contracts/profile.ts";
 import { assembleChildInstructions } from "../../src/harnesses/prompt.ts";
@@ -13,7 +14,7 @@ import { boundRecentOutput, hasUnambiguousTurnEvidence, MAX_OUTPUT_BYTES, MAX_OU
 import { processBaseline, type DelegationGroup } from "../../src/runtime/groups.ts";
 import { interruptSubagent } from "../../src/runtime/interrupt.ts";
 import { sendToSubagent } from "../../src/runtime/send.ts";
-import { StartCleanupError, TurnSubmissionUncertainError, startSubagent } from "../../src/runtime/start.ts";
+import { PlacementStartExhaustedError, StartCleanupError, TurnSubmissionUncertainError, startSubagent } from "../../src/runtime/start.ts";
 import { stopSubagent } from "../../src/runtime/stop.ts";
 import { waitForSubagent } from "../../src/runtime/wait.ts";
 import { createFakeCliFixture } from "../support/fake-cli.ts";
@@ -47,6 +48,8 @@ class FakeLifecycleClient {
   inputMutationChangesEvidence = true;
   failNextInputResponse = false;
   failNextKeysResponse = false;
+  placementRejections = 0;
+  startError: unknown;
 
   childAgent(): AgentInfo {
     return {
@@ -57,7 +60,10 @@ class FakeLifecycleClient {
   }
   childPaneInfo(): PaneInfo { return { ...this.childAgent(), pane_id: this.childPane }; }
   async startAgent(input: AgentStartInput): Promise<AgentInfo> {
-    this.startCalls.push(input); this.childLive = true; const started = this.childAgent(); if (this.exitBeforeReady) this.childLive = false; return started;
+    this.startCalls.push(input);
+    if (this.placementRejections > 0) { this.placementRejections -= 1; throw new HerdrApiError(`placement-${this.startCalls.length}`, "agent_placement_not_found", "placement is not visible yet"); }
+    if (this.startError !== undefined) throw this.startError;
+    this.childLive = true; const started = this.childAgent(); if (this.exitBeforeReady) this.childLive = false; return started;
   }
   async snapshot(): Promise<SessionSnapshot> {
     const panes = this.tabLive ? [anchor, ...(this.childLive ? [this.childPaneInfo()] : [])] : [];
@@ -119,7 +125,7 @@ test("fake lifecycle starts without task argv, waits for readiness, submits atom
   try {
     const prompt = instructions(fx.prepared); let recorded = false;
     const result = await startSubagent({
-      client: client(fake), prepared: fx.prepared, workspaceId: "w1", tabId: "w1:t1", instructions: prompt, authorization,
+      client: client(fake), prepared: fx.prepared, placement: group(), instructions: prompt, authorization,
       recordStarted: (agent) => { assert.equal(agent.terminal_id, "term_child"); assert.equal(fake.inputs.length, 0); recorded = true; },
       startupTimeoutMs: 100, turnStartTimeoutMs: 100, pollIntervalMs: 1,
     });
@@ -133,11 +139,62 @@ test("fake lifecycle starts without task argv, waits for readiness, submits atom
   } finally { await fx.cleanup(); }
 });
 
+test("explicit placement rejection retries are bounded, revalidated, and submit exactly once", async () => {
+  for (const rejections of [1, 2]) {
+    const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.placementRejections = rejections;
+    try {
+      let recorded = 0;
+      const result = await startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => { recorded += 1; }, startupTimeoutMs: 50, turnStartTimeoutMs: 50, pollIntervalMs: 1 });
+      assert.equal(result.started, true); assert.equal(fake.startCalls.length, rejections + 1); assert.equal(recorded, 1); assert.equal(fake.inputs.length, 1); assert.equal(fake.childLive, true);
+    } finally { await fx.cleanup(); }
+  }
+});
+
+test("placement exhaustion returns a proven-no-child error after exactly three calls", async () => {
+  const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.placementRejections = 3;
+  try {
+    await assert.rejects(
+      startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => assert.fail("rejected placement must not bind a child"), startupTimeoutMs: 50, pollIntervalMs: 1 }),
+      (error: unknown) => error instanceof PlacementStartExhaustedError && error.attempts === 3 && error.cleanup === "not-created",
+    );
+    assert.equal(fake.startCalls.length, 3); assert.equal(fake.childLive, false); assert.equal(fake.inputs.length, 0);
+  } finally { await fx.cleanup(); }
+});
+
+test("other API and transport launch errors are never retried", async () => {
+  const errors = [
+    new HerdrApiError("launch-1", "invalid_params", "rejected"),
+    new HerdrUnavailableError("socket disconnected"),
+  ];
+  for (const startError of errors) {
+    const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.startError = startError;
+    try {
+      await assert.rejects(
+        startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined }),
+        (error: unknown) => error instanceof StartCleanupError && !(error instanceof PlacementStartExhaustedError),
+      );
+      assert.equal(fake.startCalls.length, 1); assert.equal(fake.childLive, false);
+    } finally { await fx.cleanup(); }
+  }
+});
+
+test("abort after an explicit placement rejection stops before retry", async () => {
+  const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); const abort = new AbortController();
+  fake.startAgent = async (input) => { fake.startCalls.push(input); abort.abort(new Error("parent cancelled placement retry")); throw new HerdrApiError("placement-abort", "agent_placement_not_found", "not visible"); };
+  try {
+    await assert.rejects(
+      startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, signal: abort.signal }),
+      /parent cancelled placement retry/,
+    );
+    assert.equal(fake.startCalls.length, 1); assert.equal(fake.childLive, false);
+  } finally { await fx.cleanup(); }
+});
+
 test("initial send response loss is submission-uncertain and retains the child without pre-submit cleanup", async () => {
   const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.failNextInputResponse = true;
   try {
     await assert.rejects(
-      startSubagent({ client: client(fake), prepared: fx.prepared, workspaceId: "w1", tabId: "w1:t1", instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, turnStartTimeoutMs: 20, pollIntervalMs: 1 }),
+      startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, turnStartTimeoutMs: 20, pollIntervalMs: 1 }),
       (error: unknown) => error instanceof TurnSubmissionUncertainError && /must not be retried automatically/.test(error.message),
     );
     assert.equal(fake.childLive, true);
@@ -151,7 +208,7 @@ test("explicit initial input rejection remains a pre-submit failure and permits 
   fake.sendInput = async () => { throw new HerdrApiError("request-1", "invalid_params", "rejected"); };
   try {
     await assert.rejects(
-      startSubagent({ client: client(fake), prepared: fx.prepared, workspaceId: "w1", tabId: "w1:t1", instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, turnStartTimeoutMs: 20, pollIntervalMs: 1 }),
+      startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, turnStartTimeoutMs: 20, pollIntervalMs: 1 }),
       (error: unknown) => error instanceof StartCleanupError && error.cleanup === "closed",
     );
     assert.deepEqual(fake.closedPanes, ["w1:p1"]);
@@ -161,7 +218,7 @@ test("explicit initial input rejection remains a pre-submit failure and permits 
 test("initial blocked state preserves pane and never submits the task", async () => {
   const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.childStatus = "blocked";
   try {
-    const result = await startSubagent({ client: client(fake), prepared: fx.prepared, workspaceId: "w1", tabId: "w1:t1", instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, pollIntervalMs: 1 });
+    const result = await startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, pollIntervalMs: 1 });
     assert.equal(result.started, false); assert.equal(result.blocked, true); assert.equal(fake.inputs.length, 0); assert.equal(fake.childLive, true); assert.equal(fake.closedPanes.length, 0);
   } finally { await fx.cleanup(); }
 });
@@ -170,7 +227,7 @@ test("startup timeout performs only identity-verified pre-submit cleanup", async
   const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.childStatus = "unknown"; fake.initialNative = false;
   try {
     await assert.rejects(
-      startSubagent({ client: client(fake), prepared: fx.prepared, workspaceId: "w1", tabId: "w1:t1", instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 10, pollIntervalMs: 1 }),
+      startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 10, pollIntervalMs: 1 }),
       (error: unknown) => error instanceof StartCleanupError && error.cleanup === "closed",
     );
     assert.deepEqual(fake.closedPanes, ["w1:p1"]); assert.equal(fake.inputs.length, 0);
@@ -181,7 +238,7 @@ test("pre-submit harness exit reports bounded root-cause output and truthful alr
   const fx = await preparedFixture(); const fake = new FakeLifecycleClient(); fake.exitBeforeReady = true; fake.output = "Invalid MCP configuration: mcpServers: expected record";
   try {
     await assert.rejects(
-      startSubagent({ client: client(fake), prepared: fx.prepared, workspaceId: "w1", tabId: "w1:t1", instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, pollIntervalMs: 1 }),
+      startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 50, pollIntervalMs: 1 }),
       (error: unknown) => {
         assert.ok(error instanceof StartCleanupError);
         assert.equal(error.cleanup, "closed");
