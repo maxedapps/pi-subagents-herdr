@@ -5,6 +5,7 @@ dist/
 /.plans/
 /.progress/
 /.subagents/
+/.reviews/
 .subagents-test/
 .tmp/
 .DS_Store
