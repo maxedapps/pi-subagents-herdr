@@ -17,7 +17,7 @@ const parentSessionId = value("--parent-session-id");
 const parentSessionPath = value("--parent-session-path");
 const cwd = resolve(value("--cwd") ?? process.cwd());
 
-if (!["pi", "claude", "codex"].includes(harness)) throw new Error("--harness must be pi, claude, or codex");
+if (!["pi", "claude", "codex", "grok"].includes(harness)) throw new Error("--harness must be pi, claude, codex, or grok");
 if (!["completion", "interrupt"].includes(scenario)) throw new Error("--scenario must be completion or interrupt");
 if (!confirmed) {
   process.stdout.write(`${JSON.stringify({

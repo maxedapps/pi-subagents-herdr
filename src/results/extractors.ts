@@ -66,6 +66,7 @@ export async function tryCapturePiBridge(input: {
       result: createCapturedResult({
         runId: input.run.id,
         runNonce: input.run.runNonce,
+        source: "pi-final-assistant",
         generation: input.generation.generation,
         requestNonce: input.generation.requestNonce,
         rawText: validated.rawText,
@@ -79,5 +80,37 @@ export async function tryCapturePiBridge(input: {
       kind: "unavailable",
       reason: `Pi bridge response malformed: ${error instanceof Error ? error.message : String(error)}`,
     };
+  }
+}
+
+export interface TerminalOutputCapture {
+  readonly text: string;
+  readonly revision: number;
+  readonly truncated: boolean;
+}
+
+/** Convert one already ownership-validated bounded Herdr read into a truthful transcript result. */
+export function captureHerdrTerminalOutput(input: {
+  readonly run: ExtractorRunView;
+  readonly generation: PendingGeneration;
+  readonly output: TerminalOutputCapture;
+}): CaptureOutcome {
+  if (input.run.harness === "pi") return { kind: "unavailable", reason: "Pi never falls back to terminal output" };
+  if (input.output.text.trim().length === 0) return { kind: "unavailable", reason: "Herdr terminal output is empty" };
+  try {
+    return {
+      kind: "captured",
+      result: createCapturedResult({
+        runId: input.run.id,
+        runNonce: input.run.runNonce,
+        generation: input.generation.generation,
+        requestNonce: input.generation.requestNonce,
+        source: "herdr-terminal-output",
+        terminalOutput: { outputRevision: input.output.revision, truncated: input.output.truncated },
+        rawText: input.output.text,
+      }),
+    };
+  } catch (error) {
+    return { kind: "unavailable", reason: `Herdr terminal output malformed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }

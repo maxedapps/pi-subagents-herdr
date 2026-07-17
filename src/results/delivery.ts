@@ -105,6 +105,7 @@ export function buildDeliveredText(input: {
   readonly maxBytes?: number;
 }): string {
   const { envelope, profileName } = input;
+  const terminal = envelope.source === "herdr-terminal-output" ? envelope.terminalOutput : undefined;
   const header = [
     `${RESULT_SENTINEL_PREFIX} ${JSON.stringify({
       resultId: envelope.resultId,
@@ -113,12 +114,15 @@ export function buildDeliveredText(input: {
       profile: profileName,
       generation: envelope.generation,
       source: envelope.source,
-      limitations: "structured-final",
+      limitations: terminal ? "bounded-herdr-terminal-transcript-not-an-exact-final-message" : "structured-final",
+      ...(terminal === undefined ? {} : { truncated: terminal.truncated, outputRevision: terminal.outputRevision }),
       ...(envelope.stopReason && envelope.stopReason !== "stop" ? { stopReason: envelope.stopReason } : {}),
       ...(envelope.emptyFinal ? { emptyFinal: true } : {}),
     })}`,
     `Subagent result for ${envelope.runId} (${profileName}) generation ${envelope.generation}`,
-    `source=${envelope.source} stage=${envelope.delivery.stage}`,
+    terminal
+      ? `source=${envelope.source} stage=${envelope.delivery.stage} truncated=${terminal.truncated}; bounded Herdr terminal transcript (not an exact final assistant message)`
+      : `source=${envelope.source} stage=${envelope.delivery.stage}`,
     "",
   ].join("\n");
   const action = input.actionText ? `\n\n${input.actionText}` : "";

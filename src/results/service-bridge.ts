@@ -46,6 +46,7 @@ export interface ResultServiceHost {
   listManagedRuns(): Iterable<ResultManagedRun>;
   getManagedRun(runId: string): ResultManagedRun | undefined;
   persistRunMetadata(runId: string): Promise<void>;
+  captureTerminalOutput(runId: string): Promise<{ readonly text: string; readonly revision: number; readonly truncated: boolean }>;
   refreshAttention?(runId: string): Promise<void>;
   onResultStageAdvanced?(envelope: ResultEnvelopeV1): void;
   notifyUi(): void;
@@ -119,6 +120,7 @@ export function installResultServices(host: ResultServiceHost): {
       return run ? toCoordinatorView(host, run) : undefined;
     },
     persistRunMetadata: (runId) => host.persistRunMetadata(runId),
+    captureTerminalOutput: (runId) => host.captureTerminalOutput(runId),
     onResultCaptured: (envelope) => {
       const run = host.getManagedRun(envelope.runId);
       if (run) {

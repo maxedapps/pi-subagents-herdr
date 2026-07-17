@@ -18,7 +18,7 @@ function document(frontmatter: string, body = "Do the bounded task."): string {
 test("profile schema accepts every documented optional field", () => {
   const parsed = parseProfile(document(`name: complete-profile
 description: Complete strict profile
-harness: codex
+harness: grok
 model: configured-model
 thinking: xhigh
 permissions: write
@@ -33,7 +33,7 @@ artifacts:
   handoff: .subagents/{id}.handoff.md
   writer: child`), source());
   assert.equal(parsed.name, "complete-profile");
-  assert.equal(parsed.harness, "codex");
+  assert.equal(parsed.harness, "grok");
   assert.deepEqual(parsed.preferredTools, ["web_search"]);
   assert.equal(parsed.artifacts?.writer, "child");
 });

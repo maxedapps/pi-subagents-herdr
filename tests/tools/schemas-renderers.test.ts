@@ -9,6 +9,7 @@ import { registerStatusTool } from "../../src/tools/status.ts";
 
 test("tool schemas are strict, bounded, and Google-compatible", () => {
   assert.equal(Value.Check(StartToolSchema, { profile: "scout", task: "Map auth" }), true);
+  assert.equal(Value.Check(StartToolSchema, { profile: "scout", task: "Map auth", harness: "grok" }), true);
   assert.equal(Value.Check(StartToolSchema, { profile: "Scout", task: "Map auth" }), false);
   assert.equal(Value.Check(StartToolSchema, { profile: "scout", task: "Map auth", extra: true }), false);
   assert.equal(Value.Check(StatusToolSchema, {}), true);

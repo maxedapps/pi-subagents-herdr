@@ -94,7 +94,9 @@ export class TurnSubmissionUncertainError extends Error {
 }
 
 function nativeRequired(prepared: PreparedHarnessLaunch): boolean {
-  if (prepared.adapter.kind === "claude") return (prepared.context.integrationPolicy ?? "integrated") === "integrated";
+  const capability = prepared.adapter.capabilities.nativeSessionIdentity;
+  if (capability === "screen-only") return false;
+  if (capability === "integrated-only") return (prepared.context.integrationPolicy ?? "integrated") === "integrated";
   return true;
 }
 

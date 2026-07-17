@@ -245,8 +245,8 @@ export interface SafeCleanupInput {
   readonly artifactCapture: CaptureWorktreeArtifactsOptions;
   readonly parentRoots: ArtifactRoots;
   readonly integrationEvidence?: IntegrationVerificationRequest;
-  /** A structured result or explicit failure notice is already durable in the parent branch. */
-  readonly resultEvidencePersisted?: boolean;
+  /** A result envelope or exact failed notice is already durable in the parent branch. */
+  readonly resultEvidencePersisted: boolean;
   /** Optional caller-owned active-branch proof, rerun at the destructive boundary. */
   readonly revalidateOwnership?: () => Promise<void>;
   readonly signal?: AbortSignal;
@@ -300,6 +300,14 @@ export class WorktreeCleanupManager {
       const reason = `Worktree retained because durable recovery is uncertain: ${record.recoveryIssue}`;
       return { removed: record.state === "removed", retained: true, state: record.state, reason, record };
     }
+    if ((input.cleanup ?? "remove_if_safe") === "retain") {
+      record = this.registry.retain(record.id, "Writer worktree was explicitly retained; parent review/integration/finalization remains required");
+      return { removed: false, retained: true, state: record.state, reason: record.retentionReason!, record };
+    }
+    if (input.resultEvidencePersisted !== true) {
+      const reason = "Parent result/failure evidence is not yet persisted; cleanup is retryable after delivery";
+      return { removed: record.state === "removed", retained: true, state: record.state, reason, record };
+    }
     if (record.removalAttempt) {
       const { workspaceId, checkoutPath } = record;
       const [snapshot, listed] = await Promise.all([this.client.snapshot(input.signal), this.client.listWorktrees({ cwd: record.sourceCheckoutPath }, input.signal)]);
@@ -335,12 +343,7 @@ export class WorktreeCleanupManager {
         return { removed: true, retained: true, state: record.state, reason, record };
       }
     }
-    if ((input.cleanup ?? "remove_if_safe") === "retain") {
-      record = this.registry.retain(record.id, "Writer worktree was explicitly retained; parent review/integration/finalization remains required");
-      return { removed: false, retained: true, state: record.state, reason: record.retentionReason!, record };
-    }
     try {
-      if (input.resultEvidencePersisted === false) throw new Error("Parent result/failure evidence is not yet persisted; cleanup is retryable after delivery");
       // Capture configured supplemental artifacts before volatile topology checks.
       record = await ensureArtifacts({ registry: this.registry, record, capture: input.artifactCapture, parentRoots: input.parentRoots });
       try { await assertClean(record); }
@@ -381,6 +384,10 @@ export class WorktreeCleanupManager {
     assertOwnership(record, input.ownership);
     if (record.recoveryIssue || record.removalAttempt) {
       const reason = record.recoveryIssue ? `Worktree retained because durable recovery is uncertain: ${record.recoveryIssue}` : "Worktree retained because a prior durable removal attempt has an unresolved outcome";
+      return { removed: false, retained: true, state: record.state, reason, record };
+    }
+    if (input.resultEvidencePersisted !== true) {
+      const reason = "Parent result/failure evidence is not yet persisted; human discard cannot substitute for durable handoff evidence";
       return { removed: false, retained: true, state: record.state, reason, record };
     }
     const authorization = input.authorization;

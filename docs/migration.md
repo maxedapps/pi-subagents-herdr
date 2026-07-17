@@ -21,11 +21,11 @@ The five tools remain:
 
 Writer stop now defaults to automatic `remove_if_safe`; explicit `cleanup: "retain"` is exceptional. `subagent_stop` is idempotent for a proven already-stopped owned run, so the same call retries after integration, transient refusal, or reload. `parentReview` remains accepted as optional audit text but is not a deletion gate.
 
-Results can contain `ACTION REQUIRED`; later unresolved transitions use `herdr-subagents.action-required.v1`. Status/UI expose the same attention state. Resolve it before final reporting.
+Pi results remain exact structured finals. Claude, Codex, and Grok results are bounded Herdr terminal transcripts with explicit source/truncation metadata; no CLI-specific parser is added. Results can contain `ACTION REQUIRED`; later unresolved transitions use `herdr-subagents.action-required.v1`. Status/UI expose the same attention state. Resolve it before final reporting.
 
 ## Runtime metadata and recovery
 
-New runs write schema-v5 `run.json` with lifecycle, action state, ownership journal, and exact worktree snapshot while unresolved. Schema-v3/v4 files are parsed and normalized for current-active-branch stopped cleanup. They often lack enough exact worktree/ownership state for safe **cross-session** adoption; those resources remain untouched and appear in a consolidated recovery notice.
+New runs write schema-v5 `run.json` with lifecycle, action state, ownership journal, and exact worktree snapshot while unresolved. Earlier metadata schemas are intentionally unsupported during early development; remove or archive old `.subagents/runs/*` state before loading this version.
 
 Schema-v5 prior-session cleanup can be reauthorized only after exact stopped Git/Herdr/nonce/branch/path/anchor proof. This never adopts a process or prior private result.
 
@@ -48,13 +48,17 @@ Legacy `skills`, `preferredSkills`, `artifacts.prompt`, and `artifacts.system` r
 
 ## Finalization and residue
 
-After parent result/failure persistence plus clean objective integration/no-change proof, finalization removes:
+After a parent-persisted result envelope or exact parent-persisted `failed` notice plus clean objective integration/no-change proof, finalization removes:
 
 1. Herdr workspace/tabs/panes and linked worktree, non-forcibly;
 2. only the exact manager-generated branch at its expected child HEAD;
 3. transient `.subagents/runs/<id>` metadata/results.
 
 Caller-supplied, moved, dirty, live, unintegrated, tampered, orphaned, and ambiguous resources remain. Verified custom `captured/` content remains intentionally. There is no age/path-only garbage collector or extra cleanup command.
+
+## Activation and rollback
+
+Package source tests do not activate the extension. Build one reviewed archive, record its SHA-256/source commit, install that exact file, reload Pi, and verify the installed copy plus `/subagents-doctor`. Keep the prior archive for rollback. Resolve or explicitly retain owned runs before either install or rollback because reload does not stop children.
 
 ## Settings
 

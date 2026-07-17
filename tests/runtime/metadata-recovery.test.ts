@@ -18,7 +18,7 @@ function journal() {
 
 function metadata(root: string) {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     runId: "run-1",
     runNonce: "nonce-1",
     terminalId: "term-1",
@@ -28,6 +28,7 @@ function metadata(root: string) {
     harness: "pi",
     taskSynopsis: "inspect",
     artifactWriter: "parent",
+    lifecycle: "stopped",
     createdAt: 1,
     policy: { thinking: "low", cwd: root, tools: ["read"], mutation: false, network: false, requireWorktree: false },
     artifacts: {
@@ -70,13 +71,12 @@ test("cleanup-only adoption is an explicit terminal ownership phase with full im
   assert.throws(() => writer.append(adopted, "started", {}), /Invalid ownership journal transition/);
 });
 
-test("schema 3/4 metadata migrates to 5 while unsupported versions and policy.skills are rejected", () => {
-  const root = "/tmp/metadata-migration";
-  const v4 = parseRuntimeRunMetadata(metadata(root)); assert.equal(v4.schemaVersion, 5);
-  const { generation: _generation, ...legacy } = metadata(root);
-  const v3 = parseRuntimeRunMetadata({ ...legacy, schemaVersion: 3 }); assert.equal(v3.schemaVersion, 5); assert.equal(v3.generation.nextGeneration, 1);
-  assert.throws(() => parseRuntimeRunMetadata({ ...metadata(root), schemaVersion: 2 }), /malformed/);
-  assert.throws(() => parseRuntimeRunMetadata({ ...metadata(root), schemaVersion: 6 }), /malformed/);
+test("only current schema metadata is accepted", () => {
+  const root = "/tmp/current-metadata";
+  assert.equal(parseRuntimeRunMetadata(metadata(root)).schemaVersion, 5);
+  const { nativeSession: _native, ...screenOnly } = metadata(root);
+  const grok = parseRuntimeRunMetadata({ ...screenOnly, harness: "grok" }); assert.equal(grok.harness, "grok"); assert.equal(grok.nativeSession, undefined);
+  for (const schemaVersion of [2, 3, 4, 6]) assert.throws(() => parseRuntimeRunMetadata({ ...metadata(root), schemaVersion }), /malformed/);
   assert.throws(() => parseRuntimeRunMetadata({
     ...metadata(root),
     policy: { ...metadata(root).policy, skills: [{ name: "x", path: "/tmp/x/SKILL.md" }] },

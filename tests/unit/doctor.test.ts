@@ -13,7 +13,7 @@ function reply(request: FakeHerdrRequest, result: JsonValue): JsonValue { return
 const probe: DoctorProbe = {
   async exec(command, args) {
     if (command === "git") return { code: 128, stdout: "", stderr: "not a repository" };
-    if (command === "herdr" && args[0] === "integration") return { code: 0, stdout: "pi: current (v4)\nclaude: current (v7)\ncodex: current (v6)\n", stderr: "" };
+    if (command === "herdr" && args[0] === "integration") return { code: 0, stdout: "pi: current (v4)\nclaude: current (v7)\ncodex: current (v6)\ngrok: current (v1)\n", stderr: "" };
     return { code: 0, stdout: `${command} test-version\n`, stderr: "" };
   },
 };
@@ -62,7 +62,7 @@ test("doctor reports requested .progress protection and pre-existing untracked c
       if (command === "git" && args.includes("check-ignore")) return { code: args.some((arg) => arg.includes(".subagents")) ? 0 : 1, stdout: "", stderr: "" };
       if (command === "git" && args.includes("--others")) return { code: 0, stdout: ".progress/existing.md\n", stderr: "" };
       if (command === "git" && args.includes("ls-files")) return { code: 0, stdout: "", stderr: "" };
-      if (command === "herdr" && args[0] === "integration") return { code: 0, stdout: "pi: current (v4)\nclaude: current (v7)\ncodex: current (v6)\n", stderr: "" };
+      if (command === "herdr" && args[0] === "integration") return { code: 0, stdout: "pi: current (v4)\nclaude: current (v7)\ncodex: current (v6)\ngrok: current (v1)\n", stderr: "" };
       return { code: command === "pi" ? 0 : 1, stdout: command === "pi" ? "0.80.6\n" : "", stderr: "unavailable" };
     },
   };

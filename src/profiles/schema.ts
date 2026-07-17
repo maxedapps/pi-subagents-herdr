@@ -6,7 +6,7 @@ import type {
   ProfileSource,
   ProfileWorktreePolicy,
 } from "../contracts/profile.ts";
-import type { Harness, ThinkingLevel } from "../contracts/harness.ts";
+import { HARNESSES, type Harness, type ThinkingLevel } from "../contracts/harness.ts";
 import { assertRunUniqueArtifactTemplate } from "../artifacts/paths.ts";
 
 export const PROFILE_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -26,7 +26,6 @@ export const PROFILE_FIELDS = Object.freeze([
   "artifacts",
 ] as const);
 
-const HARNESSES = ["pi", "claude", "codex"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const PERMISSIONS = ["read-only", "write"] as const;
 const WORKTREE_POLICIES = ["forbidden", "optional", "required", "required-for-concurrency"] as const;

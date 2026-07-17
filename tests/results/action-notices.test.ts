@@ -3,6 +3,7 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   ACTION_NOTICE_CUSTOM_TYPE,
+  ACTION_NOTICE_SENTINEL,
   ActionNoticeService,
   deriveRunAttention,
   findPersistedActionNotice,
@@ -99,6 +100,40 @@ test("persistence requires an exact action sentinel, not an incidental notice-id
   assert.equal(findPersistedActionNotice(spoof, attention.noticeId), undefined);
   spoof[0] = { ...spoof[0]!, message: { customType: ACTION_NOTICE_CUSTOM_TYPE, content: formatActionNotice("run-1", attention) } } as unknown as PiBranchEntry;
   assert.equal(findPersistedActionNotice(spoof, attention.noticeId)?.id, "spoof");
+});
+
+test("consolidated sentinels satisfy exact validated noticeIds membership only", () => {
+  const content = `${ACTION_NOTICE_SENTINEL} ${JSON.stringify({ noticeId: "summary", noticeIds: ["act-a", "act-b"] })}\nsummary`;
+  const entry = { type: "message", id: "summary-entry", parentId: null, message: { customType: ACTION_NOTICE_CUSTOM_TYPE, content } } as unknown as PiBranchEntry;
+  assert.equal(findPersistedActionNotice([entry], "act-a")?.id, "summary-entry");
+  assert.equal(findPersistedActionNotice([entry], "act")?.id, undefined);
+  for (const noticeIds of [[], ["act-a", 1], ["act-a", ""], ["act-a", "act-a"], "act-a"] as unknown[]) {
+    const malformed = { ...entry, message: { customType: ACTION_NOTICE_CUSTOM_TYPE, content: `${ACTION_NOTICE_SENTINEL} ${JSON.stringify({ noticeId: "summary", noticeIds })}` } } as unknown as PiBranchEntry;
+    assert.equal(findPersistedActionNotice([malformed], "act-a"), undefined);
+  }
+  const wrongType = { ...entry, message: { customType: "other", content } } as unknown as PiBranchEntry;
+  assert.equal(findPersistedActionNotice([wrongType], "act-a"), undefined);
+});
+
+test("one consolidated branch message reconciles multiple dispatched notices", async () => {
+  const branch = fixture();
+  let first = deriveRunAttention("run-1", undefined, { kind: "recovery_required", reason: "first", nextActions: ["inspect"] });
+  let second = deriveRunAttention("run-2", undefined, { kind: "cleanup_required", reason: "second", nextActions: ["retry"] });
+  first = { ...first, delivery: { stage: "dispatched", runtimeEpoch: "epoch" } }; second = { ...second, delivery: { stage: "dispatched", runtimeEpoch: "epoch" } };
+  const content = `${ACTION_NOTICE_SENTINEL} ${JSON.stringify({ noticeId: "summary", noticeIds: [first.noticeId, second.noticeId] })}\nsummary`;
+  branch.push({ type: "message", id: "summary-entry", parentId: branch.at(-1)!.id, message: { customType: ACTION_NOTICE_CUSTOM_TYPE, content } } as unknown as PiBranchEntry);
+  const items = () => [
+    { runId: "run-1", runNonce: "nonce-1", parentSessionId: "parent", terminalId: "term-1", attention: first },
+    { runId: "run-2", runNonce: "nonce-2", parentSessionId: "parent", terminalId: "term-2", attention: second },
+  ];
+  const service = new ActionNoticeService({
+    pi: { sendMessage() { throw new Error("must not send per-run duplicates"); } } as unknown as ExtensionAPI, runtimeEpoch: "epoch",
+    getContext: () => ({ sessionManager: { getSessionId: () => "parent", getSessionFile: () => undefined, getBranch: () => branch } }) as unknown as ExtensionContext,
+    listQueued: async () => items(),
+    updateAttention: async (runId, update) => runId === "run-1" ? (first = update(first)) : (second = update(second)),
+  });
+  await service.reconcilePersistence(); await service.flush();
+  assert.equal(first.delivery.stage, "parent_persisted"); assert.equal(second.delivery.stage, "parent_persisted");
 });
 
 test("authorization rejects a wrong parent session", async () => {

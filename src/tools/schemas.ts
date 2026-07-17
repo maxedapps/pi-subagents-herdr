@@ -1,11 +1,12 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
+import { HARNESSES } from "../contracts/harness.ts";
 
 const strict = { additionalProperties: false } as const;
 const RunId = Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$" });
 const Timeout = Type.Integer({ minimum: 1, maximum: 86_400_000 });
 const Thinking = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const);
-const Harness = StringEnum(["pi", "claude", "codex"] as const);
+const Harness = StringEnum(HARNESSES);
 const SubagentState = StringEnum(["working", "blocked", "done", "idle", "unknown"] as const);
 
 export const StartToolSchema = Type.Object({

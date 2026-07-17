@@ -44,7 +44,7 @@ Optional fields:
 
 | Field | Contract |
 |---|---|
-| `harness` | `pi`, `claude`, `codex`; omitted uses settings default |
+| `harness` | `pi`, `claude`, `codex`, `grok`; omitted uses settings default |
 | `model` | safe harness model identifier; bundled profiles omit |
 | `thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` when supported |
 | `permissions` | `read-only` or `write` |
@@ -63,7 +63,7 @@ Optional fields:
 
 ## Tools, skills, and recursion guard
 
-Pi supports explicit child tool allowlists but not filesystem confinement. Claude uses reviewed built-in mappings and native permission policy, also without filesystem confinement. Codex profiles cannot claim an explicit per-tool allowlist; its sandbox/approval policy is used instead.
+Pi supports explicit child tool allowlists but not filesystem confinement. Claude uses reviewed built-in mappings and native permission policy, also without filesystem confinement. Codex and Grok profiles cannot claim an explicit per-tool allowlist; their native sandbox/approval policy is used instead. Grok also rejects additional writable roots, disables native subagents/memory/auto-update, uses `read-only` for readers, `strict` for network-disabled writers, and `workspace` for network-enabled writers.
 
 Pi children receive no trust, skill, or prompt-template override flags. Each separate Pi process resolves project trust normally, then discovers global/project/package/settings skills and prompt templates as an ordinary Pi instance. Saved trust and global settings are shared through the normal user environment; transient parent `--approve` and session-only trust choices are not inherited. The package contributes `use-herdr-subagents` dynamically in parent mode only, while child guards still prohibit orchestration/delegation tools.
 
@@ -100,7 +100,7 @@ Relative configured paths resolve against the settings file. Empty paths, NULs, 
 |---|---|---|
 | `concurrency.maxRunning` | `4` | 1–64 active/starting or retained-live failed runs |
 | `concurrency.maxWriters` | `1` | 1–16, not above maxRunning |
-| `defaultHarness` | `pi` | Pi/Claude/Codex |
+| `defaultHarness` | `pi` | Pi/Claude/Codex/Grok |
 | `profileDirectories.user/project` | `[]` | trusted path arrays |
 | `widget.visibility` | `auto` | `auto`, `always`, `never` |
 | `integrations.strictness` | `strict` | `strict` or `warn` doctor behavior |

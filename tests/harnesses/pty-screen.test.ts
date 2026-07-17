@@ -53,3 +53,18 @@ test("PTY/screen fixture exercises Codex Escape interrupt and /exit graceful act
     await fixture.waitFor("SCREEN:EXIT:SLASH");
   } finally { await fixture.cleanup(); }
 });
+
+test("PTY/screen fixture exercises Grok Control-C interrupt and /exit graceful action", async () => {
+  const fixture = await createFakePtyCliFixture();
+  try {
+    const adapter = harnessAdapter("grok");
+    sendKeys(fixture.process.stdin, adapter.capabilities.interruptKeys);
+    await fixture.waitFor("SCREEN:INTERRUPTED:CTRL_C");
+    assert.equal(adapter.capabilities.gracefulExit.kind, "input");
+    if (adapter.capabilities.gracefulExit.kind === "input") {
+      fixture.process.stdin.write(adapter.capabilities.gracefulExit.text);
+      sendKeys(fixture.process.stdin, adapter.capabilities.gracefulExit.keys);
+    }
+    await fixture.waitFor("SCREEN:EXIT:SLASH");
+  } finally { await fixture.cleanup(); }
+});

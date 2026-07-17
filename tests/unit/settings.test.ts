@@ -59,7 +59,7 @@ test("settings merge defaults then user then trusted project by field and replac
     assert.notEqual(locations.project, undefined);
     await json(locations.project!, {
       concurrency: { maxRunning: 3 },
-      defaultHarness: "codex",
+      defaultHarness: "grok",
       profileDirectories: { user: ["project-replaces-user-list"], project: ["profiles-project"] },
       integrations: { strictness: "warn" },
     });
@@ -67,7 +67,7 @@ test("settings merge defaults then user then trusted project by field and replac
     const result = await loadSettings({ ...fx, projectTrusted: true });
     assert.deepEqual(result.loaded, ["user", "project"]);
     assert.deepEqual(result.settings.concurrency, { maxRunning: 3, maxWriters: 2 });
-    assert.equal(result.settings.defaultHarness, "codex");
+    assert.equal(result.settings.defaultHarness, "grok");
     assert.deepEqual(result.settings.profileDirectories.user, [
       resolve(dirname(locations.project!), "project-replaces-user-list"),
     ]);

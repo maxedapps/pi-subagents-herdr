@@ -21,14 +21,14 @@ export interface AdapterCapabilities {
   readonly harness: Harness;
   readonly executable: string;
   readonly toolVisibility: ToolVisibilityEnforcement;
-  readonly filesystemConfinement: "none" | "codex-os-sandbox";
+  readonly filesystemConfinement: "none" | "codex-os-sandbox" | "grok-native-sandbox";
   readonly approvalBehavior: ApprovalBehavior;
   readonly modelSelection: true;
   readonly supportedThinking: readonly ThinkingLevel[];
   readonly readiness: ReadinessSignal;
   readonly interruptKeys: readonly string[];
   readonly gracefulExit: ExitAction;
-  readonly nativeSessionIdentity: "available" | "integrated-only";
+  readonly nativeSessionIdentity: "available" | "integrated-only" | "screen-only";
   readonly customizationPolicy: string;
   readonly limitations: readonly string[];
 }
@@ -53,7 +53,7 @@ export interface LaunchContext {
   readonly sessionDirectory?: string;
   readonly systemPromptPath: string;
   readonly integrationPolicy?: HarnessIntegrationPolicy;
-  /** Additional Codex write roots already authorized by monotonic policy. */
+  /** Additional harness write roots already authorized by monotonic policy; unsupported adapters reject them. */
   readonly writableRoots?: readonly string[];
   readonly metadata: ChildMetadata;
 }

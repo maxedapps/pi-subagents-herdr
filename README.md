@@ -8,13 +8,13 @@ Private Pi package that exposes safe, visible subagent orchestration through a H
 
 - Node.js 22.19+, Pi 0.80.6+, Herdr 0.7.3/protocol 16.
 - Parent Pi runs inside the matching Herdr pane/integration.
-- The selected `pi`, `claude`, or `codex` executable is installed and authenticated.
+- The selected `pi`, `claude`, `codex`, or `grok` executable is installed and authenticated.
 
-Every child is visible and interactive. Missing/incompatible backend identity fails closed; there is no hidden subprocess, recursive delegation, cross-harness substitution, or fallback. Pi/Claude tool policies are not filesystem sandboxes; Codex uses its documented OS sandbox. Writers require isolated worktrees. Child completion and test claims are evidence, never parent verification.
+Every child is visible and interactive. Missing/incompatible backend identity fails closed; there is no hidden subprocess, recursive delegation, cross-harness substitution, or fallback. Pi/Claude tool policies are not filesystem sandboxes; Codex and Grok use reviewed native sandbox controls. Writers require isolated worktrees. Child completion and test claims are evidence, never parent verification.
 
 Pi children receive no package-specific trust, skill, or prompt-template override flags. Each child independently uses normal Pi trust and resource discovery. Saved trust and global settings are available through the ordinary user environment, but transient parent `--approve` and session-only trust are not inherited by a separate child process.
 
-Process control requires agreement between the current Pi session and active branch journal, immutable run nonce, durable `run.json`, stable terminal/native identity, and a fresh backend snapshot. Other-session, orphaned, uncertain, and global live records are observational only. A later parent session may reauthorize **cleanup only** for a proven-stopped schema-v5 journal when exact parent/child Git, Herdr workspace/anchors, run nonce, branch/path, and idle/no-agent evidence all reconcile; it never adopts the process or prior private result. Send/interrupt delivery is `confirmed`, `unconfirmed`, or `uncertain`; never retry uncertain input automatically. Force stop never authorizes dirty checkout discard.
+Process control requires agreement between the current Pi session and active branch journal, immutable run nonce, durable `run.json`, exact terminal/agent identity, available harness-native identity, and a fresh backend snapshot. Other-session, orphaned, uncertain, and global live records are observational only. A later parent session may reauthorize **cleanup only** for a proven-stopped schema-v5 journal when exact parent/child Git, Herdr workspace/anchors, run nonce, branch/path, and idle/no-agent evidence all reconcile; it never adopts the process or prior private result. Send/interrupt delivery is `confirmed`, `unconfirmed`, or `uncertain`; never retry uncertain input automatically. Force stop never authorizes dirty checkout discard.
 
 ## Install
 
@@ -53,7 +53,7 @@ subagent_stop({ id: "<run>", mode: "graceful" })
 
 Execution rejects cross-mode combinations: `scope` with `id`; `states`, `timeoutMs`, or `lines` without `id`; and `timeoutMs` with `id` but no `states`. Wait preserves semantic `working`, `blocked`, `done`, `idle`, and `unknown` states, abort propagation, timeout errors, ownership defaults, and 50KB/2000-line output bounds. A successful wait returns detailed inspection/output, not only a matched state.
 
-Every successful start reports `completion.pending` with `delivery: "automatic"`. Starts and sends return immediately. For Pi children, the structured final assistant response is captured and injected into the owning parent branch as `herdr-subagents.result.v1`. Writer results carry an extension-derived `ACTION REQUIRED` block with exact Git/worktree facts. Later blocked, failed, retained-cleanup, UI, or recovery transitions use deduplicated `herdr-subagents.action-required.v1` follow-ups and the same status/UI attention state. Missing bridge evidence is capture-unavailable—never an invented result. Parent verification and explicit stop/finalization remain mandatory.
+Every successful start reports `completion.pending` with `delivery: "automatic"`. Starts and sends return immediately. Pi children publish the exact structured final assistant response. Claude, Codex, and Grok publish a bounded, ownership-validated Herdr terminal transcript with explicit truncation/revision metadata; it is never presented as an exact final message. Both sources use the same `herdr-subagents.result.v1` store/delivery path. Writer results carry an extension-derived `ACTION REQUIRED` block with exact Git/worktree facts. Later blocked, failed, retained-cleanup, UI, or recovery transitions use deduplicated `herdr-subagents.action-required.v1` follow-ups and the same status/UI attention state. Missing Pi bridge evidence and empty/failed non-Pi terminal reads are capture-unavailable—never an invented result. Parent verification and explicit stop/finalization remain mandatory.
 
 Placement starts use fresh exact topology checks and retry only explicit `agent_placement_not_found`; exhaustion returns the managed run ID and ordinary stop action. See the architecture and operations guides for details.
 
@@ -98,12 +98,12 @@ Bundled profiles create only transient parent-checkout operational state while u
 ```text
 .subagents/runs/<id>/
 ├── run.json
-└── results/             # when structured generations were captured
+└── results/             # when result generations were captured
 ```
 
-The parent-persisted structured result or explicit failure/action notice is the durable handoff. Bundled children do not write handoff/progress files. Custom profiles may explicitly configure run-unique handoff/progress artifacts; existing files in a disposable checkout are copied to parent-owned `captured/` storage and byte/SHA-256 verified before removal. Their absence is not a cleanup prerequisite; capture failure retains rather than losing a present custom artifact.
+A parent-persisted result envelope or exact parent-persisted `failed` notice is the durable handoff; other attention notices never authorize cleanup. Bundled children do not write handoff/progress files. Custom profiles may explicitly configure run-unique handoff/progress artifacts; existing files in a disposable checkout are copied to parent-owned `captured/` storage and byte/SHA-256 verified before removal. Their absence is not a cleanup prerequisite; capture failure retains rather than losing a present custom artifact.
 
-While live, schema-v5 `run.json` retains assignment, bounded output, action state, ownership journal, and exact worktree snapshot for recovery. Private system/session/exchange files remain only while live or capture-uncertain. After the result/failure notice is parent-persisted and finalization succeeds, runtime metadata/results are purged; verified custom captures remain intentionally. There is no age-based or path-only garbage collector.
+While live, schema-v5 `run.json` retains assignment, bounded output, action state, ownership journal, and exact worktree snapshot for recovery. Private system/session/exchange files remain only while live or capture-uncertain. After the result envelope or exact failed notice is parent-persisted and finalization succeeds, runtime metadata/results are purged; verified custom captures remain intentionally. There is no age-based or path-only garbage collector.
 
 Git protection appends anchored `/.subagents/` and explicitly requested `/.progress/` rules to Git-local `info/exclude`; tracked `.gitignore` is not edited. A pre-existing untracked `.progress/` requires explicit review before hiding it.
 

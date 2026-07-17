@@ -82,8 +82,8 @@ export async function assertEphemeralRuntimeLayout(
     if (files.resultExchangeDirectory === undefined) throw new Error("Pi ephemeral runtime requires the result-exchange child path");
     await assertResultExchangeLayout(directory, files.resultExchangeDirectory);
   } else {
-    if (files.sessionDirectory !== undefined) throw new Error("Claude/Codex ephemeral runtime must not claim a Pi sessions child");
-    if (files.resultExchangeDirectory !== undefined) throw new Error("Claude/Codex ephemeral runtime must not claim a Pi result-exchange child");
+    if (files.sessionDirectory !== undefined) throw new Error("Non-Pi ephemeral runtime must not claim a Pi sessions child");
+    if (files.resultExchangeDirectory !== undefined) throw new Error("Non-Pi ephemeral runtime must not claim a Pi result-exchange child");
   }
 
   await assertPrivateFile(files.systemPrompt, "Ephemeral runtime system prompt");

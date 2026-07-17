@@ -17,7 +17,7 @@ import { ensureSafeArtifactDirectory, writeArtifactAtomic } from "../artifacts/s
 import { purgeRuntimeRunArtifacts } from "../artifacts/purge.ts";
 import { loadSettingsForContext, type HerdrSubagentsSettings } from "../config/settings.ts";
 import type { ArtifactContract } from "../contracts/artifact.ts";
-import type { EffectiveLaunchPolicy, Harness, LaunchPolicy, ThinkingLevel, ToolGrant } from "../contracts/harness.ts";
+import { isHarness, type EffectiveLaunchPolicy, type Harness, type LaunchPolicy, type ThinkingLevel, type ToolGrant } from "../contracts/harness.ts";
 import type { AgentProfile } from "../contracts/profile.ts";
 import type { HerdrStatus } from "../contracts/state.ts";
 import type { SessionSnapshot } from "../herdr/protocol.ts";
@@ -213,6 +213,11 @@ export interface ToolRuntimeOptions {
 function isWithin(root: string, candidate: string): boolean {
   const value = relative(root, candidate);
   return value === "" || (!value.startsWith("..") && !isAbsolute(value));
+}
+
+export function handoffEvidencePersisted(run: Pick<ManagedRun, "latestResult" | "attention">): boolean {
+  return run.latestResult?.deliveryStage === "parent_persisted"
+    || (run.attention?.kind === "failed" && run.attention.delivery.stage === "parent_persisted");
 }
 
 function statusCall(runId: string): string { return `subagent_status({ id: ${JSON.stringify(runId)} })`; }
@@ -420,13 +425,20 @@ export class HerdrToolRuntimeController {
       this.#worktreeCleanup = new WorktreeCleanupManager(client, this.#worktrees);
       this.#installResultServices();
       await this.#recoverLiveRuns();
-      const unresolvedRecovery = await this.#adoptCrossSessionCleanupJournals();
+      const unresolvedRecovery = [...await this.#adoptCrossSessionCleanupJournals()];
       for (const record of this.#worktrees.list().filter((candidate) => candidate.state === "removed" && candidate.finalization?.branchFinalizedAt !== undefined && candidate.finalization.runtimeArtifactsPurgedAt === undefined)) {
+        const run = this.#runs.get(record.id);
+        if (!run || !handoffEvidencePersisted(run)) {
+          unresolvedRecovery.push({ runId: record.id, reason: "Finalized writer runtime artifacts remain because parent result/failure evidence is not currently persisted" });
+          continue;
+        }
         try {
           const roots = await resolveArtifactRoots({ checkout: record.sourceCheckoutPath, allowProgress: false });
           await purgeRuntimeRunArtifacts(roots, record.id);
           this.#worktrees.markRuntimeArtifactsPurged(record.id);
-        } catch { /* Exact unresolved purge remains visible in worktree state/recovery notices. */ }
+        } catch (error) {
+          unresolvedRecovery.push({ runId: record.id, reason: `Finalized writer runtime artifact purge remains unresolved: ${error instanceof Error ? error.message : String(error)}` });
+        }
       }
       this.#startupReconciling = true;
       try {
@@ -439,7 +451,7 @@ export class HerdrToolRuntimeController {
       } finally { this.#startupReconciling = false; }
       const startupAttention = [...this.#runs.values()].flatMap((run) => run.attention === undefined || run.attention.delivery.stage === "parent_persisted" ? [] : [{ runId: run.id, reason: run.attention.reason, noticeId: run.attention.noticeId }]);
       const consolidatedRecovery = [...unresolvedRecovery, ...startupAttention];
-      if (consolidatedRecovery.length > 0) this.#sendRecoverySummary(consolidatedRecovery);
+      if (consolidatedRecovery.length > 0) await this.#sendRecoverySummary(consolidatedRecovery);
       this.#subscriptions = new HerdrSubscriptionManager({
         client,
         ownedPaneIds: () => [...this.#runs.values()].flatMap((run) => run.journal.resources.paneId ? [run.journal.resources.paneId] : []),
@@ -462,21 +474,7 @@ export class HerdrToolRuntimeController {
   }
 
   #installResultServices(): void {
-    const installed = installResultServices({
-      pi: this.#pi,
-      runtimeEpoch: this.#runtimeEpoch,
-      getContext: () => this.#context,
-      getCheckout: () => this.#context?.cwd,
-      listManagedRuns: () => this.#runs.values(),
-      getManagedRun: (runId) => this.#runs.get(runId),
-      persistRunMetadata: async (runId) => {
-        const run = this.#runs.get(runId);
-        if (run) await this.#persistMetadata(run);
-      },
-      refreshAttention: (runId) => this.#refreshAttention(runId),
-      onResultStageAdvanced: (envelope) => { void this.#onResultStageAdvanced(envelope); },
-      notifyUi: () => this.#notifyUi(),
-    });
+    const installed = installResultServices(this.#resultHost());
     this.#coordinator = installed.coordinator;
     this.#delivery = installed.delivery;
     this.#notices = new ActionNoticeService({
@@ -515,6 +513,14 @@ export class HerdrToolRuntimeController {
       persistRunMetadata: async (runId: string) => {
         const run = this.#runs.get(runId);
         if (run) await this.#persistMetadata(run);
+      },
+      captureTerminalOutput: async (runId: string) => {
+        const client = this.#client;
+        const run = this.#runs.get(runId);
+        if (!client || !run) throw new Error(`Run ${runId} is unavailable for terminal result capture`);
+        const output = await readBoundedOutput(client, this.#ownedTarget(run));
+        run.lastOutput = output;
+        return { text: output.text, revision: output.revision, truncated: output.truncated };
       },
       refreshAttention: (runId: string) => this.#refreshAttention(runId),
       onResultStageAdvanced: (envelope: ResultEnvelopeV1) => { void this.#onResultStageAdvanced(envelope); },
@@ -589,7 +595,7 @@ export class HerdrToolRuntimeController {
 
   async #finalizeStoppedReadOnly(run: ManagedRun): Promise<void> {
     if (run.lifecycle !== "stopped" || run.worktreeId || !run.artifacts) return;
-    const evidencePersisted = run.latestResult?.deliveryStage === "parent_persisted" || run.attention?.delivery.stage === "parent_persisted";
+    const evidencePersisted = handoffEvidencePersisted(run);
     if (!evidencePersisted) return;
     await this.#removeEphemeral(run).catch(() => undefined);
     const roots = run.artifacts.metadataRoots;
@@ -724,20 +730,33 @@ export class HerdrToolRuntimeController {
     return unresolved;
   }
 
-  #sendRecoverySummary(items: readonly { readonly runId: string; readonly reason: string; readonly noticeId?: string }[]): void {
+  async #sendRecoverySummary(items: readonly { readonly runId: string; readonly reason: string; readonly noticeId?: string }[]): Promise<void> {
     const context = this.#context;
     if (!context || typeof this.#pi.sendMessage !== "function") return;
     const ordered = [...items].sort((left, right) => left.runId.localeCompare(right.runId));
+    const noticeIds = [...new Set(ordered.flatMap((item) => item.noticeId === undefined ? [] : [item.noticeId]))];
     const noticeId = `act-recovery-${createHash("sha256").update(JSON.stringify(ordered), "utf8").digest("hex").slice(0, 24)}`;
     const branch = currentBranch(context);
     if (findPersistedActionNotice(branch, noticeId)) return;
+
+    const coveredRuns: ManagedRun[] = [];
+    for (const item of ordered) {
+      if (!item.noticeId) continue;
+      const run = this.#runs.get(item.runId);
+      if (!run?.attention || run.attention.noticeId !== item.noticeId) continue;
+      run.attention = { ...run.attention, delivery: { stage: "dispatched", runtimeEpoch: this.#runtimeEpoch } };
+      coveredRuns.push(run);
+    }
+    try { await Promise.all(coveredRuns.map((run) => this.#persistMetadata(run))); }
+    catch { return; }
+
     const content = boundUtf8HeadTail([
-      `${ACTION_NOTICE_SENTINEL} ${JSON.stringify({ noticeId, kind: "recovery_required", revision: 1, runs: ordered.map((item) => item.runId) })}`,
+      `${ACTION_NOTICE_SENTINEL} ${JSON.stringify({ noticeId, noticeIds, kind: "recovery_required", revision: 1, runs: ordered.map((item) => item.runId) })}`,
       "ACTION REQUIRED — startup recovery",
       ...ordered.flatMap((item) => [`run=${item.runId}`, ...(item.noticeId === undefined ? [] : [`noticeId=${item.noticeId}`]), `reason=${item.reason}`]),
       "next=Inspect the listed exact resources; use current-session cleanup only when full provenance can be supplied. No resource was deleted.",
     ].join("\n")).text;
-    this.#pi.sendMessage({ customType: ACTION_NOTICE_CUSTOM_TYPE, content, display: true, details: { noticeId, runIds: ordered.map((item) => item.runId), kind: "recovery_required" } }, { deliverAs: "followUp", triggerTurn: true });
+    this.#pi.sendMessage({ customType: ACTION_NOTICE_CUSTOM_TYPE, content, display: true, details: { noticeId, noticeIds, runIds: ordered.map((item) => item.runId), kind: "recovery_required" } }, { deliverAs: "followUp", triggerTurn: true });
   }
 
   async #recoverStoppedRun(journal: OwnershipJournalData): Promise<boolean> {
@@ -825,7 +844,7 @@ export class HerdrToolRuntimeController {
       const terminalId = journal.resources.terminalId;
       const agent = terminalId ? preflight.snapshot.agents.find((candidate) => candidate.terminal_id === terminalId) : undefined;
       const pane = terminalId ? preflight.snapshot.panes.find((candidate) => candidate.terminal_id === terminalId) : undefined;
-      const harness = ["pi", "claude", "codex"].includes(String(agent?.agent)) ? agent!.agent as Harness : "pi";
+      const harness = isHarness(agent?.agent) ? agent.agent : "pi";
       this.#observational.set(journal.runId, {
         reason,
         summary: {
@@ -872,7 +891,7 @@ export class HerdrToolRuntimeController {
         continue;
       }
       const agent = preflight.snapshot.agents.find((candidate) => candidate.terminal_id === journal.resources.terminalId);
-      if (!agent || !["pi", "claude", "codex"].includes(String(agent.agent))) {
+      if (!agent || !isHarness(agent.agent)) {
         observe(journal, "uncertain", "Active journal terminal/native harness is not live and exactly reconcilable; retain evidence");
         continue;
       }
@@ -1568,7 +1587,7 @@ export class HerdrToolRuntimeController {
         runs.push({
           id: `global:${agent.terminal_id}`,
           profile: "observational",
-          harness: ["pi", "claude", "codex"].includes(String(agent.agent)) ? agent.agent as Harness : "pi",
+          harness: isHarness(agent.agent) ? agent.agent : "pi",
           lifecycle: "running",
           herdrStatus: agent.agent_status,
           ownership: "observational",
@@ -1841,6 +1860,8 @@ export class HerdrToolRuntimeController {
       const priorLifecycle = run.lifecycle;
       let provenStopped = priorLifecycle === "stopped";
       let result: StopSubagentResult;
+      let captureUncertain = false;
+      let nonPiBarrierAttempted = false;
       try {
         if (!provenStopped && priorLifecycle === "failed") {
           if (!run.target) provenStopped = true;
@@ -1880,6 +1901,10 @@ export class HerdrToolRuntimeController {
         } else {
           run.lifecycle = "stopping";
           await this.#coordinator?.reconcileRun(run.id);
+          const preStopBarrier = run.policy.harness === "pi" ? undefined : await this.#coordinator?.captureBarrier(run.id);
+          nonPiBarrierAttempted = run.policy.harness !== "pi";
+          if (preStopBarrier?.envelope) run.latestResult = toPublicResultView(preStopBarrier.envelope);
+          captureUncertain = preStopBarrier?.uncertain === true || preStopBarrier?.durable === false;
           result = await stopSubagent({
             client: ready.client,
             target: this.#ownedTarget(run),
@@ -1895,8 +1920,7 @@ export class HerdrToolRuntimeController {
           }
         }
 
-        let captureUncertain = false;
-        if (result.stopped) {
+        if (result.stopped && !nonPiBarrierAttempted) {
           const barrier = await this.#coordinator?.captureBarrier(run.id);
           if (barrier?.envelope) run.latestResult = toPublicResultView(barrier.envelope);
           captureUncertain = barrier?.uncertain === true || barrier?.durable === false;
@@ -1927,8 +1951,7 @@ export class HerdrToolRuntimeController {
           const parentRoots = await resolveArtifactRoots({ checkout: record.sourceCheckoutPath, allowProgress: false });
           const recordCheckoutPath = record.checkoutPath;
           const sourceRoots = await resolveArtifactRoots({ checkout: recordCheckoutPath, allowProgress: record.artifactPaths.some((artifact) => isWithin(join(recordCheckoutPath, ".progress"), artifact.absolutePath)) });
-          const resultEvidencePersisted = run.latestResult?.deliveryStage === "parent_persisted"
-            || run.attention?.delivery.stage === "parent_persisted";
+          const resultEvidencePersisted = handoffEvidencePersisted(run);
           const cleanupResult = await ready.worktreeCleanup.cleanup({
             id: record.id,
             cleanup: input.cleanup ?? "remove_if_safe",

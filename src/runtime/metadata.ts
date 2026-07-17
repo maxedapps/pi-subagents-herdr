@@ -1,6 +1,6 @@
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import type { Harness, ThinkingLevel } from "../contracts/harness.ts";
+import { isHarness, type Harness, type ThinkingLevel } from "../contracts/harness.ts";
 import type { NativeSessionIdentity } from "../contracts/ownership.ts";
 import { parseGenerationSummary, type GenerationSummary } from "../results/contracts.ts";
 import { parseRunAttention, type RunAttention } from "../results/action-notices.ts";
@@ -100,17 +100,13 @@ function parseGenerationState(value: unknown): RuntimeGenerationState {
 
 export function parseRuntimeRunMetadata(value: unknown): RuntimeRunMetadata {
   if (!isRecord(value)) throw new Error("runtime run metadata is malformed");
-  const legacyVersion = value.schemaVersion;
-  if (legacyVersion !== 3 && legacyVersion !== 4 && legacyVersion !== 5) throw new Error("runtime run metadata is malformed");
-  const inferredLifecycle = isRecord(value.runtime) && value.runtime.ephemeralFiles === "removed" ? "stopped" : "running";
-  const candidate: Record<string, unknown> = legacyVersion === 3
-    ? { ...value, schemaVersion: 5, lifecycle: inferredLifecycle, generation: { nextGeneration: 1, bridgeAvailable: false } }
-    : legacyVersion === 4 ? { ...value, schemaVersion: 5, lifecycle: inferredLifecycle } : value;
+  if (value.schemaVersion !== 5) throw new Error("runtime run metadata is malformed");
+  const candidate = value;
   if (!isRecord(candidate.policy) || !isRecord(candidate.artifacts) || !isRecord(candidate.runtime)) throw new Error("runtime run metadata is malformed");
   for (const key of ["runId", "runNonce", "terminalId", "profileName", "profileSource", "harness", "taskSynopsis"] as const) nonEmpty(candidate[key], `runtime metadata ${key}`);
   if (candidate.assignment !== undefined) nonEmpty(candidate.assignment, "runtime metadata assignment");
   if (candidate.artifactWriter !== "parent" && candidate.artifactWriter !== "child") throw new Error("runtime metadata artifactWriter is malformed");
-  if (!["pi", "claude", "codex"].includes(String(candidate.harness))) throw new Error("runtime metadata harness is malformed");
+  if (!isHarness(candidate.harness)) throw new Error("runtime metadata harness is malformed");
   if (!["starting", "running", "interrupting", "stopping", "stopped", "failed", "lost"].includes(String(candidate.lifecycle))) throw new Error("runtime metadata lifecycle is malformed");
   if (!Number.isSafeInteger(candidate.createdAt) || (candidate.createdAt as number) <= 0) throw new Error("runtime metadata createdAt is malformed");
   const policy = candidate.policy as Record<string, unknown>;
@@ -133,8 +129,8 @@ export function parseRuntimeRunMetadata(value: unknown): RuntimeRunMetadata {
   if (candidate.harness === "pi" && runtime.ephemeralFiles === "retained" && typeof runtime.resultExchangeDirectory !== "string") {
     throw new Error("retained Pi runtime metadata requires resultExchangeDirectory");
   }
-  if (candidate.harness !== "pi" && runtime.sessionDirectory !== undefined) throw new Error("Claude/Codex runtime metadata must not claim an unused Pi session directory");
-  if (candidate.harness !== "pi" && runtime.resultExchangeDirectory !== undefined) throw new Error("Claude/Codex runtime metadata must not claim a Pi result-exchange directory");
+  if (candidate.harness !== "pi" && runtime.sessionDirectory !== undefined) throw new Error("Non-Pi runtime metadata must not claim an unused Pi session directory");
+  if (candidate.harness !== "pi" && runtime.resultExchangeDirectory !== undefined) throw new Error("Non-Pi runtime metadata must not claim a Pi result-exchange directory");
   parseNative(candidate.nativeSession);
   if (candidate.generation === undefined) throw new Error("runtime metadata requires generation state");
   parseGenerationState(candidate.generation);

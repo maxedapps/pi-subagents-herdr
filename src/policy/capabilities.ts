@@ -51,6 +51,16 @@ export const HARNESS_CAPABILITIES: Readonly<Record<Harness, HarnessCapabilities>
     nativeSessionIdentity: "available",
     notes: Object.freeze(["Filesystem confinement is provided by Codex sandbox policy, not by tool names alone."]),
   }),
+  grok: Object.freeze({
+    harness: "grok",
+    modelSelection: true,
+    thinkingSelection: true,
+    explicitToolPolicy: false,
+    filesystemBoundary: "native-sandbox",
+    nativeApprovalPolicy: true,
+    nativeSessionIdentity: "screen-only",
+    notes: Object.freeze(["Grok uses native sandbox/permission policy and exact screen identity; explicit tool lists and additional writable roots are rejected."]),
+  }),
 });
 
 const THINKING_ORDER: Readonly<Record<ThinkingLevel, number>> = Object.freeze({
@@ -74,8 +84,8 @@ export function resolveHarnessCapabilities(
   return {
     ...capabilities,
     integrationPolicy,
-    nativeSessionIdentity:
-      capabilities.nativeSessionIdentity === "available" || integrationPolicy === "integrated",
+    nativeSessionIdentity: capabilities.nativeSessionIdentity === "available"
+      || (capabilities.nativeSessionIdentity === "integrated-policy-only" && integrationPolicy === "integrated"),
   };
 }
 

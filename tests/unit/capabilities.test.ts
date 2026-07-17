@@ -50,12 +50,17 @@ test("capability matrix does not claim Pi or Claude tool policy is a filesystem 
   assert.equal(HARNESS_CAPABILITIES.pi.filesystemBoundary, "tool-policy");
   assert.equal(HARNESS_CAPABILITIES.claude.filesystemBoundary, "tool-policy");
   assert.equal(HARNESS_CAPABILITIES.codex.filesystemBoundary, "os-sandbox");
+  assert.equal(HARNESS_CAPABILITIES.grok.filesystemBoundary, "native-sandbox");
 });
 
 test("Claude native-session capability is resolved by integration policy", () => {
   assert.equal(HARNESS_CAPABILITIES.claude.nativeSessionIdentity, "integrated-policy-only");
   assert.equal(resolveHarnessCapabilities("claude", "integrated").nativeSessionIdentity, true);
   assert.equal(resolveHarnessCapabilities("claude", "safe-mode").nativeSessionIdentity, false);
+  assert.equal(HARNESS_CAPABILITIES.grok.nativeSessionIdentity, "screen-only");
+  assert.equal(resolveHarnessCapabilities("grok").nativeSessionIdentity, false);
+  assert.equal(resolveHarnessCapabilities("pi").nativeSessionIdentity, true);
+  assert.equal(resolveHarnessCapabilities("codex").nativeSessionIdentity, true);
   assert.throws(() => resolveHarnessCapabilities("pi", "safe-mode"), /not a supported integration policy/);
 });
 

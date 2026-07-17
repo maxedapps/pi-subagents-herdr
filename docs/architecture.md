@@ -8,7 +8,7 @@ Invariants:
 
 1. Children start visibly in dedicated no-focus topology; no hidden/native fallback exists.
 2. Mutation-capable children always use an extension-owned isolated linked worktree; the child cannot choose or bypass this policy.
-3. Run nonce, terminal/native identity, repository identity, generated branch, and checkout path are immutable authority inputs.
+3. Run nonce, exact terminal/agent identity, available native identity, repository identity, generated branch, and checkout path are immutable authority inputs.
 4. Every input, focus, interrupt, stop, and destructive cleanup step revalidates current authority and mutable topology.
 5. Dirty, live, unintegrated, moved-ref, tampered, orphaned, or uncertain evidence retains resources.
 6. Interrupt stops a turn; stop resolves the child lifecycle. Neither authorizes dirty discard.
@@ -19,9 +19,9 @@ Factory registration has no runtime side effects. `session_start` loads settings
 
 Parent mode contributes `use-herdr-subagents` dynamically. `PI_HERDR_SUBAGENT=1` registers only the narrow Pi result bridge—no parent tools, commands, UI, or orchestration skill.
 
-Each generation follows `preparing → submitted → captured | closed | blocked`. Structured Pi final messages become envelopes under `.subagents/runs/<id>/results/` with delivery stages `captured → dispatched → parent_persisted`. They are injected one-at-a-time as `herdr-subagents.result.v1` follow-ups. Missing/malformed bridge evidence closes capture as unavailable; terminal text is never invented as a structured result.
+Each generation follows `preparing → submitted → captured | closed | blocked`. Pi uses its exact structured final-message bridge. Confirmed Claude, Codex, and Grok generations at `done`, `idle`, or `blocked` use one bounded ownership-validated Herdr `recent_unwrapped` transcript; its source, revision, and truncation are explicit. Both become envelopes under `.subagents/runs/<id>/results/` with delivery stages `captured → dispatched → parent_persisted` and one-at-a-time `herdr-subagents.result.v1` follow-ups. Pi never falls back to terminal text; empty/failed non-Pi reads close capture unavailable.
 
-A writer result carries the same-revision extension-derived action block. Later blocked, failed, delivery-uncertain, cleanup-retained, UI, and recovery transitions use `herdr-subagents.action-required.v1`. Stable notice identity, runtime-epoch in-flight state, active-branch scans, and ownership authorization ensure one model-visible message per unchanged action revision. Status and TUI project the same `attention` object.
+A writer result carries the same-revision extension-derived action block. Later blocked, failed, delivery-uncertain, cleanup-retained, UI, and recovery transitions use `herdr-subagents.action-required.v1`. Stable notice identity, exact consolidated `noticeIds`, runtime-epoch in-flight state, active-branch scans, and ownership authorization ensure one model-visible message per unchanged action revision. Status and TUI project the same `attention` object.
 
 ## Ownership and recovery
 
@@ -33,11 +33,11 @@ A stopped run has a terminal `stopped` ownership phase. `subagent_stop` can ther
 
 ## Launch and worktree policy
 
-Adapters validate executable, canonical cwd/roots, capabilities, model/thinking, and prohibited options before topology creation. Writers always create a linked worktree under the run-bound sibling container and a dedicated group tab inside its Herdr worktree workspace. Read-only profiles share the verified checkout but use a dedicated group tab. The group and writer terminal are journaled before task mutation.
+Adapters validate executable, canonical cwd/roots, capabilities, model/thinking, and prohibited options before topology creation. Grok rejects explicit tool lists/additional writable roots, disables native subagents/memory/auto-update, and uses `read-only`, `strict`, or `workspace` native sandbox profiles. When Herdr exposes no Grok `agent_session`, readiness remains screen-only while exact terminal/agent/topology and active-branch proof stay mandatory; other harness identity rules are unchanged. Writers always create a linked worktree under the run-bound sibling container and a dedicated group tab inside its Herdr worktree workspace. Read-only profiles share the verified checkout but use a dedicated group tab. The group and writer terminal are journaled before task mutation.
 
 A group is launch-ready only after a fresh snapshot contains its exact workspace, tab, root pane, and root terminal and the root process probe returns the same pane. Creation waits within a short fixed bound; cached groups are freshly revalidated and stale/moved provenance is never replaced implicitly. `agent.start` performs the same exact check before each call and retries only `HerdrApiError.code === "agent_placement_not_found"`, with three total attempts and fixed abort-aware waits. All transport, timeout, malformed, abort, and other API outcomes remain non-retryable because acceptance could be uncertain.
 
-Exhausted explicit placement rejection proves no child identity, not absence of extension-owned topology. The managed run and journal enter failed attention and return a blocked start payload with the exact run ID. A new read-only group uses the existing partial-start idle/identity cleanup proof; reused/ambiguous groups retain. Writer workspace/worktree provenance remains durable and the existing stop/finalization state machine skips process control, waits for parent-persisted failure evidence, derives no-change/integration, and performs normal exact cleanup—there is no provisioning rollback path.
+Exhausted explicit placement rejection proves no child identity, not absence of extension-owned topology. The managed run and journal enter failed attention and return a blocked start payload with the exact run ID. A new read-only group uses the existing partial-start idle/identity cleanup proof; reused/ambiguous groups retain. Writer workspace/worktree provenance remains durable and the existing stop/finalization state machine skips process control, waits for an exact parent-persisted `failed` notice, derives no-change/integration, and performs normal exact cleanup—there is no provisioning rollback path.
 
 Pi children independently resolve ordinary trust/resources; transient parent approval is not inherited. Recursive orchestration tools are rejected.
 
@@ -53,7 +53,7 @@ Bundled profiles create no child handoff/progress files. Their self-contained fi
 
 Custom profiles may explicitly configure run-unique handoff/progress files. Existing custom files inside a disposable checkout are copied to parent-owned `captured/` storage and byte/SHA-256 verified before removal. Missing optional files do not block; a failed copy of a present file retains. Public profiles still cannot customize internal prompt/system paths.
 
-Private system/session/exchange files are canonical run-bound OS-temp state. They remain while live or capture-uncertain and are removed after proven stop. Assignment/runtime metadata remains until a structured result or explicit failure/action notice is parent-persisted. Successful default finalization removes the runtime run directory; verified custom captures remain intentional.
+Private system/session/exchange files are canonical run-bound OS-temp state. They remain while live or capture-uncertain and are removed after proven stop. Assignment/runtime metadata remains until a result envelope or exact `failed` notice is parent-persisted. Successful default finalization removes the runtime run directory; verified custom captures remain intentional.
 
 ## Writer finalization state machine
 
@@ -64,7 +64,7 @@ live writer → stop → parent evidence persistence → safe cleanup attempt
 stopped writer → skip process control → retry safe cleanup
 ```
 
-Safe cleanup requires exact ownership, parent-persisted result/failure evidence, clean checkout, and objective integration. The extension derives `no_changes`, direct commit containment, or exact current parent/child tree equivalence; callers may supply existing containment/tree evidence for older equivalent parent refs. Parent review text is optional audit detail, not a deletion gate.
+Safe cleanup requires exact ownership, a parent-persisted result envelope or exact parent-persisted `failed` notice, clean checkout, and objective integration. Every other attention kind and every omitted/false evidence value retains. The extension derives `no_changes`, direct commit containment, or exact current parent/child tree equivalence; callers may supply existing containment/tree evidence for older equivalent parent refs. Parent review text is optional audit detail, not a deletion gate.
 
 Historical foreground snapshot hashes are not destructive gates. Current exact workspace/tab/terminal topology must contain only recorded anchors, no agent/unknown pane, and each anchor must be a known idle shell. Process information that is missing or active fails closed.
 

@@ -5,7 +5,7 @@ import {
   getAgentDir,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import type { Harness } from "../contracts/harness.ts";
+import { HARNESSES, type Harness } from "../contracts/harness.ts";
 import type { Diagnostic } from "../contracts/result.ts";
 
 export const SETTINGS_NAMESPACE = "herdr-subagents" as const;
@@ -198,7 +198,7 @@ function parseSettings(value: unknown, sourcePath: string): SettingsPatch {
 
   const patch: SettingsPatch = {};
   if (root.defaultHarness !== undefined) {
-    const parsed = stringEnum(root.defaultHarness, "settings.defaultHarness", ["pi", "claude", "codex"], issues);
+    const parsed = stringEnum(root.defaultHarness, "settings.defaultHarness", HARNESSES, issues);
     if (parsed !== undefined) patch.defaultHarness = parsed;
   }
 

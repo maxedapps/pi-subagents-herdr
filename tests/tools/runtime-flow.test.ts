@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { JsonValue } from "../../src/contracts/protocol.ts";
-import { HerdrToolRuntimeController } from "../../src/tools/service.ts";
+import { handoffEvidencePersisted, HerdrToolRuntimeController } from "../../src/tools/service.ts";
 import { startFakeHerdrServer, type FakeHerdrRequest } from "../support/fake-herdr-server.ts";
 
 const parentNative = { source: "herdr:pi", agent: "pi", kind: "id" as const, value: "parent-session" };
@@ -42,6 +42,18 @@ function fixtureApi() {
 function reply(request: FakeHerdrRequest, result: JsonValue): JsonValue {
   return { id: request.id ?? "", result };
 }
+
+test("only a persisted result or persisted failed notice satisfies the handoff gate", () => {
+  const delivery = (stage: "captured" | "dispatched" | "parent_persisted") => ({ stage, runtimeEpoch: "epoch" });
+  const attention = (kind: "failed" | "cleanup_required" | "recovery_required" | "blocked" | "delivery_uncertain" | "writer_review_required", stage: "captured" | "dispatched" | "parent_persisted") => ({ kind, delivery: delivery(stage) });
+  assert.equal(handoffEvidencePersisted({ latestResult: { deliveryStage: "parent_persisted" } as never }), true);
+  assert.equal(handoffEvidencePersisted({ attention: attention("failed", "parent_persisted") as never }), true);
+  for (const kind of ["cleanup_required", "recovery_required", "blocked", "delivery_uncertain", "writer_review_required"] as const) {
+    assert.equal(handoffEvidencePersisted({ attention: attention(kind, "parent_persisted") as never }), false);
+  }
+  assert.equal(handoffEvidencePersisted({ attention: attention("failed", "dispatched") as never }), false);
+  assert.equal(handoffEvidencePersisted({}), false);
+});
 
 test("real tool runtime handles protected starts, normal Pi resources, bounded slots, and start → stop → start through the typed Herdr client", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "p6-runtime-flow-")));

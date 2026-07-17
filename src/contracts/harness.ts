@@ -1,4 +1,6 @@
-export type Harness = "pi" | "claude" | "codex";
+export const HARNESSES = ["pi", "claude", "codex", "grok"] as const;
+export type Harness = typeof HARNESSES[number];
+export function isHarness(value: unknown): value is Harness { return typeof value === "string" && (HARNESSES as readonly string[]).includes(value); }
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type Capability = "read" | "mutation" | "network";
@@ -13,8 +15,8 @@ export interface PermissionPolicy {
   readonly network: boolean;
 }
 
-export type FilesystemBoundary = "tool-policy" | "os-sandbox";
-export type NativeSessionIdentityCapability = "available" | "integrated-policy-only";
+export type FilesystemBoundary = "tool-policy" | "os-sandbox" | "native-sandbox";
+export type NativeSessionIdentityCapability = "available" | "integrated-policy-only" | "screen-only";
 export type HarnessIntegrationPolicy = "integrated" | "safe-mode";
 
 export interface HarnessCapabilities {

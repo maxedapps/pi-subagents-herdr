@@ -56,6 +56,24 @@ export const ADAPTER_CAPABILITIES: Readonly<Record<Harness, AdapterCapabilities>
       "The Codex sandbox governs model-generated shell/file operations; external integrations must not be treated as equivalent tools.",
     ]),
   }),
+  grok: Object.freeze({
+    harness: "grok",
+    executable: "grok",
+    toolVisibility: "sandbox-only",
+    filesystemConfinement: "grok-native-sandbox",
+    approvalBehavior: "native",
+    modelSelection: true,
+    supportedThinking: Object.freeze(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const),
+    readiness: "herdr-semantic-state",
+    interruptKeys: Object.freeze(["ctrl+c"]),
+    gracefulExit: Object.freeze({ kind: "input", text: "/exit", keys: Object.freeze(["enter"]) }),
+    nativeSessionIdentity: "screen-only",
+    customizationPolicy: "Native sandbox/permission controls constrain the extension-owned checkout; native subagents, memory, and auto-update are disabled without CLI-specific result parsing.",
+    limitations: Object.freeze([
+      "Grok explicit tool lists and additional writable roots are rejected rather than inferred across harnesses.",
+      "Herdr 0.7.4 may expose Grok only through exact terminal/agent/topology identity, without agent_session.",
+    ]),
+  }),
 } as const);
 
 export function adapterCapabilities(harness: Harness): AdapterCapabilities {

@@ -6,8 +6,13 @@ export const RESULT_CUSTOM_TYPE = "herdr-subagents.result.v1" as const;
 export const RESULT_SENTINEL_PREFIX = "HERDR_RESULT_V1" as const;
 export const MODEL_VISIBLE_BYTE_LIMIT = 48 * 1024;
 
-/** Only structured Pi final-assistant captures are valid results. */
-export type ResultSource = "pi-final-assistant";
+/** Exact Pi finals and truthfully labeled bounded Herdr terminal transcripts. */
+export type ResultSource = "pi-final-assistant" | "herdr-terminal-output";
+
+export interface TerminalOutputMetadata {
+  readonly outputRevision: number;
+  readonly truncated: boolean;
+}
 
 /**
  * Delivery stages (truthful, minimal):
@@ -44,6 +49,7 @@ export interface ResultEnvelopeV1 {
   readonly generation: number;
   readonly requestNonce: string;
   readonly source: ResultSource;
+  readonly terminalOutput?: TerminalOutputMetadata;
   readonly rawText: string;
   readonly rawTextSha256: string;
   readonly capturedAt: number;
@@ -92,6 +98,7 @@ export interface PublicResultView {
   readonly resultId: string;
   readonly generation: number;
   readonly source: ResultSource;
+  readonly terminalOutput?: TerminalOutputMetadata;
   readonly deliveryStage: DeliveryStage;
   readonly rawTextSha256: string;
   readonly stopReason?: string;
@@ -106,6 +113,7 @@ export interface CapturedResult {
   readonly generation: number;
   readonly requestNonce: string;
   readonly source: ResultSource;
+  readonly terminalOutput?: TerminalOutputMetadata;
   readonly rawText: string;
   readonly rawTextSha256: string;
   readonly capturedAt: number;
@@ -156,8 +164,15 @@ export function computeResultId(input: {
 }
 
 export function parseResultSource(value: unknown): ResultSource {
-  if (value === "pi-final-assistant") return value;
-  throw new Error("result source is malformed (only pi-final-assistant is supported)");
+  if (value === "pi-final-assistant" || value === "herdr-terminal-output") return value;
+  throw new Error("result source is malformed");
+}
+
+export function parseTerminalOutputMetadata(value: unknown): TerminalOutputMetadata {
+  if (!isRecord(value)) throw new Error("result terminalOutput is malformed");
+  nonNegInt(value.outputRevision, "result terminalOutput outputRevision");
+  if (typeof value.truncated !== "boolean") throw new Error("result terminalOutput truncated is malformed");
+  return value as unknown as TerminalOutputMetadata;
 }
 
 export function parseDeliveryStage(value: unknown): DeliveryStage {
@@ -223,6 +238,12 @@ export function parseResultEnvelope(value: unknown): ResultEnvelopeV1 {
   nonNegInt(value.capturedAt, "result envelope capturedAt");
   if (typeof value.rawText !== "string" || value.rawText.includes("\0")) throw new Error("result envelope rawText is malformed");
   const source = parseResultSource(value.source);
+  if (source === "herdr-terminal-output") {
+    parseTerminalOutputMetadata(value.terminalOutput);
+    if ((value.rawText as string).trim().length === 0) throw new Error("terminal result rawText must be non-empty");
+  } else if (value.terminalOutput !== undefined) {
+    throw new Error("Pi final result must not include terminalOutput metadata");
+  }
   const rawTextSha256 = sha256Text(value.rawText as string);
   if (rawTextSha256 !== value.rawTextSha256) throw new Error("result envelope rawTextSha256 does not match rawText");
   const expectedId = computeResultId({
@@ -330,6 +351,7 @@ export function toPublicResultView(envelope: ResultEnvelopeV1): PublicResultView
     resultId: envelope.resultId,
     generation: envelope.generation,
     source: envelope.source,
+    ...(envelope.terminalOutput === undefined ? {} : { terminalOutput: envelope.terminalOutput }),
     deliveryStage: envelope.delivery.stage,
     rawTextSha256: envelope.rawTextSha256,
     ...(envelope.emptyFinal === undefined ? {} : { emptyFinal: envelope.emptyFinal }),
@@ -343,13 +365,22 @@ export function createCapturedResult(input: {
   readonly runNonce: string;
   readonly generation: number;
   readonly requestNonce: string;
+  readonly source: ResultSource;
+  readonly terminalOutput?: TerminalOutputMetadata;
   readonly rawText: string;
   readonly stopReason?: string;
   readonly emptyFinal?: boolean;
   readonly messageIdentity?: string;
   readonly capturedAt?: number;
 }): CapturedResult {
-  const source: ResultSource = "pi-final-assistant";
+  const source = input.source;
+  if (source === "herdr-terminal-output") {
+    if (!input.terminalOutput) throw new Error("herdr-terminal-output requires terminalOutput metadata");
+    parseTerminalOutputMetadata(input.terminalOutput);
+    if (input.rawText.trim().length === 0) throw new Error("herdr-terminal-output requires non-empty text");
+  } else if (input.terminalOutput !== undefined) {
+    throw new Error("pi-final-assistant must not include terminalOutput metadata");
+  }
   const rawTextSha256 = sha256Text(input.rawText);
   const resultId = computeResultId({
     runId: input.runId,
@@ -366,6 +397,7 @@ export function createCapturedResult(input: {
     generation: input.generation,
     requestNonce: input.requestNonce,
     source,
+    ...(input.terminalOutput === undefined ? {} : { terminalOutput: input.terminalOutput }),
     rawText: input.rawText,
     rawTextSha256,
     capturedAt: input.capturedAt ?? Date.now(),
@@ -388,6 +420,7 @@ export function capturedToEnvelope(
     generation: captured.generation,
     requestNonce: captured.requestNonce,
     source: captured.source,
+    ...(captured.terminalOutput === undefined ? {} : { terminalOutput: captured.terminalOutput }),
     rawText: captured.rawText,
     rawTextSha256: captured.rawTextSha256,
     capturedAt: captured.capturedAt,

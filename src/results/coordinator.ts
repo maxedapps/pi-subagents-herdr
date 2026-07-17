@@ -11,7 +11,7 @@ import {
   type SubmissionCertainty,
 } from "./contracts.ts";
 import { writeResultRequestFile } from "./child-bridge.ts";
-import { tryCapturePiBridge, type PendingGeneration } from "./extractors.ts";
+import { captureHerdrTerminalOutput, tryCapturePiBridge, type CaptureOutcome, type PendingGeneration, type TerminalOutputCapture } from "./extractors.ts";
 import { listResultEnvelopes, writeResultEnvelope } from "./store.ts";
 
 export interface CoordinatorRunView {
@@ -36,6 +36,7 @@ export interface CoordinatorHooks {
   readonly listRuns: () => readonly CoordinatorRunView[];
   readonly getRun: (runId: string) => CoordinatorRunView | undefined;
   readonly persistRunMetadata: (runId: string) => Promise<void>;
+  readonly captureTerminalOutput?: (runId: string) => Promise<TerminalOutputCapture>;
   readonly onResultCaptured?: (envelope: ResultEnvelopeV1) => void;
   readonly settlementGraceMs?: number;
   readonly reconcileIntervalMs?: number;
@@ -256,6 +257,46 @@ export class ResultCoordinator {
     await this.#queueFor(runId).run(() => this.#reconcileRun(runId));
   }
 
+  async #capturePending(run: CoordinatorRunView, active: GenerationSummary, graceExpired: boolean): Promise<CaptureOutcome> {
+    const pending: PendingGeneration = { generation: active.generation, requestNonce: active.requestNonce, summary: active };
+    const extractorRun = { id: run.id, runNonce: run.runNonce, harness: run.harness, ...(run.ephemeral === undefined ? {} : { ephemeral: run.ephemeral }) };
+    if (run.harness === "pi") return tryCapturePiBridge({ run: extractorRun, generation: pending, graceExpired });
+    if (active.certainty !== "confirmed") return { kind: "unavailable", reason: "Non-Pi submission is not confirmed" };
+    if (run.herdrStatus !== "done" && run.herdrStatus !== "idle" && run.herdrStatus !== "blocked") {
+      return { kind: "unavailable", reason: `Non-Pi generation is not at a terminal Herdr state (${run.herdrStatus})` };
+    }
+    if (!this.#hooks.captureTerminalOutput) return { kind: "unavailable", reason: "Herdr terminal capture hook is unavailable" };
+    let reason = "Herdr terminal capture failed";
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const outcome = captureHerdrTerminalOutput({ run: extractorRun, generation: pending, output: await this.#hooks.captureTerminalOutput(run.id) });
+        if (outcome.kind === "captured") return outcome;
+        reason = outcome.kind === "unavailable" ? outcome.reason : "Herdr terminal output is not ready";
+      } catch (error) {
+        reason = `Herdr terminal read failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      if (attempt < 2) await new Promise((resolveDelay) => setTimeout(resolveDelay, 75));
+    }
+    return { kind: "unavailable", reason };
+  }
+
+  async #existingEnvelope(runId: string, generation: number): Promise<ResultEnvelopeV1 | undefined> {
+    const checkout = this.#hooks.getCheckout();
+    if (!checkout) return undefined;
+    return (await listResultEnvelopes(checkout, runId)).find((item) => item.generation === generation);
+  }
+
+  async #adoptExisting(run: CoordinatorRunView, active: GenerationSummary): Promise<ResultEnvelopeV1 | undefined> {
+    const existing = await this.#existingEnvelope(run.id, active.generation);
+    if (!existing) return undefined;
+    const still = this.#hooks.getRun(run.id);
+    if (!still?.activeGeneration || still.activeGeneration.generation !== active.generation || !generationAwaitingCapture(still.activeGeneration)) return existing;
+    still.activeGeneration = { ...active, phase: "captured", resultId: existing.resultId, source: existing.source };
+    await this.#hooks.persistRunMetadata(run.id);
+    this.#hooks.onResultCaptured?.(existing);
+    return existing;
+  }
+
   async #reconcileRun(runId: string): Promise<void> {
     if (this.#stopped) return;
     const run = this.#hooks.getRun(runId);
@@ -276,21 +317,8 @@ export class ResultCoordinator {
       || terminalState === "idle"
       || terminalState === "blocked";
 
-    const pending: PendingGeneration = {
-      generation: active.generation,
-      requestNonce: active.requestNonce,
-      summary: active,
-    };
-    const outcome = await tryCapturePiBridge({
-      run: {
-        id: run.id,
-        runNonce: run.runNonce,
-        harness: run.harness,
-        ...(run.ephemeral === undefined ? {} : { ephemeral: run.ephemeral }),
-      },
-      generation: pending,
-      graceExpired,
-    });
+    if (await this.#adoptExisting(run, active)) return;
+    const outcome = await this.#capturePending(run, active, graceExpired);
 
     if (outcome.kind === "not-ready") return;
 
@@ -347,10 +375,7 @@ export class ResultCoordinator {
     this.#hooks.onResultCaptured?.(envelope);
   }
 
-  /**
-   * Stop capture barrier: structured Pi bridge only.
-   * No terminal abort text is invented. Missing capture → uncertain (retain temp tree).
-   */
+  /** Stop capture barrier: exact Pi bridge or confirmed terminal-state non-Pi transcript. */
   async captureBarrier(
     runId: string,
   ): Promise<{ readonly envelope?: ResultEnvelopeV1; readonly durable: boolean; readonly uncertain: boolean }> {
@@ -397,22 +422,10 @@ export class ResultCoordinator {
         : { durable: true, uncertain: false };
     }
 
-    // phase === submitted: try bridge once with grace expired.
-    const pending: PendingGeneration = {
-      generation: active.generation,
-      requestNonce: active.requestNonce,
-      summary: active,
-    };
-    const outcome = await tryCapturePiBridge({
-      run: {
-        id: run.id,
-        runNonce: run.runNonce,
-        harness: run.harness,
-        ...(run.ephemeral === undefined ? {} : { ephemeral: run.ephemeral }),
-      },
-      generation: pending,
-      graceExpired: true,
-    });
+    // phase === submitted: reuse a durable envelope before any fresh read.
+    const adopted = await this.#adoptExisting(run, active);
+    if (adopted) return { envelope: adopted, durable: true, uncertain: false };
+    const outcome = await this.#capturePending(run, active, true);
 
     if (outcome.kind !== "captured") {
       run.activeGeneration = {

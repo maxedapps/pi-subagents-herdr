@@ -14,6 +14,7 @@ import {
   requestHumanDiscardAuthorization,
   WorktreeCleanupManager,
   type HumanDiscardAuthorization,
+  type SafeCleanupInput,
 } from "../../src/worktrees/cleanup.ts";
 import type { WorktreeRecord } from "../../src/worktrees/contracts.ts";
 import { WorktreeRegistry } from "../../src/worktrees/manager.ts";
@@ -74,27 +75,31 @@ test("explicit retain preserves the writer while review remains optional audit s
   const value = await fixture();
   try {
     const registry = newRegistry(); registry.register(value.record); const fake = fakeHerdr(value.record); const cleanup = new WorktreeCleanupManager(fake.client, registry);
-    const retained = await cleanup.cleanup({ id: "run-1", cleanup: "retain", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots });
+    const retained = await cleanup.cleanup({ id: "run-1", cleanup: "retain", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true });
     assert.equal(retained.state, "retained"); assert.equal(fake.removeCalls, 0); assert.equal(registry.getState("run-1")?.parentVerification.integration, "pending");
     registry.setParentReviewed("run-1", "parent inspected diff/tests"); assert.equal(registry.getState("run-1")?.parentVerification.review, "reviewed"); assert.equal(registry.getState("run-1")?.state, "retained", "review alone never declares integration");
     assert.throws(() => registry.markRemoved("run-1"), /objective safe-cleanup evidence/);
   } finally { await value.dispose(); }
 });
 
-test("cleanup retains until parent result or failure evidence is persisted", async () => {
-  const value = await fixture();
-  try {
-    const registry = newRegistry(); registry.register(value.record); const fake = fakeHerdr(value.record);
-    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: false });
-    assert.equal(result.retained, true); assert.match(result.reason, /not yet persisted/); assert.equal(fake.removeCalls, 0);
-  } finally { await value.dispose(); }
+test("cleanup retains until parent result or failure evidence is literally true", async (t) => {
+  for (const evidence of ["omitted", false, undefined] as const) await t.test(String(evidence), async () => {
+    const value = await fixture();
+    try {
+      const registry = newRegistry(); registry.register(value.record); const fake = fakeHerdr(value.record);
+      const raw: Record<string, unknown> = { id: value.record.id, ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots };
+      if (evidence !== "omitted") raw.resultEvidencePersisted = evidence;
+      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup(raw as unknown as SafeCleanupInput);
+      assert.equal(result.retained, true); assert.match(result.reason, /not yet persisted/); assert.equal(fake.removeCalls, 0); assert.equal(result.record.state, "created");
+    } finally { await value.dispose(); }
+  });
 });
 
 test("remove_if_safe captures artifacts, verifies no-change objective evidence, removes identity match, and leaves branch", async () => {
   const value = await fixture();
   try {
     const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1", "reviewed empty checkout"); const fake = fakeHerdr(value.record); const cleanup = new WorktreeCleanupManager(fake.client, registry);
-    const result = await cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+    const result = await cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
     assert.equal(result.removed, true); assert.equal(result.record.artifactsCaptured, true); assert.equal(result.record.capturedArtifacts.length, 2); assert.equal(fake.forceValue, false);
     assert.equal(execFileSync("git", ["-C", value.parent, "branch", "--list", "writer-branch"], { encoding: "utf8" }).trim().endsWith("writer-branch"), true, "worktree removal must never delete its branch");
   } finally { await value.dispose(); }
@@ -107,7 +112,7 @@ test("safe removal compare-deletes only an exact extension-generated branch", as
     execFileSync("git", ["-C", value.child, "branch", "-m", branch]);
     const record: WorktreeRecord = { ...value.record, branch, generatedBranch: true };
     const registry = newRegistry(); registry.register(record); const fake = fakeHerdr(record);
-    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
     assert.equal(result.removed, true); assert.equal(result.retained, false);
     assert.equal(result.record.finalization?.branchDisposition, "deleted");
     assert.equal(execFileSync("git", ["-C", value.parent, "branch", "--list", branch], { encoding: "utf8" }).trim(), "");
@@ -121,7 +126,7 @@ test("a generated branch moved after workspace removal is retained and retry rem
     execFileSync("git", ["-C", value.child, "branch", "-m", branch]);
     const record: WorktreeRecord = { ...value.record, branch, generatedBranch: true };
     const registry = newRegistry(); registry.register(record); const fake = fakeHerdr(record, { moveBranchOnRemove: true });
-    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
     assert.equal(result.removed, true); assert.equal(result.retained, true); assert.equal(result.record.state, "removed");
     assert.match(result.reason, /Generated branch moved/);
     assert.notEqual(execFileSync("git", ["-C", value.parent, "branch", "--list", branch], { encoding: "utf8" }).trim(), "");
@@ -141,7 +146,9 @@ test("cleanup resumes after a crash once a write-ahead Herdr removal is proven c
     const childHead = execFileSync("git", ["-C", value.child, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     registry.beginRemoval(record.id, false, childHead);
     execFileSync("git", ["-C", value.parent, "worktree", "remove", value.child]);
-    const result = await cleanup.cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots });
+    const withheld = await cleanup.cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: false });
+    assert.equal(withheld.retained, true); assert.ok(withheld.record.removalAttempt); assert.notEqual(execFileSync("git", ["-C", value.parent, "branch", "--list", branch], { encoding: "utf8" }).trim(), "");
+    const result = await cleanup.cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true });
     assert.equal(integrated.parentVerification.integration, "not_required");
     assert.equal(result.removed, true); assert.equal(result.retained, false);
     assert.equal(result.record.finalization?.branchDisposition, "deleted");
@@ -155,7 +162,7 @@ test("crash recovery preserves the generated branch when current parent integrat
     const record: WorktreeRecord = { ...value.record, branch, generatedBranch: true }; const registry = newRegistry(); registry.register(record); const capture = await captureWriterArtifacts(value.capture); registry.setCapturedArtifacts(record.id, capture.references);
     execFileSync("git", ["-C", value.parent, "merge", "--no-edit", "--no-ff", branch], { stdio: "ignore" }); await new WorktreeCleanupManager(fakeHerdr(record).client, registry).verifyAndRecordIntegration(record.id, { kind: "commit_contained", parentCheckoutPath: value.parent });
     const childHead = execFileSync("git", ["-C", value.child, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(); registry.beginRemoval(record.id, false, childHead); execFileSync("git", ["-C", value.parent, "worktree", "remove", value.child]); execFileSync("git", ["-C", value.parent, "reset", "--hard", record.base], { stdio: "ignore" });
-    await assert.rejects(new WorktreeCleanupManager(fakeHerdr(record, { gone: true }).client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots }), /no longer contains/);
+    await assert.rejects(new WorktreeCleanupManager(fakeHerdr(record, { gone: true }).client, registry).cleanup({ id: record.id, ownership: authorization(record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true }), /no longer contains/);
     assert.notEqual(execFileSync("git", ["-C", value.parent, "branch", "--list", branch], { encoding: "utf8" }).trim(), "");
   } finally { await value.dispose(); }
 });
@@ -170,7 +177,7 @@ test("safe removal captures the deterministic parent wrapper for a valid child h
     assert.equal(final.writer, "parent-wrapper");
     const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1", "reviewed");
     const fake = fakeHerdr(value.record);
-    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+    const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
     assert.equal(result.removed, true);
     assert.match(String(result.record.capturedArtifacts.find((artifact) => artifact.kind === "handoff")?.absolutePath), /handoff-handoff\.parent\.md$/);
   } finally { await value.dispose(); }
@@ -211,7 +218,7 @@ test("remove_if_safe does not require configured optional progress evidence", as
       cleanup: "remove_if_safe",
       ownership: authorization(value.record),
       artifactCapture: value.capture,
-      parentRoots: value.parentRoots,
+      parentRoots: value.parentRoots, resultEvidencePersisted: true,
       integrationEvidence: { kind: "no_changes" },
     });
     assert.equal(result.removed, true);
@@ -222,21 +229,21 @@ test("remove_if_safe does not require configured optional progress evidence", as
 test("dirty/unintegrated, unavailable Herdr, mismatched provenance, and active writer all retain without remove", async (t) => {
   await t.test("dirty and unintegrated", async () => {
     const value = await fixture(); try {
-      await writeFile(join(value.child, "dirty.txt"), "unintegrated\n"); const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1"); const fake = fakeHerdr(value.record); const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+      await writeFile(join(value.child, "dirty.txt"), "unintegrated\n"); const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1"); const fake = fakeHerdr(value.record); const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
       assert.equal(result.retained, true); assert.match(result.reason, /checkout is dirty/); assert.match(result.record.retentionReason ?? "", /dirty/); assert.equal(fake.removeCalls, 0);
     } finally { await value.dispose(); }
   });
   await t.test("Herdr unavailable", async () => {
-    const value = await fixture(); try { const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1"); const fake = fakeHerdr(value.record, { unavailable: true }); const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } }); assert.equal(result.retained, true); assert.match(result.reason, /unavailable/); assert.equal(fake.removeCalls, 0); } finally { await value.dispose(); }
+    const value = await fixture(); try { const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1"); const fake = fakeHerdr(value.record, { unavailable: true }); const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } }); assert.equal(result.retained, true); assert.match(result.reason, /unavailable/); assert.equal(fake.removeCalls, 0); } finally { await value.dispose(); }
   });
   await t.test("Herdr provenance mismatch", async () => {
-    const value = await fixture(); try { const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1"); const fake = fakeHerdr(value.record, { mismatch: true }); const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } }); assert.equal(result.retained, true); assert.match(result.reason, /identity-match/); assert.equal(fake.removeCalls, 0); } finally { await value.dispose(); }
+    const value = await fixture(); try { const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1"); const fake = fakeHerdr(value.record, { mismatch: true }); const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } }); assert.equal(result.retained, true); assert.match(result.reason, /identity-match/); assert.equal(fake.removeCalls, 0); } finally { await value.dispose(); }
   });
   await t.test("active writer", async () => {
     const value = await fixture(); try {
       const writer = { terminalId: "term-writer", nativeSession: { kind: "id" as const, value: "native-writer", source: "herdr:pi" } }; const active = { ...value.record, state: "active" as const, writer };
       const writerPane = { ...pane, pane_id: "w2:p3", terminal_id: writer.terminalId, workspace_id: "w2", tab_id: "w2:t2", agent_session: { ...writer.nativeSession, agent: "pi" } };
-      const registry = newRegistry(); registry.register(active); registry.setParentReviewed("run-1"); const fake = fakeHerdr(active, { writerPane }); const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(active), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } }); assert.equal(result.retained, true); assert.match(result.reason, /still live or uncertain/); assert.equal(fake.removeCalls, 0);
+      const registry = newRegistry(); registry.register(active); registry.setParentReviewed("run-1"); const fake = fakeHerdr(active, { writerPane }); const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(active), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } }); assert.equal(result.retained, true); assert.match(result.reason, /still live or uncertain/); assert.equal(fake.removeCalls, 0);
     } finally { await value.dispose(); }
   });
 });
@@ -247,7 +254,7 @@ test("artifact capture is record/run/checkout bound and explicit supplemental fi
       const optionalRecord = { ...value.record, artifactPaths: value.record.artifactPaths.map((artifact) => ({ ...artifact, required: false })) };
       const optionalCapture = { ...value.capture, artifacts: value.capture.artifacts.map((artifact) => ({ ...artifact, required: false })) };
       const registry = newRegistry(); registry.register(optionalRecord); registry.setParentReviewed(optionalRecord.id); const fake = fakeHerdr(optionalRecord);
-      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: optionalRecord.id, cleanup: "remove_if_safe", ownership: authorization(optionalRecord), artifactCapture: optionalCapture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: optionalRecord.id, cleanup: "remove_if_safe", ownership: authorization(optionalRecord), artifactCapture: optionalCapture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
       assert.equal(result.removed, true); assert.equal(result.record.capturedArtifacts.length, 2); assert.equal(fake.removeCalls, 1);
     } finally { await value.dispose(); }
   });
@@ -255,19 +262,19 @@ test("artifact capture is record/run/checkout bound and explicit supplemental fi
     const value = await fixture(); try {
       await Promise.all(value.capture.artifacts.map((artifact) => writeFile(artifact.sourcePath, " \n")));
       const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed(value.record.id); const fake = fakeHerdr(value.record);
-      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
       assert.equal(result.retained, true); assert.match(result.reason, /required artifact is empty|required non-empty/i); assert.equal(fake.removeCalls, 0);
     } finally { await value.dispose(); }
   });
   await t.test("different run or source checkout cannot supply evidence", async () => {
     const value = await fixture(); try {
       const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed(value.record.id); const fake = fakeHerdr(value.record); const cleanup = new WorktreeCleanupManager(fake.client, registry);
-      const wrongRun = await cleanup.cleanup({ id: value.record.id, cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: { ...value.capture, runId: "other-run" }, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+      const wrongRun = await cleanup.cleanup({ id: value.record.id, cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: { ...value.capture, runId: "other-run" }, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
       assert.match(wrongRun.reason, /run id is not bound/); assert.equal(fake.removeCalls, 0);
     } finally { await value.dispose(); }
     const value2 = await fixture(); try {
       const registry = newRegistry(); registry.register(value2.record); registry.setParentReviewed(value2.record.id); const fake = fakeHerdr(value2.record);
-      const wrongSource = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value2.record.id, cleanup: "remove_if_safe", ownership: authorization(value2.record), artifactCapture: { ...value2.capture, sourceRoots: value2.parentRoots }, parentRoots: value2.parentRoots, integrationEvidence: { kind: "no_changes" } });
+      const wrongSource = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value2.record.id, cleanup: "remove_if_safe", ownership: authorization(value2.record), artifactCapture: { ...value2.capture, sourceRoots: value2.parentRoots }, parentRoots: value2.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
       assert.match(wrongSource.reason, /source checkout is not bound/); assert.equal(fake.removeCalls, 0);
     } finally { await value2.dispose(); }
   });
@@ -279,7 +286,7 @@ test("initial and group anchors retain when a current non-shell foreground proce
     try {
       const changedAnchor = target === "initial" ? value.record.createdRoot.rootPaneId : value.record.tab!.rootPaneId;
       const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed(value.record.id); const fake = fakeHerdr(value.record, { changedAnchor });
-      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
       assert.equal(result.retained, true); assert.match(result.reason, /not a known idle shell/); assert.equal(fake.removeCalls, 0);
     } finally { await value.dispose(); }
   });
@@ -298,7 +305,7 @@ test("cleanup automatically derives direct containment and exact current-tree in
         execFileSync("git", ["-C", value.parent, "reset", "--hard", equivalent], { stdio: "ignore" });
       }
       const registry = newRegistry(); registry.register(value.record); const fake = fakeHerdr(value.record);
-      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots });
+      const result = await new WorktreeCleanupManager(fake.client, registry).cleanup({ id: value.record.id, ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true });
       assert.equal(result.removed, true); assert.equal(result.retained, false);
       assert.equal(result.record.parentVerification.integrationEvidence?.kind, mode === "contained" ? "commit_contained" : "tree_matches");
     } finally { await value.dispose(); }
@@ -328,14 +335,14 @@ test("saved integration evidence is revalidated against current child and parent
   await t.test("parent reset invalidates containment", async () => {
     const fixtureValue = await integratedFixture(); try {
       execFileSync("git", ["-C", fixtureValue.value.parent, "reset", "--hard", fixtureValue.value.record.base], { stdio: "ignore" });
-      const result = await fixtureValue.cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(fixtureValue.value.record), artifactCapture: fixtureValue.value.capture, parentRoots: fixtureValue.value.parentRoots });
+      const result = await fixtureValue.cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(fixtureValue.value.record), artifactCapture: fixtureValue.value.capture, parentRoots: fixtureValue.value.parentRoots, resultEvidencePersisted: true });
       assert.equal(result.retained, true); assert.match(result.reason, /does not contain/); assert.equal(fixtureValue.fake.removeCalls, 0);
     } finally { await fixtureValue.value.dispose(); }
   });
   await t.test("child advance invalidates prior containment", async () => {
     const fixtureValue = await integratedFixture(); try {
       await writeFile(join(fixtureValue.value.child, "later.txt"), "later\n"); execFileSync("git", ["-C", fixtureValue.value.child, "add", "later.txt"]); execFileSync("git", ["-C", fixtureValue.value.child, "commit", "-qm", "later child change"]);
-      const result = await fixtureValue.cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(fixtureValue.value.record), artifactCapture: fixtureValue.value.capture, parentRoots: fixtureValue.value.parentRoots });
+      const result = await fixtureValue.cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(fixtureValue.value.record), artifactCapture: fixtureValue.value.capture, parentRoots: fixtureValue.value.parentRoots, resultEvidencePersisted: true });
       assert.equal(result.retained, true); assert.match(result.reason, /does not contain/); assert.equal(fixtureValue.fake.removeCalls, 0);
     } finally { await fixtureValue.value.dispose(); }
   });
@@ -346,12 +353,14 @@ test("discard refuses forged/LLM-only assertions and force-removes only after in
   try {
     await writeFile(join(value.child, "dirty.txt"), "discard me\n"); const registry = newRegistry(); registry.register(value.record); const fake = fakeHerdr(value.record); const cleanup = new WorktreeCleanupManager(fake.client, registry);
     const forged = { decisionId: "fake", worktreeId: "run-1", runNonce: "nonce-1", workspaceId: "w2", checkoutPath: value.child, confirmedAt: Date.now(), consequences: [] } as HumanDiscardAuthorization;
-    const refused = await cleanup.discardWithHumanConfirmation({ id: "run-1", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, authorization: forged });
+    const refused = await cleanup.discardWithHumanConfirmation({ id: "run-1", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, authorization: forged });
     assert.equal(refused.retained, true); assert.equal(fake.removeCalls, 0);
     const cancelled = await requestHumanDiscardAuthorization({ record: refused.record, confirm: async () => false }); assert.equal(cancelled, undefined);
     let preview = ""; const approved = await requestHumanDiscardAuthorization({ record: refused.record, confirm: async (value) => { preview = value.consequences.join(" "); return true; } });
     assert.ok(approved); assert.match(preview, /permanently discarded/); assert.match(preview, /leave branch/);
-    const removed = await cleanup.discardWithHumanConfirmation({ id: "run-1", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, authorization: approved! });
+    const withoutHandoff = await cleanup.discardWithHumanConfirmation({ id: "run-1", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: false, authorization: approved! });
+    assert.equal(withoutHandoff.retained, true); assert.match(withoutHandoff.reason, /cannot substitute/); assert.equal(fake.removeCalls, 0);
+    const removed = await cleanup.discardWithHumanConfirmation({ id: "run-1", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, authorization: approved! });
     assert.equal(removed.removed, true); assert.equal(fake.forceValue, true); assert.ok(removed.record.humanDiscard?.decisionId); assert.equal(execFileSync("git", ["-C", value.parent, "branch", "--list", "writer-branch"], { encoding: "utf8" }).trim().endsWith("writer-branch"), true);
   } finally { await value.dispose(); }
 });
@@ -360,10 +369,10 @@ test("tampered active-branch ownership and stale captured artifacts fail closed"
   const value = await fixture();
   try {
     const registry = newRegistry(); registry.register(value.record); registry.setParentReviewed("run-1"); const fake = fakeHerdr(value.record); const cleanup = new WorktreeCleanupManager(fake.client, registry);
-    await assert.rejects(cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: { ...authorization(value.record), runNonce: "tampered" }, artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } }), /ownership proof/);
+    await assert.rejects(cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: { ...authorization(value.record), runNonce: "tampered" }, artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } }), /ownership proof/);
     const captured = await captureWriterArtifacts(value.capture); assert.equal(captured.verifiedForRemoval, true); registry.setCapturedArtifacts("run-1", captured.references);
     await writeFile(captured.references[0]!.absolutePath, "tampered after verified capture\n");
-    const result = await cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, integrationEvidence: { kind: "no_changes" } });
+    const result = await cleanup.cleanup({ id: "run-1", cleanup: "remove_if_safe", ownership: authorization(value.record), artifactCapture: value.capture, parentRoots: value.parentRoots, resultEvidencePersisted: true, integrationEvidence: { kind: "no_changes" } });
     assert.equal(result.retained, true); assert.match(result.reason, /no longer matches/); assert.equal(fake.removeCalls, 0);
   } finally { await value.dispose(); }
 });

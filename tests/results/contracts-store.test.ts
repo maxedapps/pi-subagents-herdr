@@ -65,6 +65,7 @@ test("result store persists envelopes atomically and refuses immutable collision
   const root = await mkdtemp(join(tmpdir(), "result-store-"));
   try {
     const captured = createCapturedResult({
+      source: "pi-final-assistant",
       runId: "run-1",
       runNonce: "nonce",
       generation: 1,
@@ -84,6 +85,7 @@ test("result store persists envelopes atomically and refuses immutable collision
     await writeResultEnvelope(root, envelope);
 
     const other = capturedToEnvelope(createCapturedResult({
+      source: "pi-final-assistant",
       runId: "run-1",
       runNonce: "nonce",
       generation: 1,
@@ -111,8 +113,9 @@ test("result store persists envelopes atomically and refuses immutable collision
   }
 });
 
-test("result envelope parser rejects hash/id mismatches and non-pi sources", () => {
+test("result envelope parser enforces source-specific terminal metadata", () => {
   const captured = createCapturedResult({
+    source: "pi-final-assistant",
     runId: "run-1",
     runNonce: "n",
     generation: 1,
@@ -123,4 +126,14 @@ test("result envelope parser rejects hash/id mismatches and non-pi sources", () 
   assert.throws(() => parseResultEnvelope({ ...envelope, rawTextSha256: "0".repeat(64) }), /rawTextSha256/);
   assert.throws(() => parseResultEnvelope({ ...envelope, resultId: "res-wrong" }), /resultId/);
   assert.throws(() => parseResultEnvelope({ ...envelope, source: "terminal-fallback" }), /result source/);
+  assert.throws(() => parseResultEnvelope({ ...envelope, terminalOutput: { outputRevision: 1, truncated: false } }), /must not include terminalOutput/);
+
+  const terminal = capturedToEnvelope(createCapturedResult({
+    source: "herdr-terminal-output",
+    terminalOutput: { outputRevision: 7, truncated: true },
+    runId: "run-1", runNonce: "n", generation: 2, requestNonce: "r2", rawText: "bounded transcript",
+  }), { stage: "captured", parentSessionId: "p" });
+  assert.deepEqual(parseResultEnvelope(terminal).terminalOutput, { outputRevision: 7, truncated: true });
+  assert.throws(() => parseResultEnvelope({ ...terminal, terminalOutput: undefined }), /terminalOutput/);
+  assert.throws(() => createCapturedResult({ source: "herdr-terminal-output", terminalOutput: { outputRevision: 1, truncated: false }, runId: "r", runNonce: "n", generation: 1, requestNonce: "q", rawText: "   " }), /non-empty/);
 });

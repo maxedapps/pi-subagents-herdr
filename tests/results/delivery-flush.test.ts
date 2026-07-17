@@ -35,6 +35,7 @@ test("store-backed flush freezes deliveredText once and calls sendMessage with m
     journal = writer.append(journal, "started", { paneId: "p1", terminalId: "term-1" });
 
     const captured = createCapturedResult({
+      source: "pi-final-assistant",
       runId: "run-1",
       runNonce: "nonce-1",
       generation: 1,

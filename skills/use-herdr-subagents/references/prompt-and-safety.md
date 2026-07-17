@@ -62,7 +62,7 @@ Graceful stop may return `stopped: false`; retain and inspect rather than claimi
 Writer cleanup defaults to automatic `remove_if_safe`; omitting `cleanup` is equivalent to `cleanup: "remove_if_safe"`, while explicit `retain` is exceptional. Before accepting successful finalization:
 
 1. Prove the child is stopped and current ownership—or exact cleanup-only adoption—agrees.
-2. Confirm the structured result or failure/action notice is parent-persisted.
+2. Confirm a result envelope (exact Pi final or bounded non-Pi transcript), or an exact `failed` notice, is parent-persisted. Cleanup/recovery/blocked/writer-review notices do not qualify.
 3. Inspect the complete diff/Git status and rerun relevant checks; integrate manually.
 4. Let the extension derive `no_changes`, direct containment, or exact current tree equivalence; provide existing `commit_contained`/`tree_matches` evidence only for another integrated parent ref.
 5. Preserve any present explicit custom artifact through verified parent capture.

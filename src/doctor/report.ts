@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadSettings, type HerdrSubagentsSettings, type LoadedSettings } from "../config/settings.ts";
-import type { Harness } from "../contracts/harness.ts";
+import { HARNESSES, type Harness } from "../contracts/harness.ts";
 import type { NativeSessionIdentity } from "../contracts/ownership.ts";
 import type { AgentProfile } from "../contracts/profile.ts";
 import { HERDR_PROTOCOL_VERSION, MINIMUM_HERDR_VERSION } from "../contracts/protocol.ts";
@@ -133,7 +133,7 @@ async function inspectGit(probe: DoctorProbe, cwd: string, requestProgress: bool
 }
 function integrationChecks(output: string, strictness: HerdrSubagentsSettings["integrations"]["strictness"]): DoctorCheck[] {
   const lines = output.split(/\r?\n/).filter(Boolean);
-  return (["pi", "claude", "codex"] as const).map((name) => {
+  return HARNESSES.map((name) => {
     const line = lines.find((candidate) => candidate.startsWith(`${name}:`));
     if (!line) return check(`integration.${name}`, "integration", strictness === "strict" ? "fail" : "warning", `${name} integration status was not reported`);
     const current = /:\s+current\s+\(v\d+\)/.test(line);
@@ -223,7 +223,7 @@ export async function createDoctorReport(options: DoctorOptions): Promise<Doctor
     checks.push(check("profiles-or-settings", "profiles", "fail", error instanceof Error ? error.message : String(error)));
   }
 
-  for (const harness of ["pi", "claude", "codex"] as const) {
+  for (const harness of HARNESSES) {
     try {
       const executable = await resolveExecutable(ADAPTER_CAPABILITIES[harness].executable, undefined, environment.PATH);
       const version = await commandVersion(probe, options.context.cwd, executable, ["--version"]);

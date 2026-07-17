@@ -4,6 +4,7 @@ import { resolveExecutable } from "./base.ts";
 import { ClaudeHarnessAdapter } from "./claude.ts";
 import { CodexHarnessAdapter } from "./codex.ts";
 import { PiHarnessAdapter } from "./pi.ts";
+import { GrokHarnessAdapter } from "./grok.ts";
 
 const PREPARED = Symbol("prepared-herdr-harness-launch");
 
@@ -19,6 +20,7 @@ export function harnessAdapter(harness: Harness): HarnessAdapter {
     case "pi": return new PiHarnessAdapter();
     case "claude": return new ClaudeHarnessAdapter();
     case "codex": return new CodexHarnessAdapter();
+    case "grok": return new GrokHarnessAdapter();
   }
 }
 
@@ -44,3 +46,4 @@ export * from "./capabilities.ts";
 export * from "./pi.ts";
 export * from "./claude.ts";
 export * from "./codex.ts";
+export * from "./grok.ts";

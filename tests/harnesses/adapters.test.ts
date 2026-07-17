@@ -19,7 +19,8 @@ const ENV_KEYS = [
   "HERDR_SUBAGENT", "HERDR_SUBAGENT_NO_RECURSION", "HERDR_SUBAGENT_RUN_ID", "HERDR_SUBAGENT_RUN_NONCE",
   "HERDR_SUBAGENT_PROFILE", "HERDR_SUBAGENT_PARENT_SESSION_ID", "PI_SUBAGENT_CHILD", "PI_HERDR_SUBAGENT",
   "PI_HERDR_SUBAGENT_RUN_ID", "CLAUDE_HERDR_SUBAGENT", "CLAUDE_CODE_SAFE_MODE", "CODEX_HERDR_SUBAGENT",
-  "CODEX_HERDR_DISABLE_NATIVE_SUBAGENTS",
+  "CODEX_HERDR_DISABLE_NATIVE_SUBAGENTS", "GROK_HERDR_SUBAGENT", "GROK_HERDR_SUBAGENT_RUN_ID",
+  "GROK_HERDR_DISABLE_NATIVE_SUBAGENTS", "GROK_DISABLE_AUTOUPDATER",
 ] as const;
 
 interface Fixture {
@@ -175,6 +176,25 @@ test("Codex adapter emits exact sandbox/approval/effort roots and disables nativ
   } finally { await cli.cleanup(); await fx.cleanup(); }
 });
 
+test("Grok adapter uses conservative native sandbox controls and disables recursion, memory, web, and updates", async () => {
+  const fx = await fixture(); const cli = await createFakeCliFixture(ENV_KEYS);
+  try {
+    const readOnly = await prepareHarnessLaunch(context({ harness: "grok", fixture: fx, executable: cli.executable, thinking: "medium" }));
+    assert.deepEqual(readOnly.launch.argv, [
+      cli.executable, "--session-id", "550e8400-e29b-41d4-a716-446655440000", "--cwd", fx.cwd,
+      "--sandbox", "read-only", "--permission-mode", "dontAsk", "--rules", "immutable child boundary",
+      "--no-subagents", "--no-memory", "--no-auto-update", "--disable-web-search", "--effort", "medium",
+    ]);
+    const strictWriter = await prepareHarnessLaunch(context({ harness: "grok", fixture: fx, executable: cli.executable, mutation: true, network: false, thinking: "high", model: "grok-code-fast" }));
+    assert.equal(strictWriter.launch.argv.includes("strict"), true); assert.equal(strictWriter.launch.argv.includes("acceptEdits"), true); assert.equal(strictWriter.launch.argv.includes("--disable-web-search"), true);
+    const networkWriter = await prepareHarnessLaunch(context({ harness: "grok", fixture: fx, executable: cli.executable, mutation: true, network: true, thinking: "xhigh" }));
+    assert.equal(networkWriter.launch.argv.includes("workspace"), true); assert.equal(networkWriter.launch.argv.includes("--disable-web-search"), false);
+    assert.equal(networkWriter.launch.argv.some((arg) => arg.includes("TOP SECRET TASK")), false);
+    assert.equal(networkWriter.launch.env.GROK_HERDR_DISABLE_NATIVE_SUBAGENTS, "1"); assert.equal(networkWriter.launch.env.GROK_DISABLE_AUTOUPDATER, "1");
+    await executeFake(networkWriter); assert.equal((await cli.readCapture()).env.GROK_HERDR_SUBAGENT, "1");
+  } finally { await cli.cleanup(); await fx.cleanup(); }
+});
+
 test("adapters reject contradictions, unsupported mappings, dangerous values, and cross-harness fallback before launch", async () => {
   const fx = await fixture(); const cli = await createFakeCliFixture();
   try {
@@ -189,6 +209,18 @@ test("adapters reject contradictions, unsupported mappings, dangerous values, an
     await assert.rejects(
       prepareHarnessLaunch(context({ harness: "codex", fixture: fx, executable: cli.executable, tools: [tool("read", ["read"])] })),
       /no equivalent explicit tool allowlist/,
+    );
+    await assert.rejects(
+      prepareHarnessLaunch(context({ harness: "grok", fixture: fx, executable: cli.executable, tools: [tool("read", ["read"])] })),
+      /explicit tool lists are not supported/,
+    );
+    await assert.rejects(
+      prepareHarnessLaunch(context({ harness: "grok", fixture: fx, executable: cli.executable, mutation: true, writableRoots: [fx.root] })),
+      /additional writable roots are not supported/,
+    );
+    await assert.rejects(
+      prepareHarnessLaunch(context({ harness: "grok", fixture: fx, executable: cli.executable, integrationPolicy: "safe-mode" })),
+      /does not support the Claude safe-mode/,
     );
     await assert.rejects(
       prepareHarnessLaunch(context({ harness: "pi", fixture: fx, executable: cli.executable, tools: [tool("subagent_start", ["read"])] })),

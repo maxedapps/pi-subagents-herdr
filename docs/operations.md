@@ -4,7 +4,7 @@
 
 1. Start Pi inside the intended Herdr pane.
 2. Confirm matching `HERDR_ENV`, socket, pane, tab, and workspace variables.
-3. Confirm Pi 0.80.6+, Herdr 0.7.3/protocol 16, integrations, and harness authentication.
+3. Confirm Pi 0.80.6+, Herdr 0.7.3/protocol 16, integrations, and selected Pi/Claude/Codex/Grok authentication.
 4. Reload and run `/subagents-doctor`.
 
 Useful read-only commands:
@@ -17,7 +17,7 @@ herdr integration status
 npm run smoke:load
 ```
 
-Herdr CLI is diagnostic, not an ownership bypass.
+Herdr CLI is diagnostic, not an ownership bypass. Before releasing Grok support, verify the installed `grok --version`/`grok --help`, no-model PTY interrupt and `/exit`, Herdr `agent=grok` status/read behavior, and whether `agent_session` is present. If real behavior differs from the adapter, block release rather than weakening identity.
 
 ## Start, monitor, and act
 
@@ -28,7 +28,7 @@ subagent_status({ id: "<id>", lines: 160 })
 subagent_status({ scope: "all_owned" })
 ```
 
-Results arrive automatically. A writer result can include `ACTION REQUIRED` with exact checkout/branch/base/HEAD/clean/ahead facts and the next stop/integration step. Later blockers, failures, cleanup refusals, and recovery issues use a deduplicated follow-up message and the same `run.attention` status/TUI state. Treat it as unresolved until cleanup succeeds or an explicit blocker is reported.
+Results arrive automatically: Pi delivers an exact structured final; Claude, Codex, and Grok deliver a bounded Herdr terminal transcript labeled with source/truncation. A writer result can include `ACTION REQUIRED` with exact checkout/branch/base/HEAD/clean/ahead facts and the next stop/integration step. Later blockers, failures, cleanup refusals, and recovery issues use a deduplicated follow-up message and the same `run.attention` status/TUI state. Treat it as unresolved until cleanup succeeds or an explicit blocker is reported.
 
 Blocked state is not permission to self-approve. Use one bounded same-assignment follow-up when appropriate. For send/interrupt, inspect `unconfirmed` and `uncertain`; never retry uncertain input automatically.
 
@@ -48,7 +48,7 @@ Cleanup retains and reports an exact retry action unless all of these hold:
 
 - current ownership or exact cleanup-only adoption is authoritative;
 - child/native agent is gone and only recorded idle anchors remain;
-- structured result or explicit failure/action evidence is parent-persisted;
+- a result envelope or exact `failed` notice is parent-persisted; other notices never qualify;
 - checkout is clean and no-change/integration is objectively proven;
 - Herdr/Git repository, workspace, worktree path, branch, and child HEAD match;
 - every present explicit custom artifact is copied and hash verified.
@@ -76,7 +76,7 @@ Do not edit journals or metadata to manufacture authority.
 
 ## Artifact lifecycle
 
-Bundled profiles write no handoff/progress files. While unresolved, parent operational files are `run.json` and optional `results/`. The delivered structured result is the durable handoff. Private prompt/session/exchange files remain only while live or capture-uncertain.
+Bundled profiles write no handoff/progress files. While unresolved, parent operational files are `run.json` and optional `results/`. The delivered result envelope (exact Pi final or bounded non-Pi transcript), or an exact persisted `failed` notice, is the durable handoff. Private prompt/session/exchange files remain only while live or capture-uncertain.
 
 Custom profile artifacts are explicit supplemental retention. Present files inside a writer worktree are copied under parent-owned `captured/` and byte/SHA-256 verified. Missing optional files do not gate cleanup; a failed copy of a present file retains. Successful default finalization leaves no `.subagents/runs/<id>` directory; custom captures remain.
 
@@ -95,6 +95,10 @@ Git-local excludes protect `/.subagents/` and only explicitly requested `/.progr
 | action/cleanup required | inspect exact run facts, resolve blocker, retry `subagent_stop` |
 | dirty/unintegrated writer | review/test/integrate; never discard automatically |
 | legacy cleanup proof incomplete | retain; inspect the consolidated recovery notice |
+
+## Exact archive activation and rollback
+
+Run full/package gates first, pack once, record the archive SHA-256 and source commit, then install that exact archive. Reload Pi and verify `/subagents-doctor`, five tool registrations, installed package contents, and one bounded result-source smoke. Preserve the previous archive/path for rollback. Before replacing or rolling back, stop or explicitly retain every owned run; package reload never stops children.
 
 ## Validation
 

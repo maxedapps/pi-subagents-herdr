@@ -165,8 +165,15 @@ export function findPersistedActionNotice(branch: readonly PiBranchEntry[], noti
     if (customType !== ACTION_NOTICE_CUSTOM_TYPE && customType !== "herdr-subagents.result.v1") return false;
     return messageText(message as { content?: unknown }).split("\n").some((line) => {
       if (!line.startsWith(`${ACTION_NOTICE_SENTINEL} `)) return false;
-      try { return (JSON.parse(line.slice(ACTION_NOTICE_SENTINEL.length + 1)) as { noticeId?: unknown }).noticeId === noticeId; }
-      catch { return false; }
+      try {
+        const parsed = JSON.parse(line.slice(ACTION_NOTICE_SENTINEL.length + 1)) as unknown;
+        if (!isRecord(parsed)) return false;
+        if (parsed.noticeId === noticeId) return true;
+        if (!Array.isArray(parsed.noticeIds) || parsed.noticeIds.length === 0) return false;
+        if (!parsed.noticeIds.every((item) => typeof item === "string" && item.length > 0 && !item.includes("\0"))) return false;
+        if (new Set(parsed.noticeIds).size !== parsed.noticeIds.length) return false;
+        return parsed.noticeIds.includes(noticeId);
+      } catch { return false; }
     });
   });
 }

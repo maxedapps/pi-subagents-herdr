@@ -36,6 +36,7 @@ test("exactToolPayload serializes once for content and details", () => {
 
 test("delivered text is one result with sentinel and structured-final only", () => {
   const captured = createCapturedResult({
+    source: "pi-final-assistant",
     runId: "run-1",
     runNonce: "n",
     generation: 1,
@@ -50,6 +51,19 @@ test("delivered text is one result with sentinel and structured-final only", () 
   assert.match(text, /structured-final/);
   assert.match(text, /final answer/);
   assert.doesNotMatch(text, /terminal-fallback|legacy/);
+});
+
+test("terminal results are labeled as bounded transcripts with truncation truth", () => {
+  const captured = createCapturedResult({
+    source: "herdr-terminal-output",
+    terminalOutput: { outputRevision: 9, truncated: true },
+    runId: "run-2", runNonce: "n", generation: 1, requestNonce: "r", rawText: "terminal scrollback",
+  });
+  const envelope = capturedToEnvelope(captured, { stage: "captured", parentSessionId: "p" });
+  const deliveryId = computeDeliveryId(envelope.resultId, createHash("sha256").update(envelope.rawText, "utf8").digest("hex"));
+  const text = buildDeliveredText({ envelope, profileName: "claude-scout", deliveryId });
+  assert.match(text, /herdr-terminal-output/); assert.match(text, /bounded Herdr terminal transcript/); assert.match(text, /truncated=true/);
+  assert.doesNotMatch(text, /limitations":"structured-final/);
 });
 
 test("authorizeResultDelivery requires active-branch ownership chain", () => {

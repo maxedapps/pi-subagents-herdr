@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import type { NativeSessionIdentity } from "../contracts/ownership.ts";
+import type { Harness } from "../contracts/harness.ts";
 import type { HerdrStatus } from "../contracts/state.ts";
 import type { HerdrRequestClient } from "../herdr/client.ts";
 import type { AgentInfo, PaneInfo, SessionSnapshot } from "../herdr/protocol.ts";
@@ -22,7 +23,7 @@ export interface RuntimeOwnershipAuthorization {
 export interface OwnedRunTarget {
   readonly runId: string;
   readonly runNonce: string;
-  readonly harness: "pi" | "claude" | "codex";
+  readonly harness: Harness;
   readonly terminalId: string;
   readonly nativeSession?: NativeSessionIdentity;
   readonly activeBranchOwned: true;

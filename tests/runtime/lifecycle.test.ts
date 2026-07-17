@@ -6,7 +6,7 @@ import test from "node:test";
 import { HerdrApiError, type AgentInfo, type AgentStartInput, type PaneInfo, type PaneProcessInfo, type ReadResult, type SessionSnapshot, type TabInfo, type WorkspaceInfo } from "../../src/herdr/protocol.ts";
 import type { HerdrRequestClient } from "../../src/herdr/client.ts";
 import { HerdrUnavailableError } from "../../src/herdr/transport.ts";
-import type { EffectiveLaunchPolicy } from "../../src/contracts/harness.ts";
+import type { EffectiveLaunchPolicy, Harness } from "../../src/contracts/harness.ts";
 import type { AgentProfile } from "../../src/contracts/profile.ts";
 import { assembleChildInstructions } from "../../src/harnesses/prompt.ts";
 import { prepareHarnessLaunch, type PreparedHarnessLaunch } from "../../src/harnesses/index.ts";
@@ -33,6 +33,7 @@ class FakeLifecycleClient {
   readonly closedTabs: string[] = [];
   childLive = false;
   tabLive = true;
+  childHarness: Harness = "pi";
   childTerminal = "term_child";
   childPane = "w1:p1";
   childStatus: AgentInfo["agent_status"] = "idle";
@@ -54,7 +55,7 @@ class FakeLifecycleClient {
   childAgent(): AgentInfo {
     return {
       terminal_id: this.childTerminal, workspace_id: "w1", tab_id: "w1:t1", pane_id: this.childPane,
-      focused: false, agent_status: this.childStatus, revision: this.childRevision, agent: "pi",
+      focused: false, agent_status: this.childStatus, revision: this.childRevision, agent: this.childHarness,
       ...(this.initialNative && this.childTerminal === "term_child" ? { agent_session: native } : {}),
     };
   }
@@ -100,14 +101,14 @@ class FakeLifecycleClient {
   async getPaneProcessInfo(paneId: string): Promise<PaneProcessInfo> { return { ...anchorProcess, pane_id: paneId }; }
 }
 
-async function preparedFixture(): Promise<{ prepared: PreparedHarnessLaunch; cleanup(): Promise<void> }> {
+async function preparedFixture(harness: Harness = "pi"): Promise<{ prepared: PreparedHarnessLaunch; cleanup(): Promise<void> }> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "p5-runtime-"))); const cwd = join(root, "checkout"); const sessions = join(root, "sessions");
   await mkdir(cwd, { mode: 0o700 }); await mkdir(sessions, { mode: 0o700 });
   const system = join(root, "system.md"); await writeFile(system, "boundary", { mode: 0o600 }); await chmod(system, 0o600);
   const cli = await createFakeCliFixture();
-  const profile: AgentProfile = { name: "scout", description: "test", body: "Inspect only.", harness: "pi", permissions: "read-only", source: { path: "/profile.md", scope: "bundled", namespace: "shared", priority: 0 } };
-  const policy: EffectiveLaunchPolicy = { harness: "pi", allowedModels: [], thinking: "low", cwd, trustedRoots: [cwd], tools: [{ name: "read", capabilities: ["read"] }], permissions: { mutation: false, network: false }, requireWorktree: false, broadeningReasons: [] };
-  const prepared = await prepareHarnessLaunch({ policy, profile, executable: cli.executable, sessionId: native.value, sessionName: "run-life", sessionDirectory: sessions, systemPromptPath: system, metadata: { runId: "run-life", runNonce: "nonce-life", profileName: "scout", parentSessionId: "parent-life" } });
+  const profile: AgentProfile = { name: "scout", description: "test", body: "Inspect only.", harness, permissions: "read-only", source: { path: "/profile.md", scope: "bundled", namespace: "shared", priority: 0 } };
+  const policy: EffectiveLaunchPolicy = { harness, allowedModels: [], thinking: "low", cwd, trustedRoots: [cwd], tools: harness === "grok" ? [] : [{ name: "read", capabilities: ["read"] }], permissions: { mutation: false, network: false }, requireWorktree: false, broadeningReasons: [] };
+  const prepared = await prepareHarnessLaunch({ policy, profile, executable: cli.executable, sessionId: native.value, sessionName: "run-life", ...(harness === "pi" ? { sessionDirectory: sessions } : {}), systemPromptPath: system, metadata: { runId: "run-life", runNonce: "nonce-life", profileName: "scout", parentSessionId: "parent-life" } });
   return { prepared, cleanup: async () => { await cli.cleanup(); await rm(root, { recursive: true, force: true }); } };
 }
 
@@ -136,6 +137,15 @@ test("fake lifecycle starts without task argv, waits for readiness, submits atom
     assert.deepEqual(fake.inputs, [{ paneId: "w1:p1", text: prompt, keys: ["enter"] }]);
     assert.equal(result.agent.agent_status, "working");
     assert.deepEqual(result.target.nativeSession, { kind: "id", value: native.value, source: native.source });
+  } finally { await fx.cleanup(); }
+});
+
+test("Grok screen-only readiness preserves exact terminal/agent topology without fabricating native identity", async () => {
+  const fx = await preparedFixture("grok"); const fake = new FakeLifecycleClient(); fake.childHarness = "grok"; fake.initialNative = false;
+  try {
+    const result = await startSubagent({ client: client(fake), prepared: fx.prepared, placement: group(), instructions: instructions(fx.prepared), authorization, recordStarted: () => undefined, startupTimeoutMs: 100, turnStartTimeoutMs: 100, pollIntervalMs: 1 });
+    assert.equal(result.started, true); assert.equal(result.target.harness, "grok"); assert.equal(result.target.terminalId, "term_child"); assert.equal(result.target.nativeSession, undefined);
+    assert.equal(fake.startCalls[0]!.argv.includes("--no-subagents"), true); assert.equal(fake.startCalls[0]!.argv.some((argument) => argument.includes("Inspect package metadata")), false);
   } finally { await fx.cleanup(); }
 });
 
