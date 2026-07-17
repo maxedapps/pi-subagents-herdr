@@ -63,7 +63,7 @@ import {
   assertRuntimeFilesMatchMetadata,
   assertRuntimeMetadataMatchesJournal,
   readRuntimeRunMetadata,
-  listRuntimeRunMetadata,
+  inventoryRuntimeRunMetadata,
   type RuntimeRunMetadata,
 } from "../runtime/metadata.ts";
 import { PlacementStartExhaustedError, StartCleanupError, TurnSubmissionUncertainError, startSubagent } from "../runtime/start.ts";
@@ -73,7 +73,7 @@ import { toPublicResultView, type GenerationSummary, type PublicResultView, type
 import { deriveRunAttention, findLegacyPersistedFailedAction, toPublicRunAttention, type ActionKind, type RunAttention } from "../results/action-notices.ts";
 import { appendFailureEvidence, findPersistedFailureEvidence } from "../results/failure-evidence.ts";
 import { ResultCoordinator } from "../results/coordinator.ts";
-import { ResultDeliveryService } from "../results/delivery.ts";
+import { authorizeResultDelivery, findPersistedResultMessage, ResultDeliveryService } from "../results/delivery.ts";
 import { boundUtf8HeadTail } from "../results/presentation.ts";
 import { installResultServices, toCoordinatorView } from "../results/service-bridge.ts";
 import { listResultEnvelopes, readResultEnvelope } from "../results/store.ts";
@@ -629,24 +629,49 @@ export class HerdrToolRuntimeController {
 
   async #priorHandoffEvidence(metadata: RuntimeRunMetadata, journal: OwnershipJournalData): Promise<boolean> {
     const context = this.#context!;
-    const envelopes = await listResultEnvelopes(context.cwd, metadata.runId);
-    if (envelopes.some((envelope) => envelope.runId === metadata.runId
-      && envelope.runNonce === metadata.runNonce
-      && envelope.delivery.stage === "parent_persisted"
-      && envelope.delivery.parentSessionId === journal.parent.sessionId
-      && envelope.delivery.parentSessionPath === journal.parent.sessionPath
-      && envelope.delivery.parentEntryId !== undefined)) return true;
     if (!journal.parent.sessionPath) return false;
     let manager: SessionManager;
     try { manager = SessionManager.open(journal.parent.sessionPath); } catch { return false; }
     if (manager.getSessionId() !== journal.parent.sessionId || manager.getSessionFile() !== journal.parent.sessionPath) return false;
+
+    const envelopes = await listResultEnvelopes(context.cwd, metadata.runId);
+    for (const envelope of envelopes) {
+      const delivery = envelope.delivery;
+      if (envelope.runId !== metadata.runId || envelope.runNonce !== metadata.runNonce
+        || delivery.stage !== "parent_persisted"
+        || delivery.parentSessionId !== journal.parent.sessionId
+        || delivery.parentSessionPath !== journal.parent.sessionPath
+        || delivery.parentEntryId === undefined || delivery.deliveryId === undefined) continue;
+      if (!manager.getEntry(delivery.parentEntryId)) continue;
+      const branch = manager.getBranch(delivery.parentEntryId);
+      const persisted = findPersistedResultMessage(branch, {
+        resultId: envelope.resultId,
+        deliveryId: delivery.deliveryId,
+        runId: envelope.runId,
+        generation: envelope.generation,
+      });
+      if (persisted?.id !== delivery.parentEntryId) continue;
+      const authorization = authorizeResultDelivery({
+        runId: metadata.runId,
+        runNonce: metadata.runNonce,
+        parentSessionId: journal.parent.sessionId,
+        parentSessionPath: journal.parent.sessionPath,
+        terminalId: metadata.terminalId,
+        ...(metadata.nativeSession === undefined ? {} : { nativeSession: metadata.nativeSession }),
+        branch,
+        sessionId: manager.getSessionId(),
+        sessionPath: journal.parent.sessionPath,
+      });
+      if (authorization.ok) return true;
+    }
+
     for (const entry of manager.getEntries()) {
       const branch = manager.getBranch(entry.id);
       if (findPersistedFailureEvidence(branch, {
         runId: metadata.runId,
         runNonce: metadata.runNonce,
         parentSessionId: journal.parent.sessionId,
-        ...(journal.parent.sessionPath === undefined ? {} : { parentSessionPath: journal.parent.sessionPath }),
+        parentSessionPath: journal.parent.sessionPath,
         branchEntryId: journal.parent.branchEntryId,
       })) return true;
       if (metadata.attention?.kind === "failed"
@@ -1006,8 +1031,30 @@ export class HerdrToolRuntimeController {
     const context = this.#context;
     const snapshot = this.#preflight?.snapshot;
     if (!context) return;
-    for (const metadata of await listRuntimeRunMetadata(context.cwd)) {
-      if ((metadata.lifecycle !== "stopped" && metadata.lifecycle !== "failed") || this.#runs.has(metadata.runId) || this.#observational.has(metadata.runId)) continue;
+    for (const inventory of await inventoryRuntimeRunMetadata(context.cwd)) {
+      if (this.#runs.has(inventory.runId) || this.#observational.has(inventory.runId)) continue;
+      if (inventory.status === "malformed") {
+        const blocker = "Runtime metadata is malformed or unsafe; cleanup authority cannot be established";
+        this.#observational.set(inventory.runId, {
+          reason: blocker,
+          projectPath: context.cwd,
+          summary: {
+            id: inventory.runId,
+            profile: "prior-session-unknown",
+            harness: "pi",
+            lifecycle: "lost",
+            herdrStatus: "unknown",
+            ownership: "uncertain",
+            live: false,
+            elapsedMs: 0,
+            taskSynopsis: "Malformed prior-session residue; metadata content is intentionally not exposed",
+            residue: { policyKind: "unknown", provenance: "malformed", blocker },
+          },
+        });
+        continue;
+      }
+      const metadata = inventory.metadata;
+      if (metadata.lifecycle !== "stopped" && metadata.lifecycle !== "failed") continue;
       const policyKind = metadata.policy.requireWorktree ? "writer" as const : "read_only" as const;
       let provenance: "validated_metadata" | "unsafe" = "validated_metadata";
       let blocker = "Prior-session stopped residue requires an explicit exact-ID subagent_stop cleanup request";

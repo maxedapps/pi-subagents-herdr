@@ -161,23 +161,32 @@ export function assertRuntimeMetadataMatchesJournal(metadata: RuntimeRunMetadata
   if (metadata.harness === "pi" && metadata.nativeSession === undefined) throw new Error("Pi recovery metadata lacks mandatory native session identity");
 }
 
-/** List valid run-bound metadata without letting one malformed stale entry disable recovery. */
-export async function listRuntimeRunMetadata(checkout: string): Promise<readonly RuntimeRunMetadata[]> {
+export type RuntimeRunMetadataInventoryEntry =
+  | { readonly runId: string; readonly status: "valid"; readonly metadata: RuntimeRunMetadata }
+  | { readonly runId: string; readonly status: "malformed" };
+
+/** Inventory safe run-directory names without exposing malformed metadata content. */
+export async function inventoryRuntimeRunMetadata(checkout: string): Promise<readonly RuntimeRunMetadataInventoryEntry[]> {
   const canonicalCheckout = await realpath(resolve(checkout));
   const runsRoot = join(canonicalCheckout, ".subagents", "runs");
   let info;
   try { info = await lstat(runsRoot); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("runtime runs root is not a safe directory");
-  const values: RuntimeRunMetadata[] = [];
+  const values: RuntimeRunMetadataInventoryEntry[] = [];
   for (const entry of await readdir(runsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.isSymbolicLink() || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(entry.name)) continue;
     try {
       const metadata = await readRuntimeRunMetadata(canonicalCheckout, entry.name);
-      if (metadata) values.push(metadata);
-    } catch { /* Malformed entries remain untouched and non-authoritative. */ }
+      values.push(metadata?.runId === entry.name ? { runId: entry.name, status: "valid", metadata } : { runId: entry.name, status: "malformed" });
+    } catch { values.push({ runId: entry.name, status: "malformed" }); }
   }
   return values;
+}
+
+/** List valid run-bound metadata without letting one malformed stale entry disable recovery. */
+export async function listRuntimeRunMetadata(checkout: string): Promise<readonly RuntimeRunMetadata[]> {
+  return (await inventoryRuntimeRunMetadata(checkout)).flatMap((entry) => entry.status === "valid" ? [entry.metadata] : []);
 }
 
 export async function readRuntimeRunMetadata(checkout: string, runId: string): Promise<RuntimeRunMetadata | undefined> {
