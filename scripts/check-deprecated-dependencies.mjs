@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --throw-deprecation
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const EXPECTED_EXCEPTION = Object.freeze({
@@ -60,12 +60,30 @@ export function auditDeprecatedDependencies(lock, lockfilePath = "package-lock.j
   return { allowed, errors };
 }
 
+function isInstalledArchiveWithoutSourceLock(lockfilePath) {
+  const packageRoot = dirname(lockfilePath);
+  if (lockfilePath !== join(packageRoot, "package-lock.json")) return false;
+  if (["tsconfig.json", "tests", ".plans"].some((path) => existsSync(join(packageRoot, path)))) return false;
+  try {
+    const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+    return manifest.name === "pi-subagents-herdr"
+      && Array.isArray(manifest.files)
+      && !manifest.files.includes("package-lock.json");
+  } catch {
+    return false;
+  }
+}
+
 function main() {
   const lockfilePath = resolve(process.argv[2] ?? "package-lock.json");
   let lock;
   try {
     lock = JSON.parse(readFileSync(lockfilePath, "utf8"));
   } catch (error) {
+    if ((error && typeof error === "object" && error.code === "ENOENT") && isInstalledArchiveWithoutSourceLock(lockfilePath)) {
+      process.stdout.write("deprecated dependency audit not applicable: source package-lock.json is intentionally excluded from the installed archive\n");
+      return;
+    }
     process.stderr.write(`deprecated dependency audit failed: ${lockfilePath}: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
     return;

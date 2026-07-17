@@ -215,6 +215,15 @@ process.stdout.write("packed-isolated-load ok: extension import closure + contra
   delete environment.NODE_PATH;
   const strictExecutionEnvironment = { ...environment, NODE_OPTIONS: "--throw-deprecation" };
 
+  const installedAuditOutput = execFileSync(
+    "npm",
+    ["--prefix", installedPackage, "run", "deps:deprecations"],
+    { cwd: temporaryRoot, env: strictExecutionEnvironment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+  if (!installedAuditOutput.includes("not applicable: source package-lock.json is intentionally excluded from the installed archive")) {
+    throw new Error(`Installed archive deprecation audit reported an unexpected result: ${installedAuditOutput}`);
+  }
+
   const tsxBin = join(installRoot, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
   if (!existsSync(tsxBin)) throw new Error("Exact archive runtime dependency did not install an isolated tsx executable");
   isolatedLoadOutput = execFileSync(

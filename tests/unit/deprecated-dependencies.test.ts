@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -17,6 +17,24 @@ async function runAudit(packages: Record<string, unknown>) {
       cwd: process.cwd(), encoding: "utf8",
     });
     return { status: result.status, stdout: result.stdout, stderr: result.stderr, signal: result.signal };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function runMissingSourceLock(sourceMarker: boolean) {
+  const directory = await mkdtemp(join(tmpdir(), "deprecated-lock-missing-"));
+  const lockfile = join(directory, "package-lock.json");
+  await writeFile(join(directory, "package.json"), `${JSON.stringify({
+    name: "pi-subagents-herdr",
+    files: ["extensions/", "src/", "scripts/"],
+  }, null, 2)}\n`);
+  if (sourceMarker) await mkdir(join(directory, "tests"));
+  try {
+    const result = spawnSync(process.execPath, ["--throw-deprecation", "scripts/check-deprecated-dependencies.mjs", lockfile], {
+      cwd: process.cwd(), encoding: "utf8",
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -68,4 +86,16 @@ test("rejects a stale exception when deprecated node-domexception entries disapp
   assert.equal(result.status, 1);
   assert.match(result.stderr, /stale node-domexception exception/);
   assert.match(result.stderr, /remove the allowlist and contributor warning/);
+});
+
+test("reports the source-lock audit as not applicable in an installed archive", async () => {
+  const result = await runMissingSourceLock(false);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /not applicable: source package-lock\.json is intentionally excluded/);
+});
+
+test("fails when a source checkout marker remains but package-lock.json is missing", async () => {
+  const result = await runMissingSourceLock(true);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ENOENT/);
 });
