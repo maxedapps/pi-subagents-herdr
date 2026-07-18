@@ -34,14 +34,20 @@ export interface PiLaunch {
   env: Readonly<Record<string, string>>;
 }
 
-export function buildPiLaunch(profileName: ProfileName, runId: string): PiLaunch {
+export function buildPiLaunch(
+  profileName: ProfileName,
+  runId: string,
+  childSessionDir: string,
+  childSessionId: string,
+): PiLaunch {
   const profile = PROFILES[profileName];
   const name = `${profileName}-${runId.slice(-8)}`;
   return {
     name,
     argv: [
       "pi",
-      "--no-session",
+      "--session-dir", childSessionDir,
+      "--session-id", childSessionId,
       "--name", name,
       "--thinking", profile.thinking,
       "--tools", profile.tools.join(","),

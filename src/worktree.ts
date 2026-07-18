@@ -23,6 +23,7 @@ export async function createWorkerWorktree(
   parentWorkspaceId: string,
   parentCwd: string,
   runId: string,
+  parentSessionId: string,
   signal?: AbortSignal,
 ): Promise<WorkerTopology> {
   const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
@@ -40,7 +41,7 @@ export async function createWorkerWorktree(
     branch,
     base: "HEAD",
     path,
-    label: `subagent:${runId}`,
+    label: `subagent:${parentSessionId.slice(0, 8)}:${runId}`,
     focus: false,
   }, signal);
   return {
@@ -50,10 +51,10 @@ export async function createWorkerWorktree(
   };
 }
 
-export type GitStatus = (cwd: string) => Promise<string>;
+export type GitStatus = (cwd: string, signal?: AbortSignal) => Promise<string>;
 
-export async function readGitStatus(cwd: string): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" });
+export async function readGitStatus(cwd: string, signal?: AbortSignal): Promise<string> {
+  const { stdout } = await execFileAsync("git", ["status", "--porcelain"], { cwd, encoding: "utf8", signal });
   return stdout;
 }
 
@@ -69,7 +70,7 @@ export async function cleanupWorkerWorktree(
 ): Promise<WorkerCleanup> {
   let porcelain: string;
   try {
-    porcelain = await gitStatus(worktree.path);
+    porcelain = await gitStatus(worktree.path, signal);
   } catch (error) {
     return {
       removed: false,

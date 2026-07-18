@@ -4,9 +4,15 @@ import { createConnection, type Socket } from "node:net";
 export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 export type JsonRecord = Record<string, unknown>;
 
+export interface AgentSessionReference {
+  agent: string;
+  kind: "id" | "path";
+  value: string;
+}
+
 export interface AgentInfo {
   agent?: string;
-  sessionReady: boolean;
+  agentSession?: AgentSessionReference;
   terminalId: string;
   workspaceId: string;
   tabId: string;
@@ -28,20 +34,11 @@ export interface CreatedWorktree {
   branch: string;
 }
 
-export interface AgentRead {
-  text: string;
-  revision: number;
-  truncated: boolean;
-}
-
 export interface HerdrClient {
-  ping(signal?: AbortSignal): Promise<{ version: string; protocol: number }>;
   createTab(input: JsonRecord, signal?: AbortSignal): Promise<CreatedTab>;
   startAgent(input: JsonRecord, signal?: AbortSignal): Promise<AgentInfo>;
   getAgent(target: string, signal?: AbortSignal): Promise<AgentInfo>;
-  readAgent(target: string, signal?: AbortSignal): Promise<AgentRead>;
   sendInput(paneId: string, text: string, signal?: AbortSignal): Promise<void>;
-  sendKeys(paneId: string, keys: readonly string[], signal?: AbortSignal): Promise<void>;
   closePane(paneId: string, signal?: AbortSignal): Promise<void>;
   closeTab(tabId: string, signal?: AbortSignal): Promise<void>;
   createWorktree(input: JsonRecord, signal?: AbortSignal): Promise<CreatedWorktree>;
@@ -85,22 +82,27 @@ function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted", "AbortError");
 }
 
-function decodeAgent(value: unknown): AgentInfo {
+function decodeAgentSession(value: unknown): AgentSessionReference | undefined {
+  if (value === undefined || value === null) return undefined;
+  const session = record(value, "agent.agent_session");
+  const kind = string(session.kind, "agent.agent_session.kind");
+  if (kind !== "id" && kind !== "path") throw new HerdrError("agent.agent_session.kind must be id or path");
+  return {
+    agent: string(session.agent, "agent.agent_session.agent"),
+    kind,
+    value: string(session.value, "agent.agent_session.value"),
+  };
+}
+
+export function decodeAgent(value: unknown): AgentInfo {
   const agent = record(value, "agent");
   if (agent.agent !== undefined && agent.agent !== null && typeof agent.agent !== "string") {
     throw new HerdrError("agent.agent must be a string when present");
   }
-  let sessionReady = false;
-  if (agent.agent_session !== undefined && agent.agent_session !== null) {
-    const session = record(agent.agent_session, "agent.agent_session");
-    sessionReady = session.agent === "pi"
-      && (session.kind === "id" || session.kind === "path")
-      && typeof session.value === "string"
-      && session.value.length > 0;
-  }
+  const agentSession = decodeAgentSession(agent.agent_session);
   return {
     ...(typeof agent.agent === "string" ? { agent: agent.agent } : {}),
-    sessionReady,
+    ...(agentSession ? { agentSession } : {}),
     terminalId: string(agent.terminal_id, "agent.terminal_id"),
     workspaceId: string(agent.workspace_id, "agent.workspace_id"),
     tabId: string(agent.tab_id, "agent.tab_id"),
@@ -130,14 +132,6 @@ export class SocketHerdrClient implements HerdrClient {
     this.#idFactory = options.idFactory ?? (() => `pi-herdr-${randomUUID()}`);
   }
 
-  async ping(signal?: AbortSignal): Promise<{ version: string; protocol: number }> {
-    const result = await this.#request("ping", {}, "pong", signal);
-    if (typeof result.version !== "string" || !Number.isSafeInteger(result.protocol)) {
-      throw new HerdrError("Herdr ping omitted version or protocol");
-    }
-    return { version: result.version, protocol: result.protocol as number };
-  }
-
   async createTab(input: JsonRecord, signal?: AbortSignal): Promise<CreatedTab> {
     const result = await this.#request("tab.create", input, "tab_created", signal);
     const tab = record(result.tab, "tab.create.tab");
@@ -157,27 +151,8 @@ export class SocketHerdrClient implements HerdrClient {
     return decodeAgent((await this.#request("agent.get", { target }, "agent_info", signal)).agent);
   }
 
-  async readAgent(target: string, signal?: AbortSignal): Promise<AgentRead> {
-    const result = await this.#request("agent.read", {
-      target,
-      source: "recent_unwrapped",
-      lines: 160,
-      strip_ansi: true,
-      format: "text",
-    }, "pane_read", signal);
-    const read = record(result.read, "agent.read.read");
-    if (typeof read.text !== "string" || !Number.isSafeInteger(read.revision) || typeof read.truncated !== "boolean") {
-      throw new HerdrError("agent.read returned invalid text metadata");
-    }
-    return { text: read.text, revision: read.revision as number, truncated: read.truncated };
-  }
-
   async sendInput(paneId: string, text: string, signal?: AbortSignal): Promise<void> {
     await this.#request("pane.send_input", { pane_id: paneId, text, keys: ["return"] }, "ok", signal);
-  }
-
-  async sendKeys(paneId: string, keys: readonly string[], signal?: AbortSignal): Promise<void> {
-    await this.#request("pane.send_keys", { pane_id: paneId, keys }, "ok", signal);
   }
 
   async closePane(paneId: string, signal?: AbortSignal): Promise<void> {
@@ -222,11 +197,11 @@ export class SocketHerdrClient implements HerdrClient {
         socket.removeAllListeners();
         socket.destroy();
       };
-      const finish = (error?: unknown, value?: JsonRecord) => {
+      const finish = (error?: unknown, result?: JsonRecord) => {
         if (settled) return;
         settled = true;
         cleanup();
-        if (error === undefined) resolve(value!);
+        if (error === undefined) resolve(result!);
         else reject(error);
       };
 
@@ -247,11 +222,11 @@ export class SocketHerdrClient implements HerdrClient {
             const error = record(envelope.error, "response.error");
             throw new HerdrError(`Herdr ${string(error.code, "error.code")}: ${string(error.message, "error.message")}`);
           }
-          const result = record(envelope.result, "response.result");
-          if (string(result.type, "result.type") !== expectedType) {
-            throw new HerdrError(`Expected Herdr result ${expectedType}, received ${String(result.type)}`);
+          const response = record(envelope.result, "response.result");
+          if (string(response.type, "result.type") !== expectedType) {
+            throw new HerdrError(`Expected Herdr result ${expectedType}, received ${String(response.type)}`);
           }
-          finish(undefined, result);
+          finish(undefined, response);
         } catch (error) {
           finish(error instanceof SyntaxError ? new HerdrError("Herdr returned malformed JSON", { cause: error }) : error);
         }
