@@ -1,144 +1,96 @@
-# pi-subagents-herdr
+# Pi Herdr Subagents
 
-Private Pi package that exposes safe, visible subagent orchestration through a Herdr backend. Agents see a backend-neutral five-tool lifecycle; operators retain Herdr diagnostics, active-branch ownership recovery, isolated writer worktrees, a live TUI, and read-only doctor checks.
+A private, minimal Pi extension for visible subagents in Herdr. It supports Pi only, stores runs only in the current extension instance, and exposes exactly five tools.
 
-> **Legal hold:** `package.json` remains `private: true`. Do not publish or add license/repository metadata without explicit user approval.
+## Install and reload
 
-## Requirements and safety
+Use a local path while developing so `/reload` reads this checkout:
 
-- Node.js 22.19+, Pi 0.80.6+, Herdr 0.7.3/protocol 16.
-- Parent Pi runs inside the matching Herdr pane/integration.
-- The selected `pi`, `claude`, `codex`, or `grok` executable is installed and authenticated.
-
-Every child is visible and interactive. Missing/incompatible backend identity fails closed; there is no hidden subprocess, recursive delegation, cross-harness substitution, or fallback. Pi/Claude tool policies are not filesystem sandboxes; Codex and Grok use reviewed native sandbox controls. Writers require isolated worktrees. Child completion and test claims are evidence, never parent verification.
-
-Pi children receive no package-specific trust, skill, or prompt-template override flags. Each child independently uses normal Pi trust and resource discovery. Saved trust and global settings are available through the ordinary user environment, but transient parent `--approve` and session-only trust are not inherited by a separate child process.
-
-Process control requires agreement between the current Pi session and active branch journal, immutable run nonce, durable `run.json`, exact terminal/agent identity, available harness-native identity, and a fresh backend snapshot. Other-session, orphaned, uncertain, and global live records are observational only. Startup never adopts or finalizes prior-session resources. An explicit exact-ID `subagent_stop` may reauthorize **cleanup only** for proven-stopped schema-v5 residue after result/failure evidence and full read-only or writer provenance reconcile; it never adopts a process or exposes prior private output. Send/interrupt delivery is `confirmed`, `unconfirmed`, or `uncertain`; never retry uncertain input automatically. Force stop never authorizes dirty checkout discard.
-
-## Install
-
-```sh
-npm ci
-npm run check
+```bash
+pi remove git:git@github-mschwarzmueller:maxedapps/pi-subagents-herdr.git
 pi install /absolute/path/to/pi-subagents-herdr
 ```
 
-`npm ci` currently reports `node-domexception@1.0.0` from Pi's dev-only Google authentication graph. This is a reviewed upstream exception pending [fetch-blob's unreleased removal](https://github.com/node-fetch/fetch-blob/pull/176); overrides and warning suppression are intentionally rejected. `npm run deps:deprecations` audits lock metadata and fails for any new, widened, or stale exception.
+Start Pi inside Herdr and run `/reload` only when no subagent is live. The extension requires `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID` from the parent Herdr workspace.
 
-Remove with `pi remove /absolute/path/to/pi-subagents-herdr`. Restart Pi or use `/reload`, then run `/subagents-doctor` and `/subagents`.
+The child guard `PI_HERDR_SUBAGENT=1` prevents recursive tool and skill registration.
 
-For an exact private archive install/load qualification, use `npm run pack:inspect`. It packs once, installs that exact archive under a temporary prefix, verifies the parent-only package skill, verifies ordinary child fixture-skill discovery without `--no-skills`, checks child guards/package-relative resources, and removes the temporary environment.
+## Fixed profiles
 
-## Five tools
+| Profile | Thinking | Tools | Writes |
+|---|---|---|---|
+| `scout` | low | `read,grep,find,ls` | no |
+| `researcher` | medium | `read,grep,find,ls,web_search,fetch_content,get_search_content` | no |
+| `worker` | high | `read,grep,find,ls,bash,edit,write` | isolated worktree only |
 
-Exactly these model-facing tools are registered; there are no aliases:
+Profiles, tools, thinking, cwd, and worktree policy are not configurable.
+
+## Tools
 
 ```text
-subagent_start({ profile: "scout", task: "Map the auth flow; do not modify files." })
+subagent_start({ profile: "scout" | "researcher" | "worker", task: string })
 subagent_status({})
-subagent_status({ scope: "all_owned" })
-subagent_status({ id: "<run>", lines: 160 })
-subagent_status({ id: "<run>", states: ["done", "idle", "blocked"], timeoutMs: 900000, lines: 160 })
-subagent_send({ id: "<run>", message: "Focus on token refresh." })
-subagent_interrupt({ id: "<run>", timeoutMs: 15000 })
-subagent_stop({ id: "<run>", mode: "graceful" })
+subagent_status({ id: string, wait?: boolean, timeoutMs?: number })
+subagent_send({ id: string, message: string })
+subagent_interrupt({ id: string })
+subagent_stop({ id: string })
 ```
 
-Prefer profile defaults and omit optional start overrides unless the task explicitly requires them. A higher `thinking` preference is safely clamped to the profile policy and reported in `effective.adjustments`; other policy broadening remains fail-closed or requires configured human confirmation.
+Unknown fields are rejected. IDs are valid only in the extension instance that returned them.
 
-`subagent_status` has one strict flat Google-compatible schema and three execution modes:
+## Operating workflow
 
-- **List:** omit `id`; optional `scope` is `current_session` (default), `project`, `all_owned`, or `global`.
-- **Inspect:** provide `id` without `states`; optional `lines` is 1–2000 (default 160).
-- **Wait then inspect:** provide `id` and non-empty unique `states`; optional bounded `timeoutMs` is 1–86400000 and optional `lines` bounds final recent output.
+1. Start one bounded task.
+2. Pull terminal output explicitly with exact-ID `subagent_status`. `wait: true` polls until `idle`, `done`, or `blocked`.
+3. Send a follow-up, interrupt with `ctrl+c`, or stop the child as needed.
+4. After a send or interrupt transport error, inspect status before retrying because the mutation may already have happened.
 
-Execution rejects cross-mode combinations: `scope` with `id`; `states`, `timeoutMs`, or `lines` without `id`; and `timeoutMs` with `id` but no `states`. Wait preserves semantic `working`, `blocked`, `done`, `idle`, and `unknown` states, abort propagation, timeout errors, ownership defaults, and 50KB/2000-line output bounds. A successful wait returns detailed inspection/output, not only a matched state.
+Parent-to-child communication uses `agent.start` and `pane.send_input`. Child-to-parent communication is only the bounded `agent.get`/`agent.read` response from explicit status. There is no automatic result message, child bridge, persisted handoff, or background delivery.
 
-Every successful start reports `completion.pending` with `delivery: "automatic"`. Starts and sends return immediately. Pi children publish the exact structured final assistant response. Claude, Codex, and Grok publish a bounded, ownership-validated Herdr terminal transcript with explicit truncation/revision metadata; it is never presented as an exact final message. Both sources use the same `herdr-subagents.result.v1` store/delivery path. A completed child result is the extension's only automatic model-visible follow-up and contains only result transport metadata plus child content. Blocked, failed, review, cleanup, delivery-uncertain, and recovery obligations remain passive in `run.attention`, status, TUI, and doctor until an explicit exact-ID action. Exact-ID status reports `capture_pending` while a submitted generation awaits its durable envelope and `capture_unavailable` with the close reason when capture ends without one. Missing Pi bridge evidence and empty/failed non-Pi terminal reads are capture-unavailable—never an invented result. Parent verification and explicit stop/finalization remain mandatory.
+## Worker behavior
 
-Placement starts use fresh exact topology checks and retry only explicit `agent_placement_not_found`; exhaustion returns the managed run ID and ordinary stop action. See the architecture and operations guides for details.
+Only one worker may start at a time; readers remain independent. A worker gets one Herdr worktree beside the parent Git checkout and launches in that path.
 
-## Bundled profiles and skill
+Stopping a worker closes its pane, runs `git status --porcelain`, and:
 
-- `scout`: Pi, read-only reconnaissance with a self-contained delivered final response.
-- `researcher`: Pi, read-only sourced research when reviewed external tools are exposed, with a self-contained delivered final response.
-- `worker`: Pi, mutation tools, mandatory isolated writer worktree, and a self-contained delivered final response.
+- removes a clean worktree with `force:false`, while retaining and reporting its branch;
+- retains a dirty or uncheckable worktree and reports its exact path and branch.
 
-Bundled profiles do not pin models and prohibit recursive delegation. Profiles require a self-contained final assistant response as the primary result transport. Profiles do not configure skills; Pi children discover them normally. The package contributes `use-herdr-subagents` dynamically in parent mode only. It teaches the extension's exact five-tool lifecycle, automatic result delivery, profile selection, least privilege, blocked/uncertain handling, writer isolation, parent verification, and cleanup. It also tells agents to pair other applicable subagent skills with it when available and possible, without requiring or naming one. Child mode contributes only a narrow result bridge (no orchestration tools or parent skill).
+The extension never integrates commits, force-removes a worktree, or deletes a branch.
 
-## Settings
+## Intentional limitations and manual cleanup
 
-Namespaced settings only:
+State is in memory only. Reload, restart, fork, tree navigation, or session replacement loses ownership. Stop all runs before any of those actions. Historical IDs, panes, tabs, worktrees, branches, and old `.subagents` data are never recovered or adopted.
 
-- user: `${getAgentDir()}/herdr-subagents/settings.json`
-- trusted project: `<project-config-root>/herdr-subagents/settings.json`
+If ownership was lost, use Herdr and Git directly:
 
-Merge order is defaults → user → trusted project; known nested objects merge by field and arrays/scalars replace. Unknown keys fail validation.
-
-```json
-{
-  "concurrency": { "maxRunning": 4, "maxWriters": 1 },
-  "defaultHarness": "pi",
-  "profileDirectories": { "user": [], "project": [] },
-  "widget": { "visibility": "auto" },
-  "integrations": { "strictness": "strict" },
-  "security": {
-    "allowedRoots": ["/absolute/trusted/checkout"],
-    "allowBroadeningOverrides": false,
-    "requireWriterWorktree": true
-  }
-}
+```bash
+herdr workspace list
+herdr workspace get <workspace-id>
+herdr worktree list --cwd /path/to/repository --json
+git worktree list
+git branch --list 'herdr-subagents/*'
 ```
 
-Overrides narrow by default. Broadening requires trusted configuration plus interactive human confirmation before resources are created. Unknown tools, recursive orchestration, root escapes, and mutation without required isolation remain prohibited.
+Inspect resources before closing or removing them. Never delete a dirty worktree unless its changes are intentionally preserved elsewhere.
 
-## Artifacts and finalization
+## Activation and rollback
 
-Bundled profiles create only transient parent-checkout operational state while unresolved:
+Before activation:
 
-```text
-.subagents/runs/<id>/
-├── run.json
-└── results/             # when result generations were captured
-```
+1. stop old-extension children;
+2. inventory `.subagents`, Herdr workspaces/tabs/panes, sibling worktrees, and generated branches;
+3. run `npm ci && npm run check && npm pack --dry-run`;
+4. install this checkout as the local Pi package and reload with no live run.
 
-A parent-persisted result envelope or exact `herdr-subagents.failure.v1` custom entry is the durable handoff; the failure entry is session/branch/run/nonce-bound and never enters model context. Read-only recognition of exact legacy parent-persisted failed action evidence remains for schema-v5 residue. Passive attention alone never authorizes cleanup. Bundled children do not write handoff/progress files. Custom profiles may explicitly configure run-unique handoff/progress artifacts; existing files in a disposable checkout are copied to parent-owned `captured/` storage and byte/SHA-256 verified before removal. Their absence is not a cleanup prerequisite; capture failure retains rather than losing a present custom artifact.
+Rollback is branch-based: stop rewrite runs, switch this repository to `main`, run `npm ci` to restore the baseline dependencies, and reload the local package. `main` remains the baseline implementation. No compatibility or migration layer is provided.
 
-While live, schema-v5 `run.json` retains assignment, bounded output, passive attention, ownership journal, and exact worktree snapshot for recovery. Private system/session/exchange files remain only while live or capture-uncertain. After exact result/failure evidence and safe finalization, runtime metadata/results are purged; verified custom captures remain intentionally. There is no startup cleanup, age-based, or path-only garbage collector.
+Do not remove ignored historical residue until a human confirms no old live resource depends on it.
 
-Git protection appends anchored `/.subagents/` and explicitly requested `/.progress/` rules to Git-local `info/exclude`; tracked `.gitignore` is not edited. A pre-existing untracked `.progress/` requires explicit review before hiding it.
+## Development
 
-## TUI and operations
-
-`/subagents` lists current-session owned runs plus stopped runs with unresolved attention. Visible controls are ↑/↓ selection, Enter focus, `x` graceful stop with automatic safe finalization, `r` refresh, and Escape close. Focus and stop run only after the overlay is disposed. Use model-facing `subagent_status` for detailed output and broader observational scopes; use explicit `subagent_send`, `subagent_interrupt`, and `subagent_stop` inputs for actions not exposed in the operator dashboard.
-
-`/subagents-doctor` is read-only. It may mention Herdr because it diagnoses the actual backend: versions/protocol, parent identity, integrations, profiles/settings, Git/artifacts, recovery, prior stopped residue, topology, and retained worktrees. It never adopts, focuses, sends, stops, cleans, exposes prior private output, or rewrites settings.
-
-See [`docs/architecture.md`](docs/architecture.md), [`docs/profile-reference.md`](docs/profile-reference.md), [`docs/operations.md`](docs/operations.md), and [`docs/migration.md`](docs/migration.md).
-
-## Validation gates
-
-Fast development gate—each core suite runs once; no subprocess fake-E2E matrix and no archive install:
-
-```sh
-npm test
+```bash
+npm ci
 npm run check
+npm pack --dry-run
 ```
-
-`check` runs typecheck, core tests, and docs links. Explicit layers:
-
-```sh
-npm run test:e2e                    # deterministic no-model subprocess matrix
-npm run pack:inspect                # one exact pack/install/Pi-load pass
-npm run skill:check                 # local pinned skills-ref validation
-npm run conformance:herdr:no-model  # opt-in real placement check; harmless shell command, no coding model
-```
-
-Full release qualification runs typecheck, core tests, docs, deterministic E2E, exact archive qualification, and skill validation once each:
-
-```sh
-npm run check:full
-```
-
-No ordinary or full gate starts a real model. `scripts/e2e-herdr-smoke.mjs` remains opt-in and dry-runs unless `--confirm-model` is explicitly supplied.
