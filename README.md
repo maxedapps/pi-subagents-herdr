@@ -41,9 +41,9 @@ Use `subagent_status` for lifecycle, generation, delivery, child-session, worktr
 
 ## Current-session widget
 
-In Pi’s interactive UI, the extension automatically shows a compact `Subagents` widget above the editor while the current parent session owns visible runs. Each row contains only the profile, shortened run ID, optional generation number, and textual phase. The widget preserves run order and uses at most six lines, summarizing overflow as `+N more`.
+In Pi’s interactive UI, the extension automatically shows a compact `Subagents` widget above the editor while the current parent session owns visible runs. A responsive rounded border uses Pi’s semantic border color (blue in the bundled themes), and each row pairs a semantic colored dot with the textual phase. Rows still contain only the profile, shortened run ID, optional generation number, and phase. The titled border plus at most five rows uses no more than seven lines, summarizing overflow as `+N more`; RPC clients retain the plain six-line text representation.
 
-Active and retained counts are separate. A `retained` row is a terminal warning that resources need manual attention; it is not counted as active. The widget hides when no rows remain and clears during session shutdown or reload. Use `subagent_status` for full IDs, errors, child-session, worktree, branch, and retained-resource details.
+Active and retained counts are separate. A red indicator and `retained` phase warn that resources need manual attention; the run is not counted as active, and the literal phase remains visible without color. The widget hides when no rows remain and clears during session shutdown or reload. Use `subagent_status` for full IDs, errors, child-session, worktree, branch, and retained-resource details.
 
 ## Parent ownership and lifecycle
 

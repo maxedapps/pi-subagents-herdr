@@ -1,4 +1,5 @@
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { SocketHerdrClient } from "../../src/herdr.ts";
@@ -10,33 +11,96 @@ const WIDGET_KEY = "herdr-subagents";
 const PROFILE_WIDTH = 10;
 const noRefresh = () => {};
 
-function phase(run: Run): string {
-  if (run.lifecycle === "retained") return "retained";
-  if (run.lifecycle === "stopping" || run.lifecycle === "starting") return run.lifecycle;
-  if (!run.generation) return "ready";
-  if (run.generation.delivery === "queued") return "result queued";
-  if (run.generation.delivery === "ready") return "result ready";
-  if (run.generation.delivery === "delivered") return "ready";
-  if (run.status === "blocked") return "blocked";
-  if (run.status === "working") return "working";
-  return "waiting for result";
+type WidgetTone = "accent" | "success" | "warning" | "error" | "muted";
+
+type WidgetRow = {
+  kind: "agent";
+  profile: string;
+  id: string;
+  generation: string;
+  phase: string;
+  tone: WidgetTone;
+} | {
+  kind: "overflow";
+  label: string;
+  tone: "muted";
+};
+
+interface WidgetPresentation {
+  header: string;
+  rows: WidgetRow[];
 }
 
-export function formatSubagentWidget(runs: readonly Run[]): string[] | undefined {
+function phase(run: Run): { label: string; tone: WidgetTone } {
+  if (run.lifecycle === "retained") return { label: "retained", tone: "error" };
+  if (run.lifecycle === "stopping") return { label: "stopping", tone: "muted" };
+  if (run.lifecycle === "starting") return { label: "starting", tone: "accent" };
+  if (!run.generation) return { label: "ready", tone: "success" };
+  if (run.generation.delivery === "queued") return { label: "result queued", tone: "success" };
+  if (run.generation.delivery === "ready") return { label: "result ready", tone: "success" };
+  if (run.generation.delivery === "delivered") return { label: "ready", tone: "success" };
+  if (run.status === "blocked") return { label: "blocked", tone: "warning" };
+  if (run.status === "working") return { label: "working", tone: "accent" };
+  return { label: "waiting for result", tone: "muted" };
+}
+
+export function presentSubagentWidget(runs: readonly Run[]): WidgetPresentation | undefined {
   const visible = runs.filter((run) => run.lifecycle !== "closed");
   if (!visible.length) return undefined;
 
   const retained = visible.filter((run) => run.lifecycle === "retained").length;
   const active = visible.length - retained;
-  const header = `Subagents · ${active} active${retained ? ` · ${retained} retained` : ""}`;
-  const rows = visible.map((run) => {
-    const id = (run.id.startsWith("run-") ? run.id.slice(4) : run.id).slice(0, 8);
-    const generation = run.generation ? `g${run.generation.number} ` : "";
-    return `  ${run.profile.padEnd(PROFILE_WIDTH)} ${id} · ${generation}${phase(run)}`;
+  const rows: WidgetRow[] = visible.map((run) => {
+    const status = phase(run);
+    return {
+      kind: "agent",
+      profile: run.profile,
+      id: (run.id.startsWith("run-") ? run.id.slice(4) : run.id).slice(0, 8),
+      generation: run.generation ? `g${run.generation.number} ` : "",
+      phase: status.label,
+      tone: status.tone,
+    };
   });
-  return rows.length <= 5
-    ? [header, ...rows]
-    : [header, ...rows.slice(0, 4), `+${rows.length - 4} more`];
+  return {
+    header: `Subagents · ${active} active${retained ? ` · ${retained} retained` : ""}`,
+    rows: rows.length <= 5
+      ? rows
+      : [...rows.slice(0, 4), { kind: "overflow", label: `+${rows.length - 4} more`, tone: "muted" }],
+  };
+}
+
+export function formatSubagentWidget(runs: readonly Run[]): string[] | undefined {
+  const presentation = presentSubagentWidget(runs);
+  if (!presentation) return undefined;
+  return [presentation.header, ...presentation.rows.map((row) => row.kind === "overflow"
+    ? row.label
+    : `  ${row.profile.padEnd(PROFILE_WIDTH)} ${row.id} · ${row.generation}${row.phase}`)];
+}
+
+function fit(text: string, width: number, padding = " "): string {
+  const fitted = truncateToWidth(text, width, "");
+  return fitted + padding.repeat(Math.max(0, width - visibleWidth(fitted)));
+}
+
+function tuiWidget(presentation: WidgetPresentation) {
+  return (_tui: TUI, theme: Theme): Component => ({
+    render(width: number): string[] {
+      if (width <= 0) return [];
+      if (width <= 3) return [theme.fg("border", "─".repeat(width))];
+
+      const innerWidth = width - 2;
+      const top = theme.fg("border", `╭${fit(`─ ${presentation.header} `, innerWidth, "─")}╮`);
+      const body = presentation.rows.map((row) => {
+        const content = row.kind === "overflow"
+          ? ` ${theme.fg("muted", row.label)}`
+          : ` ${theme.fg(row.tone, "●")} ${row.profile.padEnd(PROFILE_WIDTH)} ${theme.fg("dim", `${row.id} · ${row.generation}`)}${theme.fg(row.tone, row.phase)}`;
+        return theme.fg("border", "│") + fit(content, innerWidth) + theme.fg("border", "│");
+      });
+      const bottom = theme.fg("border", `╰${"─".repeat(innerWidth)}╯`);
+      return [top, ...body, bottom];
+    },
+    invalidate() {},
+  });
 }
 
 export default function herdrSubagents(pi: ExtensionAPI): void {
@@ -86,7 +150,13 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
           parentSessionFile: sessionManager.getSessionFile(),
           parentEntryId: sessionManager.getLeafId(),
         });
-        ui.setWidget(WIDGET_KEY, formatSubagentWidget(runtime.list(request)));
+        const runs = runtime.list(request);
+        if (ctx.mode === "tui") {
+          const presentation = presentSubagentWidget(runs);
+          ui.setWidget(WIDGET_KEY, presentation ? tuiWidget(presentation) : undefined);
+        } else {
+          ui.setWidget(WIDGET_KEY, formatSubagentWidget(runs));
+        }
       };
       refreshWidget();
       for (const diagnostic of diagnostics) ui.notify(diagnostic.message, diagnostic.outcome === "closed" || diagnostic.outcome === "cleaned" ? "info" : "warning");
