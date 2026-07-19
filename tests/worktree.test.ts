@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { HerdrError, type WorkspaceInfo } from "../src/herdr.ts";
 import { SubagentRuntime } from "../src/runtime.ts";
 import { cleanupWorkerWorktree, type WorktreeFacts } from "../src/worktree.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
@@ -61,7 +63,7 @@ test("clean worker removal is bounded, non-force, and retains the branch", async
     return "";
   });
   assert.equal(statusSignal, controller.signal);
-  assert.deepEqual(cleanup, { removed: true, branch: "herdr-subagents/run-worker" });
+  assert.deepEqual(cleanup, { action: "removed", removed: true, branch: "herdr-subagents/run-worker" });
   assert.deepEqual(client.calls, [{ method: "worktree.remove", input: { workspaceId: "w-worker", force: false }, signal: controller.signal }]);
 });
 
@@ -69,6 +71,7 @@ test("dirty worker is retained with exact path and branch", async () => {
   const client = new FakeHerdr();
   const cleanup = await cleanupWorkerWorktree(client, facts, undefined, async () => " M file.ts\n");
   assert.deepEqual(cleanup, {
+    action: "retained",
     removed: false,
     branch: "herdr-subagents/run-worker",
     path: "/repo/.herdr-subagents-worktrees/run-worker",
@@ -77,14 +80,131 @@ test("dirty worker is retained with exact path and branch", async () => {
   assert.equal(client.calls.length, 0);
 });
 
-test("failed dirtiness check retains the worker for manual handling", async () => {
-  const client = new FakeHerdr();
-  const cleanup = await cleanupWorkerWorktree(client, facts, undefined, async () => { throw new Error("git unavailable"); });
-  assert.equal(cleanup.removed, false);
-  if (!cleanup.removed) {
-    assert.equal(cleanup.path, facts.path);
-    assert.equal(cleanup.branch, facts.branch);
-    assert.match(cleanup.reason, /git status failed: git unavailable/);
+test("failed dirtiness check retains a path-present worker for manual handling", async () => {
+  const path = await mkdtemp(join(tmpdir(), "worker-status-failure-"));
+  const presentFacts = { ...facts, path };
+  try {
+    const client = new FakeHerdr();
+    const cleanup = await cleanupWorkerWorktree(client, presentFacts, undefined, async () => { throw new Error("git unavailable"); });
+    assert.equal(cleanup.removed, false);
+    if (!cleanup.removed) {
+      assert.equal(cleanup.action, "retained");
+      assert.equal(cleanup.path, path);
+      assert.equal(cleanup.branch, facts.branch);
+      assert.match(cleanup.reason, /git status failed: git unavailable/);
+    }
+    assert.equal(client.calls.length, 0);
+  } finally {
+    await rm(path, { recursive: true, force: true });
   }
-  assert.equal(client.calls.length, 0);
+});
+
+test("an absent checkout closes only the exact linked workspace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-orphan-"));
+  const absentFacts = { ...facts, path: join(root, "missing") };
+  const client = new FakeHerdr();
+  client.workspace = {
+    workspaceId: facts.workspaceId,
+    worktree: { checkoutPath: join(root, "other", "..", "missing"), isLinkedWorktree: true },
+  };
+  const controller = new AbortController();
+  try {
+    const cleanup = await cleanupWorkerWorktree(client, absentFacts, controller.signal, async () => {
+      throw new Error("fatal: cannot change to missing checkout");
+    });
+    assert.deepEqual(cleanup, { action: "finalized", removed: true, branch: facts.branch });
+    assert.deepEqual(client.calls, [
+      { method: "workspace.get", input: { workspaceId: facts.workspaceId }, signal: controller.signal },
+      { method: "workspace.close", input: { workspaceId: facts.workspaceId }, signal: controller.signal },
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("structured workspace absence is already finalized without parsing its message", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-absent-workspace-"));
+  const absentFacts = { ...facts, path: join(root, "missing") };
+  const client = new FakeHerdr();
+  client.failGetWorkspace = new HerdrError("unrelated text", { code: "workspace_not_found" });
+  try {
+    const cleanup = await cleanupWorkerWorktree(client, absentFacts, undefined, async () => { throw new Error("status failed"); });
+    assert.deepEqual(cleanup, { action: "already-finalized", removed: true, branch: facts.branch });
+    assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("absent checkout lookup mismatches and null worktrees are retained untouched", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "worker-mismatch-"));
+  const absentFacts = { ...facts, path: join(root, "missing") };
+  const cases: Array<{ name: string; workspace: WorkspaceInfo }> = [
+    {
+      name: "workspace id",
+      workspace: { workspaceId: "w-other", worktree: { checkoutPath: absentFacts.path, isLinkedWorktree: true } },
+    },
+    {
+      name: "checkout path",
+      workspace: { workspaceId: facts.workspaceId, worktree: { checkoutPath: join(root, "other"), isLinkedWorktree: true } },
+    },
+    {
+      name: "linked-worktree flag",
+      workspace: { workspaceId: facts.workspaceId, worktree: { checkoutPath: absentFacts.path, isLinkedWorktree: false } },
+    },
+    {
+      name: "null worktree",
+      workspace: { workspaceId: facts.workspaceId, worktree: null },
+    },
+  ];
+  try {
+    for (const entry of cases) {
+      await context.test(entry.name, async () => {
+        const client = new FakeHerdr();
+        client.workspace = entry.workspace;
+        const cleanup = await cleanupWorkerWorktree(client, absentFacts, undefined, async () => { throw new Error("status failed"); });
+        assert.equal(cleanup.action, "retained");
+        assert.equal(cleanup.removed, false);
+        assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get"]);
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lookup errors, message-only absence, and close failure retain an absent checkout", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "worker-errors-"));
+  const absentFacts = { ...facts, path: join(root, "missing") };
+  try {
+    await context.test("lookup error", async () => {
+      const client = new FakeHerdr();
+      client.failGetWorkspace = new Error("lookup failed");
+      const cleanup = await cleanupWorkerWorktree(client, absentFacts, undefined, async () => { throw new Error("status failed"); });
+      assert.equal(cleanup.action, "retained");
+      assert.match(cleanup.removed ? "" : cleanup.reason, /workspace.get failed: lookup failed/);
+      assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get"]);
+    });
+    await context.test("message-only absence", async () => {
+      const client = new FakeHerdr();
+      client.failGetWorkspace = new Error("Herdr workspace_not_found: gone");
+      const cleanup = await cleanupWorkerWorktree(client, absentFacts, undefined, async () => { throw new Error("status failed"); });
+      assert.equal(cleanup.action, "retained");
+      assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get"]);
+    });
+    await context.test("close failure", async () => {
+      const client = new FakeHerdr();
+      client.workspace = {
+        workspaceId: facts.workspaceId,
+        worktree: { checkoutPath: absentFacts.path, isLinkedWorktree: true },
+      };
+      client.failCloseWorkspace = true;
+      const cleanup = await cleanupWorkerWorktree(client, absentFacts, undefined, async () => { throw new Error("status failed"); });
+      assert.equal(cleanup.action, "retained");
+      assert.match(cleanup.removed ? "" : cleanup.reason, /workspace.close failed/);
+      assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get", "workspace.close"]);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 import { Value } from "typebox/value";
-import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import extension, { formatSubagentWidget, presentSubagentWidget } from "../extensions/herdr-subagents/index.ts";
+import extension, { formatSubagentWidget, presentSubagentWidget, retainedCleanupAction } from "../extensions/herdr-subagents/index.ts";
+import { resolveArtifactDirectory } from "../src/artifact.ts";
 import { SocketHerdrClient } from "../src/herdr.ts";
-import { PROFILES } from "../src/profiles.ts";
+import { buildPiLaunch, PROFILES } from "../src/profiles.ts";
 import { SubagentRuntime, type Run } from "../src/runtime.ts";
 import { idSchema, sendSchema, startSchema, statusSchema } from "../src/tools.ts";
 
@@ -60,6 +63,7 @@ function mockRun(overrides: Partial<Run> = {}): Run {
     childSessionId: "child-sensitive",
     childSessionDir: "/sensitive/session",
     childCwd: "/sensitive/cwd",
+    artifactPath: "/sensitive/artifact.md",
     terminalId: "terminal-sensitive",
     paneId: "pane-sensitive",
     tabId: "tab-sensitive",
@@ -85,12 +89,12 @@ function mockUI(): { ui: any; calls: WidgetCall[] } {
   };
 }
 
-function mockContext(sessionId: string, hasUI: boolean, ui?: any, mode = hasUI ? "tui" : "json") {
+function mockContext(sessionId: string, hasUI: boolean, ui?: any, mode = hasUI ? "tui" : "json", branch: any[] = []) {
   const sessionManager = {
     getSessionId: () => sessionId,
     getSessionFile: () => `/tmp/${sessionId}.jsonl`,
     getLeafId: () => `${sessionId}-leaf`,
-    getBranch: () => [],
+    getBranch: () => branch,
   };
   return { sessionManager, hasUI, ui, mode, cwd: "/repo" };
 }
@@ -126,6 +130,7 @@ function deliveryMessage(run: Run) {
     details: {
       parentSessionId: run.parentSessionId,
       runId: run.id,
+      artifactPath: run.artifactPath,
       profile: run.profile,
       generation: run.generation?.number,
       childSessionId: run.childSessionId,
@@ -401,7 +406,7 @@ test("parent registers exactly four tools, one skill hook, and result confirmati
     "subagent_start", "subagent_status", "subagent_send", "subagent_stop",
   ]);
   assert.deepEqual(registered.events.map(({ name }) => name), [
-    "resources_discover", "session_start", "message_end", "agent_settled", "session_before_tree", "session_shutdown",
+    "resources_discover", "session_start", "session_compact", "context", "message_end", "agent_settled", "session_before_tree", "session_shutdown",
   ]);
   assert.deepEqual(registered.commands, []);
   const resources = registered.events.find(({ name }) => name === "resources_discover")?.handler({}, {}) as { skillPaths: string[] };
@@ -409,6 +414,92 @@ test("parent registers exactly four tools, one skill hook, and result confirmati
   assert.match(resources.skillPaths[0] ?? "", /skills\/use-herdr-subagents\/SKILL\.md$/);
   assert.equal(existsSync(resources.skillPaths[0] ?? ""), true);
 }));
+
+test("compaction reminders are transient, one-shot, session-scoped, and require run artifacts", async () => {
+  const fixture = extensionWithRuntimeCapture();
+  const liveId = `compact-live-${Date.now()}`;
+  const emptyId = `${liveId}-empty`;
+  const resumedId = `${liveId}-resumed`;
+  const liveDirectory = resolveArtifactDirectory(getAgentDir(), liveId);
+  const resumedDirectory = resolveArtifactDirectory(getAgentDir(), resumedId);
+  const liveCtx = mockContext(liveId, false);
+  const emptyCtx = mockContext(emptyId, false);
+  const resumedCtx = mockContext(resumedId, false, undefined, "json", [{ type: "compaction" }]);
+  try {
+    await event(fixture.registered, "session_start")({ reason: "startup" }, liveCtx);
+    fixture.restore();
+    await mkdir(liveDirectory, { recursive: true });
+    await writeFile(join(liveDirectory, "run-live.md"), "# artifact\n");
+    await event(fixture.registered, "session_compact")({}, liveCtx);
+    const originalMessages = [{ role: "user", content: "continue", timestamp: 1 }];
+    const reminded = await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx) as any;
+    assert.notEqual(reminded.messages, originalMessages);
+    assert.equal(originalMessages.length, 1);
+    assert.deepEqual(reminded.messages.at(-1), {
+      role: "custom",
+      customType: "herdr-subagent-artifact-reminder",
+      content: `Exact subagent exchanges remain under ${liveDirectory}. List or read the relevant run file before relying on compacted subagent details.`,
+      display: false,
+      timestamp: reminded.messages.at(-1).timestamp,
+    });
+    assert.equal(typeof reminded.messages.at(-1).timestamp, "number");
+    assert.equal(await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx), undefined);
+    assert.deepEqual(fixture.registered.messages, []);
+
+    await event(fixture.registered, "session_start")({ reason: "new" }, emptyCtx);
+    await event(fixture.registered, "session_compact")({}, emptyCtx);
+    assert.equal(await event(fixture.registered, "context")({ messages: originalMessages }, emptyCtx), undefined);
+
+    await mkdir(resumedDirectory, { recursive: true });
+    await writeFile(join(resumedDirectory, "run-complete.md"), "# completed artifact\n");
+    await event(fixture.registered, "session_start")({ reason: "resume" }, resumedCtx);
+    const resumed = await event(fixture.registered, "context")({ messages: originalMessages }, resumedCtx) as any;
+    assert.equal(resumed.messages.at(-1).content.includes(resumedDirectory), true);
+    assert.equal(await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx), undefined);
+  } finally {
+    fixture.restore();
+    await rm(liveDirectory, { recursive: true, force: true });
+    await rm(resumedDirectory, { recursive: true, force: true });
+  }
+});
+
+test("automatic retained worker cleanup sends one exact action while clean outcomes send none", async () => {
+  const fixture = extensionWithRuntimeCapture();
+  const ctx = mockContext("action-parent", false);
+  try {
+    await event(fixture.registered, "session_start")({ reason: "startup" }, ctx);
+    const runtime = fixture.runtime();
+    fixture.restore();
+    const run = mockRun({
+      id: "run-action",
+      parentSessionId: "action-parent",
+      parentInstanceId: runtime.instanceId,
+      profile: "worker",
+      lifecycle: "retained",
+      artifactPath: "/agent/herdr-subagent-artifacts/action-parent/run-action.md",
+      worktree: { workspaceId: "w-worker", path: "/repo/worker", branch: "herdr-subagents/run-action" },
+    });
+    const retained = {
+      run,
+      retained: ["branch=herdr-subagents/run-action", "worktree=/repo/worker"],
+      workerCleanup: { action: "retained" as const, removed: false as const, branch: "herdr-subagents/run-action", path: "/repo/worker", reason: "worktree is dirty" },
+    };
+    const action = retainedCleanupAction(retained);
+    assert.match(action?.content ?? "", /run-action.*Worktree: \/repo\/worker.*Branch: herdr-subagents\/run-action.*Workspace: w-worker.*worktree is dirty.*Artifact: .*subagent_stop.*Do not use raw Git-only/s);
+    let calls = 0;
+    (runtime as any).settle = async () => calls++ === 0 ? [retained] : [];
+    await event(fixture.registered, "agent_settled")({}, ctx);
+    await event(fixture.registered, "agent_settled")({}, ctx);
+    assert.equal(fixture.registered.messages.length, 1);
+    assert.deepEqual((fixture.registered.messages[0] as any).options, { deliverAs: "steer", triggerTurn: true });
+    assert.equal(retainedCleanupAction({ ...retained, run: { ...run, lifecycle: "closed" } }), undefined);
+    (runtime as any).shutdown = async () => [retained];
+    await event(fixture.registered, "session_shutdown")({ reason: "quit" }, ctx);
+    assert.equal(fixture.registered.messages.length, 1, "shutdown must not inject retained cleanup actions");
+  } finally {
+    fixture.restore();
+  }
+});
 
 test("session lifecycle hooks bind ephemeral diagnostics and leave an empty tree navigable", async () => {
   let registered!: Registered;
@@ -586,6 +677,19 @@ test("fixed profiles expose only approved controls", () => {
   assert.deepEqual(PROFILES.researcher.tools, ["read", "grep", "find", "ls", "web_search", "fetch_content", "get_search_content"]);
   assert.deepEqual(PROFILES.worker.tools, ["read", "grep", "find", "ls", "bash", "edit", "write"]);
   assert.deepEqual([PROFILES.scout.thinking, PROFILES.researcher.thinking, PROFILES.worker.thinking], ["low", "medium", "high"]);
+});
+
+test("every profile receives the exact extension-owned read-only artifact instruction", () => {
+  for (const profile of Object.keys(PROFILES) as Array<keyof typeof PROFILES>) {
+    const artifactPath = `/agent/herdr-subagent-artifacts/parent/run-${profile}.md`;
+    const launch = buildPiLaunch(profile, `run-${profile}`, "/sessions", `child-${profile}`, artifactPath);
+    const prompt = launch.argv[launch.argv.indexOf("--append-system-prompt") + 1]!;
+    assert.equal(prompt.startsWith(PROFILES[profile].systemPrompt), true);
+    assert.match(prompt, new RegExp(`Archive: ${artifactPath}`));
+    assert.match(prompt, /extension writes this file automatically/i);
+    assert.match(prompt, /Never edit it/);
+    assert.match(prompt, /After compaction or uncertainty, read it/);
+  }
 });
 
 test("strict schemas accept only background/default or bounded blocking start/send", () => {

@@ -39,9 +39,14 @@ export function buildPiLaunch(
   runId: string,
   childSessionDir: string,
   childSessionId: string,
+  artifactPath: string,
 ): PiLaunch {
   const profile = PROFILES[profileName];
   const name = `${profileName}-${runId.slice(-8)}`;
+  const systemPrompt = [
+    profile.systemPrompt,
+    `Archive: ${artifactPath}. The extension writes this file automatically. Never edit it. After compaction or uncertainty, read it before relying on earlier parent instructions or your prior results.`,
+  ].join("\n\n");
   return {
     name,
     argv: [
@@ -51,7 +56,7 @@ export function buildPiLaunch(
       "--name", name,
       "--thinking", profile.thinking,
       "--tools", profile.tools.join(","),
-      "--append-system-prompt", profile.systemPrompt,
+      "--append-system-prompt", systemPrompt,
     ],
     env: { PI_HERDR_SUBAGENT: "1" },
   };

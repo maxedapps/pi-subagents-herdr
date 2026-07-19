@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
-import { mkdir } from "node:fs/promises";
+import { lstat, mkdir } from "node:fs/promises";
 import { promisify } from "node:util";
-import { dirname, join, resolve } from "node:path";
-import type { HerdrClient } from "./herdr.ts";
+import { dirname, join, normalize, resolve } from "node:path";
+import { HerdrError, type HerdrClient } from "./herdr.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -59,8 +59,52 @@ export async function readGitStatus(cwd: string, signal?: AbortSignal): Promise<
 }
 
 export type WorkerCleanup =
-  | { removed: true; branch: string }
-  | { removed: false; branch: string; path: string; reason: string };
+  | { action: "removed" | "finalized" | "already-finalized"; removed: true; branch: string }
+  | { action: "retained"; removed: false; branch: string; path: string; reason: string };
+
+function retained(worktree: WorktreeFacts, reason: string): WorkerCleanup {
+  return { action: "retained", removed: false, branch: worktree.branch, path: worktree.path, reason };
+}
+
+async function checkoutIsAbsent(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+async function finalizeAbsentWorker(
+  client: HerdrClient,
+  worktree: WorktreeFacts,
+  signal?: AbortSignal,
+): Promise<WorkerCleanup> {
+  let workspace;
+  try {
+    workspace = await client.getWorkspace(worktree.workspaceId, signal);
+  } catch (error) {
+    if (error instanceof HerdrError && error.code === "workspace_not_found") {
+      return { action: "already-finalized", removed: true, branch: worktree.branch };
+    }
+    return retained(worktree, `workspace.get failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (
+    workspace.workspaceId !== worktree.workspaceId
+    || workspace.worktree === null
+    || normalize(workspace.worktree.checkoutPath) !== normalize(worktree.path)
+    || workspace.worktree.isLinkedWorktree !== true
+  ) {
+    return retained(worktree, "workspace lookup did not exactly match the linked worker worktree");
+  }
+  try {
+    await client.closeWorkspace(worktree.workspaceId, signal);
+    return { action: "finalized", removed: true, branch: worktree.branch };
+  } catch (error) {
+    return retained(worktree, `workspace.close failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 export async function cleanupWorkerWorktree(
   client: HerdrClient,
@@ -72,25 +116,18 @@ export async function cleanupWorkerWorktree(
   try {
     porcelain = await gitStatus(worktree.path, signal);
   } catch (error) {
-    return {
-      removed: false,
-      branch: worktree.branch,
-      path: worktree.path,
-      reason: `git status failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
+    try {
+      if (await checkoutIsAbsent(worktree.path)) return finalizeAbsentWorker(client, worktree, signal);
+    } catch (pathError) {
+      return retained(worktree, `checkout path check failed: ${pathError instanceof Error ? pathError.message : String(pathError)}`);
+    }
+    return retained(worktree, `git status failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (porcelain.trim()) {
-    return { removed: false, branch: worktree.branch, path: worktree.path, reason: "worktree is dirty" };
-  }
+  if (porcelain.trim()) return retained(worktree, "worktree is dirty");
   try {
     await client.removeWorktree(worktree.workspaceId, signal);
-    return { removed: true, branch: worktree.branch };
+    return { action: "removed", removed: true, branch: worktree.branch };
   } catch (error) {
-    return {
-      removed: false,
-      branch: worktree.branch,
-      path: worktree.path,
-      reason: `worktree.remove failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
+    return retained(worktree, `worktree.remove failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

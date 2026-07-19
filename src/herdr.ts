@@ -34,6 +34,16 @@ export interface CreatedWorktree {
   branch: string;
 }
 
+export interface WorkspaceWorktreeInfo {
+  checkoutPath: string;
+  isLinkedWorktree: boolean;
+}
+
+export interface WorkspaceInfo {
+  workspaceId: string;
+  worktree: WorkspaceWorktreeInfo | null;
+}
+
 export interface HerdrClient {
   createTab(input: JsonRecord, signal?: AbortSignal): Promise<CreatedTab>;
   startAgent(input: JsonRecord, signal?: AbortSignal): Promise<AgentInfo>;
@@ -43,12 +53,17 @@ export interface HerdrClient {
   closeTab(tabId: string, signal?: AbortSignal): Promise<void>;
   createWorktree(input: JsonRecord, signal?: AbortSignal): Promise<CreatedWorktree>;
   removeWorktree(workspaceId: string, signal?: AbortSignal): Promise<void>;
+  getWorkspace(workspaceId: string, signal?: AbortSignal): Promise<WorkspaceInfo>;
+  closeWorkspace(workspaceId: string, signal?: AbortSignal): Promise<void>;
 }
 
 export class HerdrError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
+  readonly code?: string;
+
+  constructor(message: string, options?: ErrorOptions & { code?: string }) {
     super(message, options);
     this.name = "HerdrError";
+    this.code = options?.code;
   }
 }
 
@@ -68,6 +83,11 @@ function record(value: unknown, label: string): JsonRecord {
 
 function string(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) throw new HerdrError(`${label} must be a non-empty string`);
+  return value;
+}
+
+function boolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") throw new HerdrError(`${label} must be a boolean`);
   return value;
 }
 
@@ -182,6 +202,30 @@ export class SocketHerdrClient implements HerdrClient {
     await this.#request("worktree.remove", { workspace_id: workspaceId, force: false }, "worktree_removed", signal);
   }
 
+  async getWorkspace(workspaceId: string, signal?: AbortSignal): Promise<WorkspaceInfo> {
+    const result = await this.#request("workspace.get", { workspace_id: workspaceId }, "workspace_info", signal);
+    const workspace = record(result.workspace, "workspace.get.workspace");
+    const worktreeValue = workspace.worktree;
+    let worktree: WorkspaceWorktreeInfo | null;
+    if (worktreeValue === null) {
+      worktree = null;
+    } else {
+      const decoded = record(worktreeValue, "workspace.worktree");
+      worktree = {
+        checkoutPath: string(decoded.checkout_path, "workspace.worktree.checkout_path"),
+        isLinkedWorktree: boolean(decoded.is_linked_worktree, "workspace.worktree.is_linked_worktree"),
+      };
+    }
+    return {
+      workspaceId: string(workspace.workspace_id, "workspace.workspace_id"),
+      worktree,
+    };
+  }
+
+  async closeWorkspace(workspaceId: string, signal?: AbortSignal): Promise<void> {
+    await this.#request("workspace.close", { workspace_id: workspaceId }, "ok", signal);
+  }
+
   async #request(method: string, params: JsonRecord, expectedType: string, signal?: AbortSignal): Promise<JsonRecord> {
     if (signal?.aborted) throw abortError(signal);
     const id = this.#idFactory();
@@ -220,7 +264,8 @@ export class SocketHerdrClient implements HerdrClient {
           if (hasResult === hasError) throw new HerdrError("Herdr response must contain exactly one result or error");
           if (hasError) {
             const error = record(envelope.error, "response.error");
-            throw new HerdrError(`Herdr ${string(error.code, "error.code")}: ${string(error.message, "error.message")}`);
+            const code = string(error.code, "error.code");
+            throw new HerdrError(`Herdr ${code}: ${string(error.message, "error.message")}`, { code });
           }
           const response = record(envelope.result, "response.result");
           if (string(response.type, "result.type") !== expectedType) {

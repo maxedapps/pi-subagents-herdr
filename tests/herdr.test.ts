@@ -45,13 +45,15 @@ function success(request: Request): JsonRecord {
     case "agent.start": case "agent.get": return { ...base, result: { type: request.method === "agent.start" ? "agent_started" : "agent_info", agent: { agent: "pi", agent_session: { agent: "pi", kind: "id", value: "child-session" }, terminal_id: "term", workspace_id: "w1", tab_id: "w1:t2", pane_id: "w1:p3", agent_status: "idle" } } };
     case "worktree.create": return { ...base, result: { type: "worktree_created", workspace: { workspace_id: "w2" }, tab: { tab_id: "w2:t1" }, root_pane: { pane_id: "w2:p1" }, worktree: { path: "/tmp/w2", branch: "branch" } } };
     case "worktree.remove": return { ...base, result: { type: "worktree_removed", workspace_id: "w2", path: "/tmp/w2", forced: false } };
+    case "workspace.get": return { ...base, result: { type: "workspace_info", workspace: { workspace_id: "w2", worktree: { checkout_path: "/tmp/w2", is_linked_worktree: true } } } };
     default: return { ...base, result: { type: "ok" } };
   }
 }
 
-test("client exposes and sends exactly the eight approved Herdr methods", async () => {
+test("client exposes and sends exactly the ten approved Herdr methods", async () => {
   assert.deepEqual(Object.getOwnPropertyNames(SocketHerdrClient.prototype).filter((name) => name !== "constructor"), [
     "createTab", "startAgent", "getAgent", "sendInput", "closePane", "closeTab", "createWorktree", "removeWorktree",
+    "getWorkspace", "closeWorkspace",
   ]);
   const requests: Request[] = [];
   await withServer((request) => { requests.push(request); return success(request); }, async (client) => {
@@ -64,19 +66,56 @@ test("client exposes and sends exactly the eight approved Herdr methods", async 
     await client.closeTab("w1:t2");
     await client.createWorktree({ workspace_id: "w1", path: "/tmp/w2", branch: "branch", focus: false });
     await client.removeWorktree("w2");
+    assert.deepEqual(await client.getWorkspace("w2"), {
+      workspaceId: "w2",
+      worktree: { checkoutPath: "/tmp/w2", isLinkedWorktree: true },
+    });
+    await client.closeWorkspace("w2");
   });
   assert.deepEqual(requests.map(({ method }) => method), [
     "tab.create", "agent.start", "agent.get", "pane.send_input", "pane.close", "tab.close", "worktree.create", "worktree.remove",
+    "workspace.get", "workspace.close",
   ]);
   assert.deepEqual(requests[2]?.params, { target: "term" });
   assert.deepEqual(requests[3]?.params, { pane_id: "w1:p3", text: "task", keys: ["return"] });
   assert.deepEqual(requests[7]?.params, { workspace_id: "w2", force: false });
+  assert.deepEqual(requests[8]?.params, { workspace_id: "w2" });
+  assert.deepEqual(requests[9]?.params, { workspace_id: "w2" });
+});
+
+ test("workspace.get accepts an explicitly null worktree", async () => {
+  await withServer((request) => ({
+    id: request.id,
+    result: { type: "workspace_info", workspace: { workspace_id: "w2", worktree: null } },
+  }), async (client) => {
+    assert.deepEqual(await client.getWorkspace("w2"), { workspaceId: "w2", worktree: null });
+  });
+});
+
+test("workspace.get fails closed on malformed required fields", async (context) => {
+  const malformed = [
+    { label: "workspace id", workspace: { workspace_id: "", worktree: null } },
+    { label: "missing worktree", workspace: { workspace_id: "w2" } },
+    { label: "checkout path", workspace: { workspace_id: "w2", worktree: { checkout_path: null, is_linked_worktree: true } } },
+    { label: "linked-worktree flag", workspace: { workspace_id: "w2", worktree: { checkout_path: "/tmp/w2", is_linked_worktree: "true" } } },
+  ];
+  for (const entry of malformed) {
+    await context.test(entry.label, async () => {
+      await withServer((request) => ({ id: request.id, result: { type: "workspace_info", workspace: entry.workspace } }), async (client) => {
+        await assert.rejects(client.getWorkspace("w2"), (error) => error instanceof HerdrError);
+      });
+    });
+  }
 });
 
 test("client surfaces API, malformed response, timeout, and abort failures", async (context) => {
-  await context.test("API error", async () => {
-    await withServer((request) => ({ id: request.id, error: { code: "not_found", message: "gone" } }), async (client) => {
-      await assert.rejects(client.getAgent("missing"), /Herdr not_found: gone/);
+  await context.test("API error preserves its structured code", async () => {
+    await withServer((request) => ({ id: request.id, error: { code: "workspace_not_found", message: "gone" } }), async (client) => {
+      await assert.rejects(client.getWorkspace("missing"), (error) => {
+        assert.equal(error instanceof HerdrError && error.code, "workspace_not_found");
+        assert.match(String(error), /Herdr workspace_not_found: gone/);
+        return true;
+      });
     });
   });
   await context.test("malformed JSON", async () => {

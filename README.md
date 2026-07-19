@@ -37,7 +37,21 @@ subagent_stop({ id })
 
 With `wait:true`, the same complete structured result is returned directly and is not injected again. A wait timeout leaves the generation running in the background; it is not an implicit stop.
 
-Use `subagent_status` for lifecycle, generation, delivery, child-session, worktree, and retained-resource facts. Polling is not required for result delivery. A follow-up may be sent only after the previous generation was delivered or returned; it reuses the same child session with a fresh branch cursor. To continue after an automatic result, send the follow-up during the result-triggered parent turn before settlement cleanup becomes eligible.
+Use `subagent_status` for lifecycle, generation, delivery, artifact, child-session, worktree, and retained-resource facts. Polling is not required for result delivery. A follow-up may be sent only after the previous generation was delivered or returned; it reuses the same child session with a fresh branch cursor. To continue after an automatic result, send the follow-up during the result-triggered parent turn before settlement cleanup becomes eligible.
+
+## Exact run artifacts
+
+The extension automatically owns one Markdown artifact per run:
+
+```text
+<agentDir>/herdr-subagent-artifacts/<parentSessionId>/<runId>.md
+```
+
+It writes every exact parent start/follow-up before sending it and the full textual child response before readiness or delivery. Follow-ups become later generation sections in the same file. Artifacts contain only concise run/worktree/cleanup facts and verbatim exchanged text—not thinking, tool traffic, or full transcripts—and survive child-session and worktree cleanup.
+
+Agents must never create or edit these files. After compaction or uncertainty, list/read the relevant run artifact rather than relying on compacted delegation details. When a compacted parent session has artifacts, the extension adds one transient path-only reminder to the next model context; it does not persist a message, trigger a turn, or copy artifact contents.
+
+Artifact paths appear in start, result, status, and stop surfaces. If result archival fails, execution is retained without delivery or child-session deletion and one action notice identifies the file. Calling the existing `subagent_stop` retries exact archival from the cached result or preserved child session, returns the result once, and then finalizes resources; later inspection does not inject it again.
 
 ## Current-session widget
 
@@ -64,9 +78,11 @@ Worker cleanup closes the child pane, runs bounded `git status --porcelain`, and
 - removes a clean Herdr worktree with `force:false`;
 - retains dirty or uncheckable worktrees with their exact path;
 - retains and reports every generated branch;
-- removes child session storage only after the child is stopped and its result is recorded.
+- removes child session storage only after the child is stopped and its result artifact is recorded.
 
-Partial cleanup is recorded as `retained` and is not destructively retried. The extension never force-removes a worktree, deletes a branch, integrates commits, or scans for unknown resources. Resolve reported retained resources manually after preserving any work.
+Retained proven-stopped cleanup is safely retryable through the same `subagent_stop` run ID. Each retry performs a fresh status check; dirty work remains untouched, while a checkout made clean by the parent is removed non-forcibly. Automatic retention sends one concise action with the exact run, worktree, branch, workspace, reason, artifact, and retry call; explicit stop returns the same facts without another message, and shutdown never triggers a turn.
+
+Do not use raw Git-only worktree removal. If an operator already removed the checkout externally, the extension calls `workspace.get` and closes Herdr state only when the exact journaled workspace ID, normalized checkout path, and linked-worktree flag match. Structured `workspace_not_found` means it is already finalized; every malformed, mismatched, or other error remains retained. The extension never force-removes a worktree, deletes a branch, integrates commits, or scans for unknown resources.
 
 Herdr labels are diagnostic only: `subagent:<parentSessionShortId>:<runId>`.
 

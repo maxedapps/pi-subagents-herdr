@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { appendArtifactSection } from "../src/artifact.ts";
 import { PROFILES } from "../src/profiles.ts";
-import { SubagentRuntime, type ResultDelivery, type RuntimeOptions } from "../src/runtime.ts";
+import { SubagentRuntime, type ActionDelivery, type ResultDelivery, type RuntimeOptions } from "../src/runtime.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
 
 const parentSessionId = "parent-session";
@@ -68,16 +69,19 @@ function observableSnapshot(runtime: SubagentRuntime): string[] {
 }
 
 async function fixture(
-  run: (client: FakeHerdr, runtime: SubagentRuntime, deliveries: ResultDelivery[], agentDir: string) => Promise<void>,
+  run: (client: FakeHerdr, runtime: SubagentRuntime, deliveries: ResultDelivery[], agentDir: string, actions: ActionDelivery[]) => Promise<void>,
   ids: string[] = ["run-reader"],
   options: {
     appendState?: NonNullable<RuntimeOptions["appendState"]>;
+    appendArtifact?: NonNullable<RuntimeOptions["appendArtifact"]>;
+    gitStatus?: NonNullable<RuntimeOptions["gitStatus"]>;
     onRunsChanged?: (runtime: SubagentRuntime) => void;
   } = {},
 ): Promise<void> {
   const agentDir = await mkdtemp(join(tmpdir(), "runtime-agent-"));
   const client = new FakeHerdr();
   const deliveries: ResultDelivery[] = [];
+  const actions: ActionDelivery[] = [];
   let runtime!: SubagentRuntime;
   runtime = new SubagentRuntime(client, { workspaceId: "w-parent", agentDir }, {
     idFactory: () => ids.shift() ?? "run-extra",
@@ -85,9 +89,11 @@ async function fixture(
     readinessTimeoutMs: 30,
     pollIntervalMs: 1,
     cleanupTimeoutMs: 30,
-    gitStatus: async () => "",
+    gitStatus: options.gitStatus ?? (async () => ""),
     appendState: options.appendState ?? (() => {}),
+    ...(options.appendArtifact ? { appendArtifact: options.appendArtifact } : {}),
     deliverResult: (message) => deliveries.push(message),
+    deliverAction: (message) => actions.push(message),
     onRunsChanged: () => options.onRunsChanged?.(runtime),
   });
   await runtime.bindParent({
@@ -95,7 +101,7 @@ async function fixture(
     parentSessionFile: "/tmp/parent-session.jsonl",
     parentEntryId: "parent-leaf",
   }, [], "startup");
-  try { await run(client, runtime, deliveries, agentDir); }
+  try { await run(client, runtime, deliveries, agentDir, actions); }
   finally {
     for (const current of [...runtime.runs.values()]) {
       try { await runtime.stop(current.id); } catch { /* test cleanup best effort */ }
@@ -114,7 +120,7 @@ test("background start launches a deterministic persistent child and steers one 
     assert.deepEqual(input.argv, [
       "pi", "--session-dir", `${input.argv instanceof Array ? input.argv[2] : ""}`, "--session-id", "herdr-run-reader",
       "--name", "scout-n-reader", "--thinking", "low", "--tools", "read,grep,find,ls",
-      "--append-system-prompt", PROFILES.scout.systemPrompt,
+      "--append-system-prompt", `${PROFILES.scout.systemPrompt}\n\nArchive: ${started.artifactPath}. The extension writes this file automatically. Never edit it. After compaction or uncertainty, read it before relying on earlier parent instructions or your prior results.`,
     ]);
     assert.equal(input.cwd, "/repo");
     await eventually(() => deliveries.length === 1);
@@ -124,6 +130,7 @@ test("background start launches a deterministic persistent child and steers one 
     assert.deepEqual(delivered.details, {
       parentSessionId,
       runId: "run-reader",
+      artifactPath: started.artifactPath,
       profile: "scout",
       generation: 1,
       childSessionId: "herdr-run-reader",
@@ -134,6 +141,189 @@ test("background start launches a deterministic persistent child and steers one 
     assert.equal(runtime.confirmDelivery({ role: "custom", customType: delivered.customType, details: { ...delivered.details, generation: 2 } }), false);
     assert.equal(runtime.confirmDelivery({ role: "custom", customType: delivered.customType, details: delivered.details }), true);
     assert.equal(runtime.status("run-reader").generation?.delivery, "delivered");
+  });
+});
+
+test("artifact writes precede execution and readiness, survive child cleanup, and stay concise", async () => {
+  const order: string[] = [];
+  await fixture(async (client, runtime, deliveries) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => {
+      order.push("send");
+      await appendResult(client, ["line one\n", "line two"]);
+    };
+    const started = await runtime.start("scout", "exact\nparent task", "/repo");
+    await eventually(() => deliveries.length === 1);
+    assert.ok(order.indexOf("artifact-parent") < order.indexOf("send"));
+    assert.ok(order.indexOf("artifact-result") < order.indexOf("result-ready"));
+    assert.equal(started.artifactPath.endsWith("/herdr-subagent-artifacts/parent-session/run-reader.md"), true);
+    const delivery = deliveries[0]!;
+    assert.equal(delivery.details.artifactPath, started.artifactPath);
+    assert.equal(runtime.confirmDelivery({ role: "custom", ...delivery }), true);
+    const stopped = await runtime.stop(started.id);
+    assert.equal(stopped.run.lifecycle, "closed");
+    assert.equal(existsSync(started.childSessionDir), false);
+    const artifact = await readFile(started.artifactPath, "utf8");
+    assert.match(artifact, /## Generation 1 — Parent\n```text\nexact\nparent task\n```/);
+    assert.match(artifact, /## Generation 1 — Subagent\n```text\nline one\nline two\n```/);
+    assert.doesNotMatch(artifact, /thinking|response-metadata|childEntryId/);
+  }, ["run-reader"], {
+    appendArtifact: async (identity, section, operations) => {
+      order.push(section.includes("— Subagent") ? "artifact-result" : "artifact-parent");
+      await appendArtifactSection(identity, section, operations);
+    },
+    appendState: (_customType, record) => {
+      if (record.state === "result_ready") order.push("result-ready");
+    },
+  });
+});
+
+test("input artifact failure prevents Herdr input and uses startup cleanup", async () => {
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle"];
+    await assert.rejects(runtime.start("scout", "must not execute", "/repo"), /Artifact persistence failed/);
+    assert.equal(client.calls.some(({ method }) => method === "pane.send_input"), false);
+    assert.deepEqual(runtime.list(), []);
+  }, ["run-reader"], {
+    appendArtifact: async () => { throw new Error("archive unavailable"); },
+  });
+});
+
+test("failed result archival retains one exact source and subagent_stop recovers without injection", async () => {
+  let failResult = true;
+  await fixture(async (client, runtime, deliveries, _agentDir, actions) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["full\nresult"]); };
+    const started = await runtime.start("scout", "task", "/repo");
+    await eventually(() => runtime.status(started.id).archivePending === true);
+    const retained = runtime.status(started.id);
+    assert.equal(retained.lifecycle, "retained");
+    assert.equal(retained.generation?.delivery, "pending");
+    assert.equal(retained.latestResult?.text, "full\nresult");
+    assert.equal(existsSync(retained.childSessionDir), true);
+    assert.equal(deliveries.length, 0);
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0]?.details.artifactPath, started.artifactPath);
+
+    failResult = false;
+    const recovered = await runtime.stop(started.id);
+    assert.equal(recovered.run.lifecycle, "closed");
+    assert.equal(recovered.run.latestResult?.text, "full\nresult");
+    assert.equal(recovered.run.generation?.delivery, "delivered");
+    assert.equal(recovered.run.generation?.returned, true);
+    assert.equal(recovered.run.generation?.artifactResultPersisted, true);
+    assert.equal(deliveries.length, 0);
+    assert.equal(actions.length, 1);
+    assert.equal(existsSync(started.childSessionDir), false);
+    assert.match(await readFile(started.artifactPath, "utf8"), /full\nresult/);
+
+    const inspectedAgain = await runtime.stop(started.id);
+    assert.equal(inspectedAgain.run.latestResult?.text, "full\nresult");
+    assert.equal(deliveries.length, 0);
+  }, ["run-reader"], {
+    appendArtifact: async (identity, section, operations) => {
+      if (failResult && section.includes("— Subagent")) throw new Error("result archive unavailable");
+      await appendArtifactSection(identity, section, operations);
+    },
+  });
+});
+
+test("result_ready journal failure recovers without duplicating the archived result", async () => {
+  let failReadyOnce = true;
+  await fixture(async (client, runtime, deliveries, _agentDir, actions) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["journal recovery"]); };
+    const started = await runtime.start("scout", "task", "/repo");
+    await eventually(() => runtime.status(started.id).archivePending === true);
+    assert.equal(actions.length, 1);
+    assert.equal(deliveries.length, 0);
+    const recovered = await runtime.stop(started.id);
+    assert.equal(recovered.run.latestResult?.text, "journal recovery");
+    assert.equal(recovered.run.generation?.returned, true);
+    const artifact = await readFile(started.artifactPath, "utf8");
+    assert.equal(artifact.match(/— Subagent/g)?.length, 1);
+    assert.equal(deliveries.length, 0);
+  }, ["run-reader"], {
+    appendState: (_customType, record) => {
+      if (record.state === "result_ready" && failReadyOnce) {
+        failReadyOnce = false;
+        throw new Error("result_ready journal failed once");
+      }
+    },
+  });
+});
+
+test("result_delivered journal failure preserves returned state and recovers without a second transition", async () => {
+  let failDeliveredOnce = true;
+  await fixture(async (client, runtime, deliveries, _agentDir, actions) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["blocking journal recovery"]); };
+    await assert.rejects(
+      runtime.start("scout", "task", "/repo", { wait: true, timeoutMs: 100 }),
+      /result_delivered journal failed once/,
+    );
+    const retained = runtime.status("run-reader");
+    assert.equal(retained.archivePending, true);
+    assert.equal(retained.generation?.delivery, "delivered");
+    assert.equal(retained.generation?.returned, true);
+    assert.equal(actions.length, 1);
+    const recovered = await runtime.stop("run-reader");
+    assert.equal(recovered.run.generation?.delivery, "delivered");
+    assert.equal(recovered.run.generation?.returned, true);
+    assert.equal(deliveries.length, 0);
+    assert.equal((await readFile(retained.artifactPath, "utf8")).match(/— Subagent/g)?.length, 1);
+  }, ["run-reader"], {
+    appendState: (_customType, record) => {
+      if (record.state === "result_delivered" && failDeliveredOnce) {
+        failDeliveredOnce = false;
+        throw new Error("result_delivered journal failed once");
+      }
+    },
+  });
+});
+
+test("cleanup artifact failure preserves child session until a later stop retry", async () => {
+  let failCleanup = true;
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["archived"]); };
+    const started = await runtime.start("scout", "task", "/repo", { wait: true, timeoutMs: 100 });
+    const first = await runtime.stop(started.id);
+    assert.equal(first.run.lifecycle, "retained");
+    assert.equal(first.retained.includes(`artifact=${started.artifactPath}`), true);
+    assert.equal(first.retained.includes(`sessionDir=${started.childSessionDir}`), true);
+    assert.equal(existsSync(started.childSessionDir), true);
+    failCleanup = false;
+    const second = await runtime.stop(started.id);
+    assert.equal(second.run.lifecycle, "closed");
+    assert.equal(existsSync(started.childSessionDir), false);
+    assert.equal(client.calls.filter(({ method }) => method === "pane.close").length, 1);
+  }, ["run-reader"], {
+    appendArtifact: async (identity, section, operations) => {
+      if (failCleanup && section.startsWith("\n## Cleanup")) throw new Error("cleanup archive unavailable");
+      await appendArtifactSection(identity, section, operations);
+    },
+  });
+});
+
+test("follow-up artifact failure leaves the prior delivered generation usable and unsent", async () => {
+  let failFollowup = false;
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["first"]); };
+    const first = await runtime.start("scout", "one", "/repo", { wait: true, timeoutMs: 100 });
+    failFollowup = true;
+    await assert.rejects(runtime.send(first.id, "two"), /Artifact persistence failed/);
+    const current = runtime.status(first.id);
+    assert.equal(current.generation?.number, 1);
+    assert.equal(current.generation?.delivery, "delivered");
+    assert.equal(current.latestResult?.text, "first");
+    assert.equal(client.calls.filter(({ method }) => method === "pane.send_input").length, 1);
+  }, ["run-reader"], {
+    appendArtifact: async (identity, section, operations) => {
+      if (failFollowup && section.includes("— Parent")) throw new Error("follow-up archive unavailable");
+      await appendArtifactSection(identity, section, operations);
+    },
   });
 });
 
@@ -163,10 +353,11 @@ test("run notifications expose journaled snapshots and suppress unchanged monito
     await runtime.send(started.id, "follow up");
     assert.deepEqual(changes.at(-1), ["run-reader/live/idle/g2:pending/"]);
     const stopped = await runtime.stop(started.id);
-    assert.equal(stopped.run.lifecycle, "closed");
+    assert.equal(stopped.run.lifecycle, "retained");
+    assert.deepEqual(stopped.retained, [`sessionDir=${started.childSessionDir}`]);
     assert.deepEqual(changes.slice(-2), [
       ["run-reader/stopping/idle/g2:pending/"],
-      [],
+      [`run-reader/retained/idle/g2:pending/sessionDir=${started.childSessionDir}`],
     ]);
   }, ["run-reader"], {
     onRunsChanged: (runtime) => changes.push(observableSnapshot(runtime)),
@@ -195,7 +386,7 @@ test("journal failures suppress ordinary phases and notify only finalized fallba
     await fixture(async (_client, runtime) => {
       await assert.rejects(runtime.start("scout", "task", "/repo"), /journal failed/);
       assert.deepEqual(changes, [[
-        "run-reader/retained/working/no-generation/journal=herdr-subagent-state",
+        "run-reader/retained/working/no-generation/journal=herdr-subagent-state|tab=w-parent:t-reader",
       ]]);
       assert.equal(runtime.status("run-reader").error, "Cleanup journal failed: journal failed");
     }, ["run-reader"], {
@@ -370,6 +561,121 @@ test("ownership, uncertain input, fresh startup cleanup, and once-only stop pres
   }));
 });
 
+test("retained worker finalization retries dirty-to-clean without stopping the child twice", async () => {
+  let dirty = true;
+  let statusCalls = 0;
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["worker result"]); };
+    const started = await runtime.start("worker", "task", process.cwd(), { wait: true, timeoutMs: 100 });
+    const first = await runtime.stop(started.id);
+    assert.equal(first.run.lifecycle, "retained");
+    assert.equal(first.run.childStopped, true);
+    assert.equal(first.workerCleanup?.removed, false);
+    assert.equal(first.workerCleanup?.action, "retained");
+    const retainedArtifact = await readFile(started.artifactPath, "utf8");
+    assert.match(retainedArtifact, /## Cleanup\n- State: action required/);
+    assert.match(retainedArtifact, /- Reason: worktree is dirty/);
+    assert.match(retainedArtifact, /Do not use raw Git-only removal/);
+    dirty = false;
+    const second = await runtime.stop(started.id);
+    assert.equal(second.run.lifecycle, "closed");
+    assert.equal(second.run.childStopped, true);
+    assert.equal(second.workerCleanup?.removed, true);
+    assert.equal(second.workerCleanup?.action, "removed");
+    assert.match(await readFile(started.artifactPath, "utf8"), /## Cleanup\n- State: removed/);
+    assert.equal(statusCalls, 2);
+    assert.equal(client.calls.filter(({ method }) => method === "pane.close").length, 1);
+    assert.equal(client.calls.filter(({ method }) => method === "worktree.remove").length, 1);
+    await rm(started.worktree!.path, { recursive: true, force: true });
+  }, ["run-worker-retry"], {
+    gitStatus: async () => {
+      statusCalls++;
+      return dirty ? " M file.ts\n" : "";
+    },
+  });
+});
+
+test("automatic dirty settlement can be cleaned and retried through explicit stop", async () => {
+  let dirty = true;
+  let statusCalls = 0;
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["worker result"]); };
+    const started = await runtime.start("worker", "task", process.cwd(), { wait: true, timeoutMs: 100 });
+    const [automatic] = await runtime.settle();
+    assert.equal(automatic?.run.lifecycle, "retained");
+    assert.equal(automatic?.run.childStopped, true);
+    dirty = false;
+    const retried = await runtime.stop(started.id);
+    assert.equal(retried.run.lifecycle, "closed");
+    assert.equal(retried.workerCleanup?.action, "removed");
+    assert.equal(statusCalls, 2);
+    assert.equal(client.calls.filter(({ method }) => method === "pane.close").length, 1);
+    assert.equal(client.calls.filter(({ method }) => method === "worktree.remove").length, 1);
+    await rm(started.worktree!.path, { recursive: true, force: true });
+  }, ["run-worker-auto-retry"], {
+    gitStatus: async () => {
+      statusCalls++;
+      return dirty ? " M file.ts\n" : "";
+    },
+  });
+});
+
+test("retained stop calls share one attempt and a later call starts a fresh retry", async () => {
+  let release!: () => void;
+  let calls = 0;
+  const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("worker", "task", process.cwd());
+    const one = runtime.stop(started.id);
+    const two = runtime.stop(started.id);
+    await eventually(() => calls === 1);
+    release();
+    const [first, shared] = await Promise.all([one, two]);
+    assert.deepEqual(first, shared);
+    assert.equal(first.run.lifecycle, "retained");
+    await runtime.stop(started.id);
+    assert.equal(calls, 2);
+    assert.equal(client.calls.filter(({ method }) => method === "pane.close").length, 1);
+    await rm(started.worktree!.path, { recursive: true, force: true });
+  }, ["run-worker-concurrent"], {
+    gitStatus: async () => {
+      calls++;
+      if (calls === 1) await gate;
+      return " M file.ts\n";
+    },
+  });
+});
+
+test("failed child-stop milestone persistence does not authorize cleanup-only mutation", async () => {
+  let failMilestone = true;
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("worker", "task", process.cwd());
+    const first = await runtime.stop(started.id);
+    assert.equal(first.run.lifecycle, "retained");
+    assert.equal(first.run.childStopped, undefined);
+    assert.equal(first.retained.includes("journal=herdr-subagent-state"), true);
+    assert.equal(client.calls.some(({ method }) => method === "worktree.remove"), false);
+
+    const second = await runtime.stop(started.id);
+    assert.equal(second.run.childStopped, true);
+    assert.equal(second.run.lifecycle, "retained");
+    assert.equal(client.calls.filter(({ method }) => method === "pane.close").length, 2);
+    await rm(started.worktree!.path, { recursive: true, force: true });
+  }, ["run-worker-milestone"], {
+    appendState: (_customType, record) => {
+      if (record.state === "stopping" && record.childStopped && failMilestone) {
+        failMilestone = false;
+        throw new Error("milestone failed");
+      }
+    },
+    gitStatus: async () => " M file.ts\n",
+  });
+});
+
 test("pre-run worker agent-start failure removes the clean worktree but reports its retained branch", async () => {
   await fixture(async (client, runtime) => {
     client.failStartAgent = true;
@@ -442,7 +748,7 @@ test("normal stop retains session storage when reader or worker stop cannot be e
   }, ["run-worker-stop-cleanup"]));
 });
 
-test("successful enclosing cleanup clears stale pane and session retention", async (context) => {
+test("successful enclosing cleanup clears stale pane but preserves any unarchived generation session", async (context) => {
   for (const profile of ["scout", "worker"] as const) {
     await context.test(`startup ${profile}`, async () => fixture(async (client, runtime) => {
       client.hangGetAgent = true;
@@ -471,20 +777,13 @@ test("successful enclosing cleanup clears stale pane and session retention", asy
       await mkdir(started.childSessionDir, { recursive: true });
       client.failClosePane = true;
       const stopped = await runtime.stop(started.id);
-      if (profile === "worker") {
-        assert.equal(stopped.run.lifecycle, "retained");
-        assert.deepEqual(stopped.retained, [
-          `branch=${started.worktree!.branch}`,
-          `sessionDir=${started.childSessionDir}`,
-        ]);
-        assert.equal(existsSync(started.childSessionDir), true);
-        assert.equal(runtime.list().length, 1);
-      } else {
-        assert.deepEqual(stopped.retained, []);
-        assert.equal(stopped.run.lifecycle, "closed");
-        assert.equal(existsSync(started.childSessionDir), false);
-        assert.deepEqual(runtime.list(), []);
-      }
+      assert.equal(stopped.run.lifecycle, "retained");
+      assert.deepEqual(stopped.retained, profile === "worker" ? [
+        `branch=${started.worktree!.branch}`,
+        `sessionDir=${started.childSessionDir}`,
+      ] : [`sessionDir=${started.childSessionDir}`]);
+      assert.equal(existsSync(started.childSessionDir), true);
+      assert.equal(runtime.list().length, 1);
       if (started.worktree) await rm(started.worktree.path, { recursive: true, force: true });
     }, [`run-${profile}-stop-enclosing`]));
   }

@@ -24,6 +24,8 @@ export interface JournalGeneration {
   delivery: "pending" | "ready" | "queued" | "delivered";
   resultEntryId?: string;
   returned?: boolean;
+  artifactParentPersisted?: true;
+  artifactResultPersisted?: true;
 }
 
 export interface HerdrStateRecord {
@@ -39,6 +41,7 @@ export interface HerdrStateRecord {
   childSessionDir: string;
   childSessionPath?: string;
   childCwd: string;
+  artifactPath?: string;
   terminalId: string;
   paneId: string;
   tabId: string;
@@ -48,6 +51,8 @@ export interface HerdrStateRecord {
   result?: ChildResult;
   worktree?: WorktreeFacts;
   retained?: readonly string[];
+  childStopped?: true;
+  archivePending?: true;
   workerCleanup?: WorkerCleanup;
   error?: string;
 }
@@ -56,12 +61,21 @@ export interface ReplayedHerdrRun {
   latest: HerdrStateRecord;
   readyGenerations: ReadonlySet<number>;
   latestResult?: ChildResult;
+  childStopped: boolean;
 }
 
 const JOURNAL_STATES = new Set<HerdrLifecycleState>([
   "starting", "live", "generation_pending", "result_ready", "result_queued",
   "result_delivered", "stopping", "retained", "closed",
 ]);
+
+function validGenerationArtifactFacts(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (typeof value !== "object" || value === null) return false;
+  const generation = value as Record<string, unknown>;
+  return (generation.artifactParentPersisted === undefined || generation.artifactParentPersisted === true)
+    && (generation.artifactResultPersisted === undefined || generation.artifactResultPersisted === true);
+}
 
 function isRecord(value: unknown): value is HerdrStateRecord {
   if (typeof value !== "object" || value === null) return false;
@@ -80,6 +94,10 @@ function isRecord(value: unknown): value is HerdrStateRecord {
     && typeof record.childSessionId === "string"
     && typeof record.childSessionDir === "string"
     && typeof record.childCwd === "string"
+    && (record.artifactPath === undefined || typeof record.artifactPath === "string")
+    && (record.childStopped === undefined || record.childStopped === true)
+    && (record.archivePending === undefined || record.archivePending === true)
+    && validGenerationArtifactFacts(record.generation)
     && typeof record.terminalId === "string"
     && typeof record.paneId === "string"
     && typeof record.tabId === "string"
@@ -92,7 +110,7 @@ export function reconstructHerdrJournal(
   parentSessionId: string,
   parentSessionFile: string,
 ): { runs: Map<string, ReplayedHerdrRun>; invalidEntries: number } {
-  const replayed = new Map<string, { latest: HerdrStateRecord; readyGenerations: Set<number>; latestResult?: ChildResult }>();
+  const replayed = new Map<string, { latest: HerdrStateRecord; readyGenerations: Set<number>; latestResult?: ChildResult; childStopped: boolean }>();
   let invalidEntries = 0;
   for (const entry of branch) {
     if (entry.type !== "custom" || entry.customType !== HERDR_STATE_CUSTOM_TYPE) continue;
@@ -102,8 +120,9 @@ export function reconstructHerdrJournal(
     }
     const record = entry.data;
     if (record.parentSessionId !== parentSessionId || record.parentSessionFile !== parentSessionFile) continue;
-    const current = replayed.get(record.runId) ?? { latest: record, readyGenerations: new Set<number>() };
+    const current = replayed.get(record.runId) ?? { latest: record, readyGenerations: new Set<number>(), childStopped: false };
     current.latest = record;
+    if (record.childStopped) current.childStopped = true;
     if (record.state === "result_ready" && record.generation && record.result) {
       current.readyGenerations.add(record.generation.number);
       current.latestResult = record.result;

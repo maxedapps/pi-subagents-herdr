@@ -7,8 +7,10 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   captureChildCursor,
+  HERDR_STATE_CUSTOM_TYPE,
   openChildSession,
   readChildResult,
+  reconstructHerdrJournal,
   type ChildSessionLocation,
 } from "../src/session.ts";
 
@@ -77,6 +79,60 @@ test("fresh snapshots select the last non-toolUse assistant after the active-bra
     assert.equal(result?.text, "second result");
     assert.equal(result?.message.responseId, "response-metadata");
     assert.deepEqual(result?.message, final);
+  });
+});
+
+test("journal replay accepts old records and validates optional artifact milestones", async () => {
+  await fixture(async (_location, manager) => {
+    manager.appendMessage({ role: "user", content: "parent", timestamp: Date.now() });
+    const parentSessionFile = manager.getSessionFile()!;
+    const base = {
+      state: "generation_pending" as const,
+      at: 1,
+      parentSessionId: manager.getSessionId(),
+      parentSessionFile,
+      parentEntryId: manager.getLeafId(),
+      parentInstanceId: "instance",
+      parentProcessId: 1,
+      runId: "run-old",
+      childSessionId: "herdr-run-old",
+      childSessionDir: "/agent/herdr-subagents/parent/run-old",
+      childCwd: "/repo",
+      terminalId: "term",
+      paneId: "pane",
+      tabId: "tab",
+      workspaceId: "workspace",
+      profile: "scout" as const,
+      generation: { number: 1, baselineEntryId: null, delivery: "pending" as const },
+    };
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, base);
+    let replayed = reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile);
+    assert.equal(replayed.invalidEntries, 0);
+    assert.equal(replayed.runs.get("run-old")?.latest.artifactPath, undefined);
+
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, {
+      ...base,
+      artifactPath: "/agent/herdr-subagent-artifacts/parent/run-old.md",
+      archivePending: true,
+      generation: { ...base.generation, artifactParentPersisted: true, artifactResultPersisted: true },
+    });
+    replayed = reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile);
+    assert.equal(replayed.invalidEntries, 0);
+    assert.equal(replayed.runs.get("run-old")?.latest.archivePending, true);
+
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, childStopped: true });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, at: 2 });
+    replayed = reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile);
+    assert.equal(replayed.runs.get("run-old")?.childStopped, true);
+
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, childStopped: false });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, archivePending: false });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, {
+      ...base,
+      generation: { ...base.generation, artifactResultPersisted: false },
+    });
+    replayed = reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile);
+    assert.equal(replayed.invalidEntries, 3);
   });
 });
 

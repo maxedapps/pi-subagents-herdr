@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { access, rm } from "node:fs/promises";
+import { access, lstat, rm } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { AgentInfo, AgentStatus, HerdrClient } from "./herdr.ts";
+import { getAgentDir, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+  appendArtifactSection,
+  renderArtifactHeader,
+  renderCleanupSection,
+  renderGenerationSection,
+  resolveArtifactLocation,
+  type ArtifactIdentity,
+} from "./artifact.ts";
+import { HerdrError, type AgentInfo, type AgentStatus, type HerdrClient } from "./herdr.ts";
 import { buildPiLaunch, type ProfileName } from "./profiles.ts";
 import {
   captureChildCursor,
@@ -40,6 +48,8 @@ export interface Generation {
   delivery: "pending" | "ready" | "queued" | "delivered";
   blockingWaiter: boolean;
   returned?: boolean;
+  artifactParentPersisted?: true;
+  artifactResultPersisted?: true;
   error?: string;
 }
 
@@ -52,6 +62,7 @@ export interface Run {
   childSessionDir: string;
   childSessionPath?: string;
   childCwd: string;
+  artifactPath: string;
   terminalId: string;
   paneId: string;
   tabId: string;
@@ -66,6 +77,8 @@ export interface Run {
   warning?: string;
   resultContent?: string;
   retained?: readonly string[];
+  childStopped?: true;
+  archivePending?: true;
   error?: string;
 }
 
@@ -82,6 +95,8 @@ interface RunRecord extends Run {
   completion?: Promise<GenerationOutcome>;
   complete?: (outcome: GenerationOutcome) => void;
   cleanup?: Promise<StopResult>;
+  archiveActionSent?: boolean;
+  archiveRecovered?: boolean;
 }
 
 export interface ParentSessionBinding {
@@ -109,6 +124,7 @@ export interface LifecycleDiagnostic {
 export interface ResultDetails {
   parentSessionId: string;
   runId: string;
+  artifactPath: string;
   profile: ProfileName;
   generation: number;
   childSessionId: string;
@@ -137,7 +153,9 @@ export interface RuntimeOptions {
   cleanupTimeoutMs?: number;
   gitStatus?: GitStatus;
   appendState?: (customType: typeof HERDR_STATE_CUSTOM_TYPE, record: HerdrStateRecord) => void;
+  appendArtifact?: typeof appendArtifactSection;
   deliverResult?: (message: ResultDelivery) => void;
+  deliverAction?: (message: ActionDelivery) => void;
   onRunsChanged?: () => void;
   isProcessAlive?: (pid: number) => boolean;
   now?: () => number;
@@ -147,6 +165,13 @@ export interface GenerationRequest extends Partial<ParentRequest> {
   wait?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
+}
+
+export interface ActionDelivery {
+  customType: "herdr-subagent-action";
+  content: string;
+  display: true;
+  details: { parentSessionId: string; runId: string; artifactPath: string; reason: string };
 }
 
 export interface StopResult {
@@ -205,6 +230,7 @@ export function formatSubagentResult(run: Run, result: ChildResult): string {
   return [
     `<subagent_result run_id="${run.id}" profile="${run.profile}" generation="${generation}" child_entry_id="${result.childEntryId}" lifecycle="${run.lifecycle}">`,
     result.text,
+    `Artifact: ${run.artifactPath}`,
     ...(warning ? [warning] : ["Reader reminder: the child remains available for follow-ups; stop it when no longer needed."]),
     "</subagent_result>",
   ].join("\n");
@@ -219,6 +245,8 @@ function cloneRun(run: RunRecord): Run {
     completion: _completion,
     complete: _complete,
     cleanup: _cleanup,
+    archiveActionSent: _archiveActionSent,
+    archiveRecovered: _archiveRecovered,
     ...publicRun
   } = run;
   return {
@@ -269,7 +297,10 @@ export class SubagentRuntime {
   readonly #cleanupTimeoutMs: number;
   readonly #gitStatus?: GitStatus;
   readonly #appendState?: RuntimeOptions["appendState"];
+  readonly #appendArtifactSection: typeof appendArtifactSection;
   readonly #deliverResult?: (message: ResultDelivery) => void;
+  readonly #deliverAction?: (message: ActionDelivery) => void;
+  readonly #agentDir: string;
   readonly #onRunsChanged?: () => void;
   readonly #isProcessAlive: (pid: number) => boolean;
   readonly #now: () => number;
@@ -292,7 +323,10 @@ export class SubagentRuntime {
     this.#cleanupTimeoutMs = options.cleanupTimeoutMs ?? 10_000;
     this.#gitStatus = options.gitStatus;
     this.#appendState = options.appendState;
+    this.#appendArtifactSection = options.appendArtifact ?? appendArtifactSection;
     this.#deliverResult = options.deliverResult;
+    this.#deliverAction = options.deliverAction;
+    this.#agentDir = environment.agentDir ?? getAgentDir();
     this.#onRunsChanged = options.onRunsChanged;
     this.#isProcessAlive = options.isProcessAlive ?? processIsAlive;
     this.#now = options.now ?? Date.now;
@@ -336,6 +370,76 @@ export class SubagentRuntime {
     for (const replay of replayed.runs.values()) {
       const record = replay.latest;
       if (record.parentInstanceId === this.instanceId) continue;
+      if (record.state === "retained" && record.archivePending === true) {
+        if (this.#isProcessAlive(record.parentProcessId)) {
+          this.#diagnostics.push({
+            runId: record.runId,
+            outcome: "live_owner",
+            message: `Run ${record.runId} belongs to live parent process ${record.parentProcessId}; left untouched`,
+          });
+          continue;
+        }
+        const mismatch = await this.#residueMismatch(record, cleanupSignal);
+        if (mismatch) {
+          this.#diagnostics.push({
+            runId: record.runId,
+            outcome: "identity_mismatch",
+            message: `Run ${record.runId} archive recovery was not bound: ${mismatch}`,
+          });
+          continue;
+        }
+        const run = this.#replayedRun(replay);
+        run.lifecycle = "retained";
+        run.archivePending = true;
+        this.runs.set(run.id, run);
+        this.#diagnostics.push({
+          runId: record.runId,
+          outcome: "retained",
+          message: `Run ${record.runId} retained for exact result archival recovery through subagent_stop`,
+          ...(record.retained ? { retained: [...record.retained] } : {}),
+        });
+        continue;
+      }
+      if (record.state === "retained" && replay.childStopped && record.worktree) {
+        if (this.#isProcessAlive(record.parentProcessId)) {
+          this.#diagnostics.push({
+            runId: record.runId,
+            outcome: "live_owner",
+            message: `Run ${record.runId} belongs to live parent process ${record.parentProcessId}; left untouched`,
+          });
+          continue;
+        }
+        const mismatch = await this.#stoppedWorkerResidueMismatch(record, cleanupSignal);
+        if (mismatch) {
+          this.#diagnostics.push({
+            runId: record.runId,
+            outcome: "identity_mismatch",
+            message: `Run ${record.runId} cleanup-only reconciliation was not authorized: ${mismatch}`,
+          });
+          continue;
+        }
+        const run = this.#replayedRun(replay);
+        run.lifecycle = "stopping";
+        try {
+          this.#record(run, "stopping");
+        } catch (error) {
+          this.#diagnostics.push({
+            runId: record.runId,
+            outcome: "retained",
+            message: `Run ${record.runId} cleanup-only reconciliation was not started because its journal failed: ${errorMessage(error)}`,
+          });
+          continue;
+        }
+        const stopped = await this.#cleanupRun(run, cleanupSignal, false);
+        if (stopped.run.lifecycle === "retained") this.runs.set(run.id, run);
+        this.#diagnostics.push({
+          runId: record.runId,
+          outcome: stopped.run.lifecycle === "closed" ? "cleaned" : "retained",
+          message: `Proven-stopped worker ${record.runId} cleanup ${stopped.run.lifecycle}`,
+          ...(stopped.retained.length ? { retained: [...stopped.retained] } : {}),
+        });
+        continue;
+      }
       if (TERMINAL.has(record.state)) {
         this.#diagnostics.push({
           runId: record.runId,
@@ -440,6 +544,12 @@ export class SubagentRuntime {
     if (worker) this.#workerStarting = true;
 
     const id = this.#idFactory();
+    const artifactIdentity: ArtifactIdentity = {
+      agentDir: this.#agentDir,
+      parentSessionId: parent.parentSessionId,
+      runId: id,
+    };
+    const artifactPath = resolveArtifactLocation(artifactIdentity).path;
     let tabId: string | undefined;
     let rootPaneId: string | undefined;
     let worktree: WorktreeFacts | undefined;
@@ -478,7 +588,7 @@ export class SubagentRuntime {
       const childCwd = worktree?.path ?? cwd;
       const location = createChildSessionLocation(parent.parentSessionId, id, childCwd, this.environment.agentDir);
       childSessionDir = location.childSessionDir;
-      const launch = buildPiLaunch(profile, id, location.childSessionDir, location.childSessionId);
+      const launch = buildPiLaunch(profile, id, location.childSessionDir, location.childSessionId, artifactPath);
       agent = await this.client.startAgent({
         name: launch.name,
         argv: launch.argv,
@@ -497,6 +607,7 @@ export class SubagentRuntime {
         childSessionId: location.childSessionId,
         childSessionDir: location.childSessionDir,
         childCwd,
+        artifactPath,
         terminalId: agent.terminalId,
         paneId: agent.paneId,
         tabId: agent.tabId,
@@ -531,6 +642,18 @@ export class SubagentRuntime {
       run.lifecycle = "live";
       run.updatedAt = this.#now();
       this.#record(run, "live");
+      await this.#appendArtifact(run,
+        renderArtifactHeader({
+          runId: run.id,
+          profile: run.profile,
+          ...(run.worktree ? { worker: {
+            path: run.worktree.path,
+            branch: run.worktree.branch,
+            workspaceId: run.worktree.workspaceId,
+          } } : {}),
+        }) + renderGenerationSection({ generation: 1, speaker: "Parent", body: task }),
+      );
+      run.generation.artifactParentPersisted = true;
       this.#record(run, "generation_pending");
       this.#notifyRunsChanged();
       this.#prepareCompletion(run);
@@ -581,12 +704,17 @@ export class SubagentRuntime {
 
     const cursor = await captureChildCursor(run.location);
     run.childSessionPath = cursor.childSessionPath;
+    const generationNumber = (run.generation?.number ?? 0) + 1;
+    await this.#appendArtifact(run,
+      renderGenerationSection({ generation: generationNumber, speaker: "Parent", body: input }),
+    );
     run.generation = {
-      number: (run.generation?.number ?? 0) + 1,
+      number: generationNumber,
       input,
       baselineEntryId: cursor.baselineEntryId,
       delivery: "pending",
       blockingWaiter: request.wait === true,
+      artifactParentPersisted: true,
     };
     run.latestResult = undefined;
     run.resultContent = undefined;
@@ -612,13 +740,38 @@ export class SubagentRuntime {
   async stop(id: string, request: Partial<ParentRequest> = {}): Promise<StopResult> {
     const run = this.#run(id, request);
     if (run.cleanup) return run.cleanup;
-    if (run.lifecycle === "retained" || run.lifecycle === "closed") {
+    if (run.lifecycle === "closed") {
       return { run: cloneRun(run), retained: [...(run.retained ?? [])] };
     }
-    this.#markStopping(run, `Run stopped: ${id}`);
     const signal = AbortSignal.timeout(this.#cleanupTimeoutMs);
-    run.cleanup = this.#cleanupRun(run, signal, false);
-    return run.cleanup;
+    const attempt = this.#stopAttempt(run, signal);
+    run.cleanup = attempt;
+    void attempt.then(
+      () => { if (run.lifecycle === "retained" && run.cleanup === attempt) run.cleanup = undefined; },
+      () => { if (run.cleanup === attempt) run.cleanup = undefined; },
+    );
+    return attempt;
+  }
+
+  async #stopAttempt(run: RunRecord, signal: AbortSignal): Promise<StopResult> {
+    if (run.archivePending && !await this.#recoverPendingArtifact(run)) {
+      return { run: cloneRun(run), retained: [...(run.retained ?? [])] };
+    }
+    run.error = undefined;
+    run.retained = undefined;
+    try {
+      this.#markStopping(run, `Run stopped: ${run.id}`);
+    } catch (error) {
+      run.lifecycle = "retained";
+      run.error = `Stopping journal failed: ${errorMessage(error)}`;
+      const retained: string[] = [];
+      if (!retained.includes("journal=herdr-subagent-state")) retained.push("journal=herdr-subagent-state");
+      run.retained = retained;
+      run.updatedAt = this.#now();
+      this.#notifyRunsChanged();
+      return { run: cloneRun(run), retained };
+    }
+    return this.#cleanupRun(run, signal, false);
   }
 
   async settle(request: Partial<ParentRequest> = {}): Promise<readonly StopResult[]> {
@@ -658,6 +811,7 @@ export class SubagentRuntime {
     if (!run || run.parentInstanceId !== this.instanceId || !generation || generation.delivery !== "queued") return false;
     if (
       details.parentSessionId !== run.parentSessionId
+      || details.artifactPath !== run.artifactPath
       || details.profile !== run.profile
       || details.generation !== generation.number
       || details.childSessionId !== run.childSessionId
@@ -708,6 +862,8 @@ export class SubagentRuntime {
       delivery: generation.delivery,
       ...(generation.resultEntryId ? { resultEntryId: generation.resultEntryId } : {}),
       ...(generation.returned ? { returned: true } : {}),
+      ...(generation.artifactParentPersisted ? { artifactParentPersisted: true } : {}),
+      ...(generation.artifactResultPersisted ? { artifactResultPersisted: true } : {}),
     };
   }
 
@@ -727,6 +883,7 @@ export class SubagentRuntime {
       childSessionDir: run.childSessionDir,
       ...(run.childSessionPath ? { childSessionPath: run.childSessionPath } : {}),
       childCwd: run.childCwd,
+      artifactPath: run.artifactPath,
       terminalId: run.terminalId,
       paneId: run.paneId,
       tabId: run.tabId,
@@ -736,10 +893,73 @@ export class SubagentRuntime {
       ...(state === "result_ready" && run.latestResult ? { result: run.latestResult } : {}),
       ...(run.worktree ? { worktree: { ...run.worktree } } : {}),
       ...(run.retained ? { retained: [...run.retained] } : {}),
+      ...(run.childStopped ? { childStopped: true } : {}),
+      ...(run.archivePending ? { archivePending: true } : {}),
       ...(workerCleanup ? { workerCleanup } : {}),
       ...(run.error ? { error: run.error } : {}),
     };
     this.#appendState(HERDR_STATE_CUSTOM_TYPE, record);
+  }
+
+  async #appendArtifact(run: Pick<Run, "id" | "parentSessionId" | "artifactPath">, section: string): Promise<void> {
+    try {
+      await this.#appendArtifactSection({
+        agentDir: this.#agentDir,
+        parentSessionId: run.parentSessionId,
+        runId: run.id,
+      }, section);
+    } catch (error) {
+      throw new Error(`Artifact persistence failed for run ${run.id} at ${run.artifactPath}: ${errorMessage(error)}`, { cause: error });
+    }
+  }
+
+  async #recoverPendingArtifact(run: RunRecord): Promise<boolean> {
+    const generation = run.generation;
+    if (!generation) return false;
+    try {
+      let result = run.latestResult;
+      if (!result) {
+        const recovered = await readChildResult(run.location, generation.baselineEntryId, "idle");
+        if (!recovered) throw new Error("Preserved child result could not be read");
+        run.childSessionPath = recovered.childSessionPath;
+        result = { childEntryId: recovered.childEntryId, text: recovered.text, message: recovered.message };
+        run.latestResult = result;
+      }
+      if (!generation.artifactResultPersisted) {
+        await this.#appendArtifact(run,
+          renderGenerationSection({ generation: generation.number, speaker: "Subagent", body: result.text }),
+        );
+        generation.artifactResultPersisted = true;
+      }
+      generation.resultEntryId = result.childEntryId;
+      const alreadyReturned = generation.returned === true;
+      if (!alreadyReturned) generation.delivery = "ready";
+      generation.error = undefined;
+      run.archivePending = undefined;
+      run.error = undefined;
+      run.retained = undefined;
+      run.resultContent = formatSubagentResult(run, result);
+      run.updatedAt = this.#now();
+      this.#record(run, "result_ready");
+      if (!alreadyReturned) {
+        generation.delivery = "delivered";
+        generation.returned = true;
+      }
+      run.archiveRecovered = true;
+      this.#record(run, "result_delivered");
+      this.#notifyRunsChanged();
+      return true;
+    } catch (error) {
+      run.archivePending = true;
+      run.lifecycle = "retained";
+      run.error = `Result archive recovery failed: ${errorMessage(error)}`;
+      generation.error = run.error;
+      run.retained = this.#allResourceFacts(run);
+      run.updatedAt = this.#now();
+      try { this.#record(run, "retained"); } catch { /* tool result still exposes the exact failure */ }
+      this.#notifyRunsChanged();
+      return false;
+    }
   }
 
   #notifyRunsChanged(): void {
@@ -773,6 +993,39 @@ export class SubagentRuntime {
         if (result) {
           run.childSessionPath = result.childSessionPath;
           run.latestResult = { childEntryId: result.childEntryId, text: result.text, message: result.message };
+          try {
+            await this.#appendArtifact(run,
+              renderGenerationSection({ generation: generation.number, speaker: "Subagent", body: result.text }),
+            );
+          } catch (error) {
+            run.archivePending = true;
+            run.lifecycle = "retained";
+            run.error = `Result archive required before delivery: ${errorMessage(error)}`;
+            generation.error = run.error;
+            run.retained = this.#allResourceFacts(run);
+            run.updatedAt = this.#now();
+            try { this.#record(run, "retained"); } catch { /* preserve the archive error */ }
+            this.#notifyRunsChanged();
+            if (!run.archiveActionSent) {
+              run.archiveActionSent = true;
+              try {
+                this.#deliverAction?.({
+                  customType: "herdr-subagent-action",
+                  content: `Run ${run.id} result is preserved but not delivered because its artifact could not be written. Artifact: ${run.artifactPath}. Retry with subagent_stop({ id: "${run.id}" }).`,
+                  display: true,
+                  details: {
+                    parentSessionId: run.parentSessionId,
+                    runId: run.id,
+                    artifactPath: run.artifactPath,
+                    reason: run.error,
+                  },
+                });
+              } catch { /* an action notice must not weaken retention */ }
+            }
+            run.complete?.({ error: new Error(run.error) });
+            return;
+          }
+          generation.artifactResultPersisted = true;
           run.resultContent = formatSubagentResult(run, run.latestResult);
           generation.resultEntryId = result.childEntryId;
           generation.error = undefined;
@@ -802,10 +1055,27 @@ export class SubagentRuntime {
       generation.error = failure.message;
       run.error = failure.message;
       run.lifecycle = "retained";
+      if (run.latestResult && generation.artifactResultPersisted) run.archivePending = true;
       run.retained = this.#allResourceFacts(run);
       run.updatedAt = this.#now();
       try { this.#record(run, "retained"); } catch { /* expose the monitor error through status */ }
       this.#notifyRunsChanged();
+      if (run.archivePending && !run.archiveActionSent) {
+        run.archiveActionSent = true;
+        try {
+          this.#deliverAction?.({
+            customType: "herdr-subagent-action",
+            content: `Run ${run.id} result is archived but its delivery journal did not complete. Artifact: ${run.artifactPath}. Retry with subagent_stop({ id: "${run.id}" }).`,
+            display: true,
+            details: {
+              parentSessionId: run.parentSessionId,
+              runId: run.id,
+              artifactPath: run.artifactPath,
+              reason: run.error,
+            },
+          });
+        } catch { /* an action notice must not weaken retention */ }
+      }
       run.complete?.({ error: failure });
     }
   }
@@ -819,6 +1089,7 @@ export class SubagentRuntime {
     const details: ResultDetails = {
       parentSessionId: run.parentSessionId,
       runId: run.id,
+      artifactPath: run.artifactPath,
       profile: run.profile,
       generation: generation.number,
       childSessionId: run.childSessionId,
@@ -893,7 +1164,7 @@ export class SubagentRuntime {
   }
 
   #markStopping(run: RunRecord, reason: string): void {
-    if (run.lifecycle === "stopping" || run.lifecycle === "closed" || run.lifecycle === "retained") return;
+    if (run.lifecycle === "stopping" || run.lifecycle === "closed") return;
     run.lifecycle = "stopping";
     run.updatedAt = this.#now();
     run.monitorController?.abort(new Error(reason));
@@ -926,7 +1197,10 @@ export class SubagentRuntime {
         }
         run.cleanup = this.#cleanupRun(run, signal, false);
       }
-      results.push(await run.cleanup);
+      const attempt = run.cleanup;
+      const result = await attempt;
+      results.push(result);
+      if (result.run.lifecycle === "retained" && run.cleanup === attempt) run.cleanup = undefined;
     }
     return results;
   }
@@ -976,40 +1250,103 @@ export class SubagentRuntime {
   async #cleanupRun(run: RunRecord, signal: AbortSignal, allowUnjournaledWorkerSessionRemoval: boolean): Promise<StopResult> {
     const retained: string[] = [];
     let partial = false;
-    let paneClosed = false;
-    try { await this.client.closePane(run.paneId, signal); paneClosed = true; }
-    catch { /* enclosing tab/worktree cleanup may still stop the child */ }
-
-    let childStopped = paneClosed;
+    let mayFinalize = true;
     let workerCleanup: WorkerCleanup | undefined;
-    if (run.worktree) {
+
+    if (!run.childStopped) {
+      try {
+        await this.client.closePane(run.paneId, signal);
+        if (!this.#persistChildStopped(run)) mayFinalize = false;
+      } catch { /* an enclosing tab/worktree cleanup may still prove the child stopped */ }
+    }
+
+    if (!mayFinalize) {
+      partial = true;
+      retained.push("journal=herdr-subagent-state");
+      if (run.worktree) retained.push(`branch=${run.worktree.branch}`, `worktree=${run.worktree.path}`);
+      else retained.push(`tab=${run.tabId}`);
+    } else if (run.worktree) {
       workerCleanup = await cleanupWorkerWorktree(this.client, run.worktree, signal, this.#gitStatus);
       retained.push(`branch=${workerCleanup.branch}`);
       if (workerCleanup.removed) {
-        childStopped = true;
+        if (!run.childStopped && !this.#persistChildStopped(run)) {
+          partial = true;
+          retained.push("journal=herdr-subagent-state");
+        }
       } else {
         partial = true;
-        if (!paneClosed) retained.unshift(`pane=${run.paneId}`);
+        if (!run.childStopped) retained.unshift(`pane=${run.paneId}`);
         retained.push(`worktree=${workerCleanup.path}`);
       }
     } else {
       try {
         await this.client.closeTab(run.tabId, signal);
-        childStopped = true;
+        if (!run.childStopped && !this.#persistChildStopped(run)) {
+          partial = true;
+          retained.push("journal=herdr-subagent-state");
+        }
       } catch {
         partial = true;
-        if (!paneClosed) retained.push(`pane=${run.paneId}`);
+        if (!run.childStopped) retained.push(`pane=${run.paneId}`);
         retained.push(`tab=${run.tabId}`);
       }
     }
 
-    if (await pathExists(run.childSessionDir)) {
-      const resultPersisted = Boolean(run.latestResult && run.generation?.resultEntryId === run.latestResult.childEntryId);
-      const mayRemove = childStopped && (!run.worktree || resultPersisted || allowUnjournaledWorkerSessionRemoval);
-      if (mayRemove) {
+    const childSessionPresent = await pathExists(run.childSessionDir);
+    const generationMayContainResult = run.generation?.artifactParentPersisted === true;
+    const resultArchived = run.generation?.artifactResultPersisted === true;
+    const sessionRemovalAuthorized = run.childStopped === true
+      && (!generationMayContainResult || resultArchived || allowUnjournaledWorkerSessionRemoval);
+    if (childSessionPresent && !sessionRemovalAuthorized) {
+      partial = true;
+      retained.push(`sessionDir=${run.childSessionDir}`);
+    }
+
+    let cleanupArtifactPersisted = true;
+    if (run.generation?.artifactParentPersisted) {
+      const state = partial
+        ? "action required"
+        : workerCleanup?.removed && workerCleanup.action === "removed"
+          ? "removed"
+          : "finalized";
+      const reason = workerCleanup && !workerCleanup.removed
+        ? workerCleanup.reason
+        : partial
+          ? run.error ?? "owned resource cleanup was incomplete"
+          : undefined;
+      try {
+        await this.#appendArtifact(run, renderCleanupSection({
+          state,
+          ...(reason ? { reason } : {}),
+          ...(retained.length ? { retained: [...retained] } : {}),
+          ...(state === "action required" ? {
+            next: `Preserve the work, make the checkout safe, then retry subagent_stop({ id: "${run.id}" }). Do not use raw Git-only removal.`,
+          } : {}),
+        }));
+      } catch (error) {
+        cleanupArtifactPersisted = false;
+        partial = true;
+        run.error = `Cleanup artifact failed: ${errorMessage(error)}`;
+        retained.push(`artifact=${run.artifactPath}`);
+      }
+    }
+
+    if (childSessionPresent) {
+      if (cleanupArtifactPersisted && sessionRemovalAuthorized) {
         try { await rm(run.childSessionDir, { recursive: true, force: true }); }
-        catch { partial = true; retained.push(`sessionDir=${run.childSessionDir}`); }
-      } else {
+        catch {
+          partial = true;
+          retained.push(`sessionDir=${run.childSessionDir}`);
+          try {
+            await this.#appendArtifact(run, renderCleanupSection({
+              state: "action required",
+              reason: "child session removal failed",
+              retained: [`sessionDir=${run.childSessionDir}`],
+              next: `Retry subagent_stop({ id: "${run.id}" }).`,
+            }));
+          } catch { /* the prior complete cleanup section remains valid */ }
+        }
+      } else if (!retained.includes(`sessionDir=${run.childSessionDir}`)) {
         partial = true;
         retained.push(`sessionDir=${run.childSessionDir}`);
       }
@@ -1031,9 +1368,23 @@ export class SubagentRuntime {
       retained: [...retained],
       ...(workerCleanup ? { workerCleanup } : {}),
     };
-    if (run.lifecycle === "closed") this.runs.delete(run.id);
+    if (run.lifecycle === "closed" && !run.archiveRecovered) this.runs.delete(run.id);
     this.#notifyRunsChanged();
     return result;
+  }
+
+  #persistChildStopped(run: RunRecord): boolean {
+    if (run.childStopped) return true;
+    run.childStopped = true;
+    run.updatedAt = this.#now();
+    try {
+      this.#record(run, "stopping");
+      return true;
+    } catch (error) {
+      run.childStopped = undefined;
+      run.error = `Child-stop milestone journal failed: ${errorMessage(error)}`;
+      return false;
+    }
   }
 
   #allResourceFacts(run: RunRecord): string[] {
@@ -1042,6 +1393,56 @@ export class SubagentRuntime {
       ...(run.worktree ? [`worktree=${run.worktree.path}`, `branch=${run.worktree.branch}`] : [`tab=${run.tabId}`]),
       `sessionDir=${run.childSessionDir}`,
     ];
+  }
+
+  async #stoppedWorkerResidueMismatch(record: HerdrStateRecord, signal: AbortSignal): Promise<string | undefined> {
+    const worktree = record.worktree;
+    if (!worktree) return "worker facts are missing";
+    if (!/^run-[A-Za-z0-9._-]+$/.test(record.runId) || record.childSessionId !== `herdr-${record.runId}`) {
+      return "run and child session IDs are not deterministic";
+    }
+    const expectedLocation = createChildSessionLocation(record.parentSessionId, record.runId, record.childCwd, this.#agentDir);
+    if (resolve(record.childSessionDir) !== resolve(expectedLocation.childSessionDir)) {
+      return "child session directory is not the deterministic owned path";
+    }
+    const expectedArtifactPath = resolveArtifactLocation({
+      agentDir: this.#agentDir,
+      parentSessionId: record.parentSessionId,
+      runId: record.runId,
+    }).path;
+    if (record.artifactPath && resolve(record.artifactPath) !== resolve(expectedArtifactPath)) {
+      return "artifact path is not the deterministic owned path";
+    }
+    if (
+      worktree.workspaceId !== record.workspaceId
+      || resolve(worktree.path) !== resolve(record.childCwd)
+      || worktree.branch !== `herdr-subagents/${record.runId}`
+      || resolve(worktree.path).split(/[\\/]/).at(-2) !== ".herdr-subagents-worktrees"
+      || resolve(worktree.path).split(/[\\/]/).at(-1) !== record.runId
+    ) return "journaled worker workspace, path, or branch identity is not exact";
+
+    let pathAbsent = false;
+    try {
+      const stats = await lstat(worktree.path);
+      if (stats.isSymbolicLink()) return "worker checkout path is a symbolic link";
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") pathAbsent = true;
+      else return `worker checkout path could not be checked (${errorMessage(error)})`;
+    }
+
+    try {
+      const workspace = await this.client.getWorkspace(worktree.workspaceId, signal);
+      if (
+        workspace.workspaceId !== worktree.workspaceId
+        || workspace.worktree === null
+        || workspace.worktree.isLinkedWorktree !== true
+        || resolve(workspace.worktree.checkoutPath) !== resolve(worktree.path)
+      ) return "current Herdr workspace does not exactly match the linked worker checkout";
+    } catch (error) {
+      if (error instanceof HerdrError && error.code === "workspace_not_found" && pathAbsent) return undefined;
+      return `current Herdr workspace could not be proven (${errorMessage(error)})`;
+    }
+    return undefined;
   }
 
   async #residueMismatch(record: HerdrStateRecord, signal: AbortSignal): Promise<string | undefined> {
@@ -1056,6 +1457,14 @@ export class SubagentRuntime {
     );
     if (resolve(record.childSessionDir) !== resolve(expectedLocation.childSessionDir)) {
       return "child session directory is not the deterministic owned path";
+    }
+    const expectedArtifactPath = resolveArtifactLocation({
+      agentDir: this.#agentDir,
+      parentSessionId: record.parentSessionId,
+      runId: record.runId,
+    }).path;
+    if (record.artifactPath && resolve(record.artifactPath) !== resolve(expectedArtifactPath)) {
+      return "artifact path is not the deterministic owned path";
     }
     let agent: AgentInfo;
     try {
@@ -1088,6 +1497,8 @@ export class SubagentRuntime {
       delivery: record.generation.delivery,
       blockingWaiter: false,
       ...(record.generation.returned ? { returned: true } : {}),
+      ...(record.generation.artifactParentPersisted ? { artifactParentPersisted: true } : {}),
+      ...(record.generation.artifactResultPersisted ? { artifactResultPersisted: true } : {}),
     } satisfies Generation : undefined;
     const latestResult = generation && replay.readyGenerations.has(generation.number) ? replay.latestResult : undefined;
     return {
@@ -1099,6 +1510,11 @@ export class SubagentRuntime {
       childSessionDir: record.childSessionDir,
       ...(record.childSessionPath ? { childSessionPath: record.childSessionPath } : {}),
       childCwd: record.childCwd,
+      artifactPath: record.artifactPath ?? resolveArtifactLocation({
+        agentDir: this.#agentDir,
+        parentSessionId: record.parentSessionId,
+        runId: record.runId,
+      }).path,
       terminalId: record.terminalId,
       paneId: record.paneId,
       tabId: record.tabId,
@@ -1115,6 +1531,8 @@ export class SubagentRuntime {
       status: "unknown",
       createdAt: record.at,
       updatedAt: this.#now(),
+      ...(replay.childStopped ? { childStopped: true } : {}),
+      ...(record.archivePending ? { archivePending: true } : {}),
       ...(record.error ? { error: record.error } : {}),
     };
   }

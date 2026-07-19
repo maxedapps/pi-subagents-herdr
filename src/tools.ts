@@ -74,7 +74,7 @@ export function registerSubagentTools(pi: ExtensionAPI, runtime: SubagentRuntime
   pi.registerTool({
     name: "subagent_start",
     label: "Start subagent",
-    description: "Start one visible fixed-profile Pi subagent. Background is the default; wait:true returns its structured result directly.",
+    description: "Start one visible fixed-profile Pi subagent. Background is the default; wait:true returns its structured result and automatic artifact path directly.",
     parameters: startSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       return result(await runtime.start(
@@ -89,7 +89,7 @@ export function registerSubagentTools(pi: ExtensionAPI, runtime: SubagentRuntime
   pi.registerTool({
     name: "subagent_status",
     label: "Subagent status",
-    description: "List current-parent runs or return one run's lifecycle, generation, structured result, and retained-resource facts.",
+    description: "List current-parent runs or return one run's lifecycle, generation, artifact, structured result, and retained-resource facts.",
     parameters: statusSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const request = runtime.requestFor({
@@ -118,7 +118,7 @@ export function registerSubagentTools(pi: ExtensionAPI, runtime: SubagentRuntime
   pi.registerTool({
     name: "subagent_stop",
     label: "Stop subagent",
-    description: "Stop a current-parent run and report exactly which owned resources were removed or retained.",
+    description: "Stop or retry finalization for a current-parent run and report its artifact plus exactly which owned resources were removed or retained.",
     parameters: idSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       return result(await runtime.stop(params.id, runtime.requestFor({

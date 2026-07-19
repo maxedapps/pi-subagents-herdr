@@ -1,15 +1,26 @@
 import { getAgentDir, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
+import { readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { resolveArtifactDirectory } from "../../src/artifact.ts";
 import { SocketHerdrClient } from "../../src/herdr.ts";
-import { SubagentRuntime, type Run } from "../../src/runtime.ts";
+import { SubagentRuntime, type Run, type StopResult } from "../../src/runtime.ts";
 import { registerSubagentTools } from "../../src/tools.ts";
 
 const skillPath = fileURLToPath(new URL("../../skills/use-herdr-subagents/SKILL.md", import.meta.url));
 const WIDGET_KEY = "herdr-subagents";
 const PROFILE_WIDTH = 10;
 const noRefresh = () => {};
+
+async function hasRunArtifacts(directory: string): Promise<boolean> {
+  try {
+    return (await readdir(directory, { withFileTypes: true }))
+      .some((entry) => entry.isFile() && entry.name.endsWith(".md"));
+  } catch {
+    return false;
+  }
+}
 
 type WidgetTone = "accent" | "success" | "warning" | "error" | "muted";
 
@@ -42,6 +53,35 @@ function phase(run: Run): { label: string; tone: WidgetTone } {
   if (run.status === "blocked") return { label: "blocked", tone: "warning" };
   if (run.status === "working") return { label: "working", tone: "accent" };
   return { label: "waiting for result", tone: "muted" };
+}
+
+export function retainedCleanupAction(result: StopResult) {
+  const { run, workerCleanup } = result;
+  if (run.lifecycle !== "retained" || !run.worktree) return undefined;
+  const reason = workerCleanup && !workerCleanup.removed
+    ? workerCleanup.reason
+    : run.error ?? "owned worker cleanup was incomplete";
+  return {
+    customType: "herdr-subagent-action" as const,
+    content: [
+      `Run ${run.id} cleanup requires action.`,
+      `Worktree: ${run.worktree.path}`,
+      `Branch: ${run.worktree.branch}`,
+      `Workspace: ${run.worktree.workspaceId}`,
+      `Reason: ${reason}`,
+      `Artifact: ${run.artifactPath}`,
+      `Retry: subagent_stop({ id: "${run.id}" })`,
+      "Do not use raw Git-only worktree removal; preserve the work and retry through the extension.",
+    ].join("\n"),
+    display: true,
+    details: {
+      parentSessionId: run.parentSessionId,
+      runId: run.id,
+      artifactPath: run.artifactPath,
+      worktree: { ...run.worktree },
+      reason,
+    },
+  };
 }
 
 export function presentSubagentWidget(runs: readonly Run[]): WidgetPresentation | undefined {
@@ -109,6 +149,9 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
   const parentInstanceId = randomUUID();
   let refreshWidget: () => void = noRefresh;
   let refreshOwner: object | undefined;
+  let reminderSessionId: string | undefined;
+  let reminderDirectory: string | undefined;
+  let reminderPending = false;
   const runtime = new SubagentRuntime(
     new SocketHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH ?? "" }),
     {
@@ -124,6 +167,9 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
       deliverResult(message) {
         pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true });
       },
+      deliverAction(message) {
+        pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true });
+      },
       onRunsChanged() {
         refreshWidget();
       },
@@ -135,11 +181,18 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
   pi.on("session_start", async (event, ctx) => {
     refreshWidget = noRefresh;
     refreshOwner = undefined;
+    reminderPending = false;
+    reminderSessionId = ctx.sessionManager.getSessionId();
+    reminderDirectory = resolveArtifactDirectory(getAgentDir(), reminderSessionId);
     const diagnostics = await runtime.bindParent({
       parentSessionId: ctx.sessionManager.getSessionId(),
       parentSessionFile: ctx.sessionManager.getSessionFile(),
       parentEntryId: ctx.sessionManager.getLeafId(),
     }, ctx.sessionManager.getBranch(), event.reason);
+    if (ctx.sessionManager.getBranch().some((entry) => entry.type === "compaction")
+      && await hasRunArtifacts(reminderDirectory)) {
+      reminderPending = true;
+    }
     if (ctx.hasUI) {
       const sessionManager = ctx.sessionManager;
       const ui = ctx.ui;
@@ -162,6 +215,25 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
       for (const diagnostic of diagnostics) ui.notify(diagnostic.message, diagnostic.outcome === "closed" || diagnostic.outcome === "cleaned" ? "info" : "warning");
     }
   });
+  pi.on("session_compact", async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (sessionId !== reminderSessionId || !reminderDirectory) return;
+    reminderPending = await hasRunArtifacts(reminderDirectory);
+  });
+  pi.on("context", (event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (!reminderPending || sessionId !== reminderSessionId || !reminderDirectory) return;
+    reminderPending = false;
+    return {
+      messages: [...event.messages, {
+        role: "custom" as const,
+        customType: "herdr-subagent-artifact-reminder",
+        content: `Exact subagent exchanges remain under ${reminderDirectory}. List or read the relevant run file before relying on compacted subagent details.`,
+        display: false,
+        timestamp: Date.now(),
+      }],
+    };
+  });
   pi.on("message_end", (event, ctx) => {
     runtime.requestFor({
       parentSessionId: ctx.sessionManager.getSessionId(),
@@ -171,11 +243,15 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
     runtime.confirmDelivery(event.message);
   });
   pi.on("agent_settled", async (_event, ctx) => {
-    await runtime.settle(runtime.requestFor({
+    const results = await runtime.settle(runtime.requestFor({
       parentSessionId: ctx.sessionManager.getSessionId(),
       parentSessionFile: ctx.sessionManager.getSessionFile(),
       parentEntryId: ctx.sessionManager.getLeafId(),
     }));
+    for (const result of results) {
+      const action = retainedCleanupAction(result);
+      if (action) pi.sendMessage(action, { deliverAs: "steer", triggerTurn: true });
+    }
   });
   pi.on("session_before_tree", (_event, ctx) => {
     const request = runtime.requestFor({
@@ -201,6 +277,11 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
       if (ownsRefresh && refreshWidget === currentRefresh) {
         refreshWidget = noRefresh;
         refreshOwner = undefined;
+      }
+      if (reminderSessionId === sessionManager.getSessionId()) {
+        reminderPending = false;
+        reminderSessionId = undefined;
+        reminderDirectory = undefined;
       }
     }
   });

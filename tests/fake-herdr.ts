@@ -6,6 +6,7 @@ import type {
   CreatedWorktree,
   HerdrClient,
   JsonRecord,
+  WorkspaceInfo,
 } from "../src/herdr.ts";
 
 export interface Call {
@@ -25,10 +26,19 @@ export class FakeHerdr implements HerdrClient {
   failClosePane = false;
   failCloseTab = false;
   failRemoveWorktree = false;
+  failGetWorkspace?: Error;
+  failCloseWorkspace = false;
   failSendInput = false;
   hangGetAgent = false;
   onSendInput?: (paneId: string, text: string) => void | Promise<void>;
   agent?: AgentInfo;
+  workspace: WorkspaceInfo = {
+    workspaceId: "w-worker",
+    worktree: {
+      checkoutPath: "/repo/.herdr-subagents-worktrees/run-worker",
+      isLinkedWorktree: true,
+    },
+  };
 
   async createTab(input: JsonRecord, signal?: AbortSignal): Promise<CreatedTab> {
     this.calls.push({ method: "tab.create", input, signal });
@@ -107,6 +117,20 @@ export class FakeHerdr implements HerdrClient {
   async removeWorktree(workspaceId: string, signal?: AbortSignal): Promise<void> {
     this.calls.push({ method: "worktree.remove", input: { workspaceId, force: false }, signal });
     if (this.failRemoveWorktree) throw new Error("remove failed");
+  }
+
+  async getWorkspace(workspaceId: string, signal?: AbortSignal): Promise<WorkspaceInfo> {
+    this.calls.push({ method: "workspace.get", input: { workspaceId }, signal });
+    if (this.failGetWorkspace) throw this.failGetWorkspace;
+    return {
+      ...this.workspace,
+      worktree: this.workspace.worktree ? { ...this.workspace.worktree } : null,
+    };
+  }
+
+  async closeWorkspace(workspaceId: string, signal?: AbortSignal): Promise<void> {
+    this.calls.push({ method: "workspace.close", input: { workspaceId }, signal });
+    if (this.failCloseWorkspace) throw new Error("workspace close failed");
   }
 
   private copyAgent(): AgentInfo {
