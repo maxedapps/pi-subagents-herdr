@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { PROFILES } from "../src/profiles.ts";
-import { SubagentRuntime, type ResultDelivery } from "../src/runtime.ts";
+import { SubagentRuntime, type ResultDelivery, type RuntimeOptions } from "../src/runtime.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
 
 const parentSessionId = "parent-session";
@@ -57,22 +57,38 @@ async function eventually(check: () => boolean, timeoutMs = 500): Promise<void> 
   }
 }
 
+function observableSnapshot(runtime: SubagentRuntime): string[] {
+  return runtime.list().map((run) => [
+    run.id,
+    run.lifecycle,
+    run.status,
+    run.generation ? `g${run.generation.number}:${run.generation.delivery}` : "no-generation",
+    run.retained?.join("|") ?? "",
+  ].join("/"));
+}
+
 async function fixture(
   run: (client: FakeHerdr, runtime: SubagentRuntime, deliveries: ResultDelivery[], agentDir: string) => Promise<void>,
   ids: string[] = ["run-reader"],
+  options: {
+    appendState?: NonNullable<RuntimeOptions["appendState"]>;
+    onRunsChanged?: (runtime: SubagentRuntime) => void;
+  } = {},
 ): Promise<void> {
   const agentDir = await mkdtemp(join(tmpdir(), "runtime-agent-"));
   const client = new FakeHerdr();
   const deliveries: ResultDelivery[] = [];
-  const runtime = new SubagentRuntime(client, { workspaceId: "w-parent", agentDir }, {
+  let runtime!: SubagentRuntime;
+  runtime = new SubagentRuntime(client, { workspaceId: "w-parent", agentDir }, {
     idFactory: () => ids.shift() ?? "run-extra",
     instanceIdFactory: () => "instance-current",
     readinessTimeoutMs: 30,
     pollIntervalMs: 1,
     cleanupTimeoutMs: 30,
     gitStatus: async () => "",
-    appendState: () => {},
+    appendState: options.appendState ?? (() => {}),
     deliverResult: (message) => deliveries.push(message),
+    onRunsChanged: () => options.onRunsChanged?.(runtime),
   });
   await runtime.bindParent({
     parentSessionId,
@@ -118,6 +134,116 @@ test("background start launches a deterministic persistent child and steers one 
     assert.equal(runtime.confirmDelivery({ role: "custom", customType: delivered.customType, details: { ...delivered.details, generation: 2 } }), false);
     assert.equal(runtime.confirmDelivery({ role: "custom", customType: delivered.customType, details: delivered.details }), true);
     assert.equal(runtime.status("run-reader").generation?.delivery, "delivered");
+  });
+});
+
+test("run notifications expose journaled snapshots and suppress unchanged monitor polls", async () => {
+  const changes: string[][] = [];
+  await fixture(async (client, runtime, deliveries) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("scout", "inspect this", "/repo");
+    await eventually(() => client.calls.filter(({ method }) => method === "agent.get").length >= 5);
+    assert.deepEqual(changes, [
+      ["run-reader/starting/working/no-generation/"],
+      ["run-reader/starting/idle/no-generation/"],
+      ["run-reader/live/idle/g1:pending/"],
+    ]);
+
+    await appendResult(client, ["complete"]);
+    await eventually(() => deliveries.length === 1);
+    assert.deepEqual(changes.slice(-2), [
+      ["run-reader/live/idle/g1:ready/"],
+      ["run-reader/live/idle/g1:queued/"],
+    ]);
+
+    const delivery = deliveries[0]!;
+    assert.equal(runtime.confirmDelivery({ role: "custom", ...delivery }), true);
+    assert.deepEqual(changes.at(-1), ["run-reader/live/idle/g1:delivered/"]);
+
+    await runtime.send(started.id, "follow up");
+    assert.deepEqual(changes.at(-1), ["run-reader/live/idle/g2:pending/"]);
+    const stopped = await runtime.stop(started.id);
+    assert.equal(stopped.run.lifecycle, "closed");
+    assert.deepEqual(changes.slice(-2), [
+      ["run-reader/stopping/idle/g2:pending/"],
+      [],
+    ]);
+  }, ["run-reader"], {
+    onRunsChanged: (runtime) => changes.push(observableSnapshot(runtime)),
+  });
+});
+
+test("throwing run notifications cannot break start, result delivery, or explicit stop", async () => {
+  await fixture(async (client, runtime, deliveries) => {
+    client.statuses = ["idle"];
+    client.onSendInput = async () => { await appendResult(client, ["answer"]); };
+    const started = await runtime.start("scout", "task", "/repo");
+    await eventually(() => deliveries.length === 1);
+    assert.equal(runtime.confirmDelivery({ role: "custom", ...deliveries[0]! }), true);
+    assert.equal(runtime.status(started.id).generation?.delivery, "delivered");
+    const stopped = await runtime.stop(started.id);
+    assert.equal(stopped.run.lifecycle, "closed");
+    assert.deepEqual(runtime.list(), []);
+  }, ["run-reader"], {
+    onRunsChanged: () => { throw new Error("widget failed"); },
+  });
+});
+
+test("journal failures suppress ordinary phases and notify only finalized fallback state", async (context) => {
+  await context.test("startup insertion", async () => {
+    const changes: string[][] = [];
+    await fixture(async (_client, runtime) => {
+      await assert.rejects(runtime.start("scout", "task", "/repo"), /journal failed/);
+      assert.deepEqual(changes, [[
+        "run-reader/retained/working/no-generation/journal=herdr-subagent-state",
+      ]]);
+      assert.equal(runtime.status("run-reader").error, "Cleanup journal failed: journal failed");
+    }, ["run-reader"], {
+      appendState: () => { throw new Error("journal failed"); },
+      onRunsChanged: (runtime) => changes.push(observableSnapshot(runtime)),
+    });
+  });
+
+  await context.test("monitor result", async () => {
+    const changes: string[][] = [];
+    await fixture(async (client, runtime, deliveries) => {
+      client.statuses = ["idle"];
+      const started = await runtime.start("scout", "task", "/repo");
+      changes.length = 0;
+      await appendResult(client, ["answer"]);
+      await eventually(() => runtime.status(started.id).lifecycle === "retained");
+      assert.deepEqual(changes, [[
+        "run-reader/retained/idle/g1:ready/pane=w-parent:p-child|tab=w-parent:t-reader|sessionDir="
+          + started.childSessionDir,
+      ]]);
+      assert.deepEqual(deliveries, []);
+    }, ["run-reader"], {
+      appendState: (_customType, record) => {
+        if (record.state === "result_ready") throw new Error("result journal failed");
+      },
+      onRunsChanged: (runtime) => changes.push(observableSnapshot(runtime)),
+    });
+  });
+
+  await context.test("closed cleanup", async () => {
+    const changes: string[][] = [];
+    await fixture(async (client, runtime) => {
+      client.statuses = ["idle"];
+      const started = await runtime.start("scout", "task", "/repo");
+      changes.length = 0;
+      const stopped = await runtime.stop(started.id);
+      assert.equal(stopped.run.lifecycle, "retained");
+      assert.deepEqual(changes, [
+        ["run-reader/stopping/idle/g1:pending/"],
+        ["run-reader/retained/idle/g1:pending/journal=herdr-subagent-state"],
+      ]);
+      assert.equal(runtime.list()[0]?.lifecycle, "retained");
+    }, ["run-reader"], {
+      appendState: (_customType, record) => {
+        if (record.state === "closed") throw new Error("cleanup journal failed");
+      },
+      onRunsChanged: (runtime) => changes.push(observableSnapshot(runtime)),
+    });
   });
 });
 

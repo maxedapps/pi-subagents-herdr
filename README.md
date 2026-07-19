@@ -39,6 +39,12 @@ With `wait:true`, the same complete structured result is returned directly and i
 
 Use `subagent_status` for lifecycle, generation, delivery, child-session, worktree, and retained-resource facts. Polling is not required for result delivery. A follow-up may be sent only after the previous generation was delivered or returned; it reuses the same child session with a fresh branch cursor. To continue after an automatic result, send the follow-up during the result-triggered parent turn before settlement cleanup becomes eligible.
 
+## Current-session widget
+
+In Pi’s interactive UI, the extension automatically shows a compact `Subagents` widget above the editor while the current parent session owns visible runs. Each row contains only the profile, shortened run ID, optional generation number, and textual phase. The widget preserves run order and uses at most six lines, summarizing overflow as `+N more`.
+
+Active and retained counts are separate. A `retained` row is a terminal warning that resources need manual attention; it is not counted as active. The widget hides when no rows remain and clears during session shutdown or reload. Use `subagent_status` for full IDs, errors, child-session, worktree, branch, and retained-resource details.
+
 ## Parent ownership and lifecycle
 
 Each meaningful transition is stored as a compact `herdr-subagent-state` custom entry on the active parent branch. These entries do not enter model context. Ownership includes the parent session ID/file/leaf, extension instance ID, PID, run and child session IDs, and exact Herdr topology.

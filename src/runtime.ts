@@ -138,6 +138,7 @@ export interface RuntimeOptions {
   gitStatus?: GitStatus;
   appendState?: (customType: typeof HERDR_STATE_CUSTOM_TYPE, record: HerdrStateRecord) => void;
   deliverResult?: (message: ResultDelivery) => void;
+  onRunsChanged?: () => void;
   isProcessAlive?: (pid: number) => boolean;
   now?: () => number;
 }
@@ -269,6 +270,7 @@ export class SubagentRuntime {
   readonly #gitStatus?: GitStatus;
   readonly #appendState?: RuntimeOptions["appendState"];
   readonly #deliverResult?: (message: ResultDelivery) => void;
+  readonly #onRunsChanged?: () => void;
   readonly #isProcessAlive: (pid: number) => boolean;
   readonly #now: () => number;
   #parent?: BoundParent;
@@ -291,6 +293,7 @@ export class SubagentRuntime {
     this.#gitStatus = options.gitStatus;
     this.#appendState = options.appendState;
     this.#deliverResult = options.deliverResult;
+    this.#onRunsChanged = options.onRunsChanged;
     this.#isProcessAlive = options.isProcessAlive ?? processIsAlive;
     this.#now = options.now ?? Date.now;
   }
@@ -508,6 +511,7 @@ export class SubagentRuntime {
       run.warning = workerWarning(run);
       this.runs.set(id, run);
       this.#record(run, "starting");
+      this.#notifyRunsChanged();
 
       const deadline = this.#now() + this.#readinessTimeoutMs;
       while (true) {
@@ -528,6 +532,7 @@ export class SubagentRuntime {
       run.updatedAt = this.#now();
       this.#record(run, "live");
       this.#record(run, "generation_pending");
+      this.#notifyRunsChanged();
       this.#prepareCompletion(run);
       inputAttempted = true;
       try {
@@ -546,7 +551,10 @@ export class SubagentRuntime {
       if (run) {
         run.lifecycle = "stopping";
         run.monitorController?.abort(new Error(`Startup failed: ${run.id}`));
-        try { this.#record(run, "stopping"); } catch { /* preserve the original startup error */ }
+        try {
+          this.#record(run, "stopping");
+          this.#notifyRunsChanged();
+        } catch { /* preserve the original startup error */ }
         const signal = AbortSignal.timeout(this.#cleanupTimeoutMs);
         const stopped = await this.#cleanupRun(run, signal, true);
         retained = stopped.retained;
@@ -585,6 +593,7 @@ export class SubagentRuntime {
     run.error = undefined;
     run.updatedAt = this.#now();
     this.#record(run, "generation_pending");
+    this.#notifyRunsChanged();
     this.#prepareCompletion(run);
     try {
       await this.client.sendInput(run.paneId, input, request.signal);
@@ -657,6 +666,7 @@ export class SubagentRuntime {
     generation.delivery = "delivered";
     run.updatedAt = this.#now();
     this.#record(run, "result_delivered");
+    this.#notifyRunsChanged();
     this.#deliverySinceSettlement = true;
     return true;
   }
@@ -732,6 +742,10 @@ export class SubagentRuntime {
     this.#appendState(HERDR_STATE_CUSTOM_TYPE, record);
   }
 
+  #notifyRunsChanged(): void {
+    try { this.#onRunsChanged?.(); } catch { /* presentation invalidation must not affect runtime behavior */ }
+  }
+
   #prepareCompletion(run: RunRecord): void {
     run.completion = new Promise((resolvePromise) => { run.complete = resolvePromise; });
   }
@@ -766,10 +780,12 @@ export class SubagentRuntime {
           run.error = undefined;
           run.updatedAt = this.#now();
           this.#record(run, "result_ready");
+          this.#notifyRunsChanged();
           if (generation.blockingWaiter) {
             generation.delivery = "delivered";
             generation.returned = true;
             this.#record(run, "result_delivered");
+            this.#notifyRunsChanged();
             this.#deliverySinceSettlement = true;
             run.complete?.({ result: run.latestResult });
           } else {
@@ -789,6 +805,7 @@ export class SubagentRuntime {
       run.retained = this.#allResourceFacts(run);
       run.updatedAt = this.#now();
       try { this.#record(run, "retained"); } catch { /* expose the monitor error through status */ }
+      this.#notifyRunsChanged();
       run.complete?.({ error: failure });
     }
   }
@@ -798,6 +815,7 @@ export class SubagentRuntime {
     generation.delivery = "queued";
     run.updatedAt = this.#now();
     this.#record(run, "result_queued");
+    this.#notifyRunsChanged();
     const details: ResultDetails = {
       parentSessionId: run.parentSessionId,
       runId: run.id,
@@ -864,12 +882,14 @@ export class SubagentRuntime {
   }
 
   #updateRun(run: RunRecord, agent: AgentInfo): void {
+    const statusChanged = run.status !== agent.status;
     run.terminalId = agent.terminalId;
     run.paneId = agent.paneId;
     run.tabId = agent.tabId;
     run.workspaceId = agent.workspaceId;
     run.status = agent.status;
     run.updatedAt = this.#now();
+    if (statusChanged) this.#notifyRunsChanged();
   }
 
   #markStopping(run: RunRecord, reason: string): void {
@@ -878,22 +898,34 @@ export class SubagentRuntime {
     run.updatedAt = this.#now();
     run.monitorController?.abort(new Error(reason));
     this.#record(run, "stopping");
+    this.#notifyRunsChanged();
   }
 
   async #cleanupMany(runs: RunRecord[], reason: string): Promise<readonly StopResult[]> {
-    for (const run of runs) {
-      if (run.lifecycle === "stopping" || run.lifecycle === "closed" || run.lifecycle === "retained") continue;
-      run.lifecycle = "stopping";
-      run.updatedAt = this.#now();
-      run.monitorController?.abort(new Error(reason));
-    }
-    for (const run of runs) {
-      if (run.lifecycle === "stopping" && !run.cleanup) this.#record(run, "stopping");
-    }
+    for (const run of runs) run.monitorController?.abort(new Error(reason));
+
     const signal = AbortSignal.timeout(this.#cleanupTimeoutMs);
     const results: StopResult[] = [];
     for (const run of runs) {
-      if (!run.cleanup) run.cleanup = this.#cleanupRun(run, signal, false);
+      if (!run.cleanup) {
+        const previousLifecycle = run.lifecycle;
+        const previousUpdatedAt = run.updatedAt;
+        const changedToStopping = run.lifecycle !== "stopping" && run.lifecycle !== "closed" && run.lifecycle !== "retained";
+        if (changedToStopping) {
+          run.lifecycle = "stopping";
+          run.updatedAt = this.#now();
+        }
+        try {
+          this.#record(run, "stopping");
+          this.#notifyRunsChanged();
+        } catch {
+          if (changedToStopping) {
+            run.lifecycle = previousLifecycle;
+            run.updatedAt = previousUpdatedAt;
+          }
+        }
+        run.cleanup = this.#cleanupRun(run, signal, false);
+      }
       results.push(await run.cleanup);
     }
     return results;
@@ -1000,6 +1032,7 @@ export class SubagentRuntime {
       ...(workerCleanup ? { workerCleanup } : {}),
     };
     if (run.lifecycle === "closed") this.runs.delete(run.id);
+    this.#notifyRunsChanged();
     return result;
   }
 

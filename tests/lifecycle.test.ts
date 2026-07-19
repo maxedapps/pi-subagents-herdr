@@ -6,7 +6,7 @@ import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SubagentRuntime, type ResultDelivery } from "../src/runtime.ts";
+import { SubagentRuntime, type ResultDelivery, type RuntimeOptions } from "../src/runtime.ts";
 import { HERDR_STATE_CUSTOM_TYPE, type HerdrStateRecord } from "../src/session.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
 
@@ -92,19 +92,25 @@ function runtimeFor(
     instanceId?: string;
     processId?: number;
     isProcessAlive?: (pid: number) => boolean;
+    onRunsChanged?: () => void;
+    appendState?: NonNullable<RuntimeOptions["appendState"]>;
+    ids?: string[];
   } = {},
 ): SubagentRuntime {
+  const ids = [...(options.ids ?? ["run-lifecycle"])];
   return new SubagentRuntime(client, { workspaceId: "w-parent", agentDir: parent.agentDir }, {
-    idFactory: () => "run-lifecycle",
+    idFactory: () => ids.shift() ?? "run-lifecycle-extra",
     instanceIdFactory: () => options.instanceId ?? "instance-current",
     parentProcessId: options.processId ?? 200,
     readinessTimeoutMs: 40,
     pollIntervalMs: 1,
     cleanupTimeoutMs: 40,
     gitStatus: async () => "",
-    appendState: (customType, record) => { parent.manager.appendCustomEntry(customType, record); },
+    appendState: options.appendState
+      ?? ((customType, record) => { parent.manager.appendCustomEntry(customType, record); }),
     deliverResult: (message) => options.deliveries?.push(message),
     isProcessAlive: options.isProcessAlive,
+    onRunsChanged: options.onRunsChanged,
   });
 }
 
@@ -329,7 +335,15 @@ test("settlement waits for delivery confirmation, blocks tree while open, and re
     const deliveries: ResultDelivery[] = [];
     const client = new FakeHerdr();
     client.statuses = ["idle"];
-    const runtime = runtimeFor(parent, client, { deliveries });
+    const changes: string[][] = [];
+    let runtime!: SubagentRuntime;
+    runtime = runtimeFor(parent, client, {
+      deliveries,
+      onRunsChanged: () => {
+        changes.push(runtime.list().map(({ lifecycle }) => lifecycle));
+        throw new Error("widget failed");
+      },
+    });
     await bind(runtime, parent);
     const started = await runtime.start("scout", "slow", parent.root);
     const request = runtime.requestFor({
@@ -349,14 +363,88 @@ test("settlement waits for delivery confirmation, blocks tree while open, and re
     assert.equal(runtime.confirmDelivery({ role: "custom", ...delivery }), true);
 
     client.failCloseTab = true;
+    changes.length = 0;
     const [settled] = await runtime.settle(request);
     assert.equal(settled?.run.lifecycle, "retained");
     assert.equal(settled?.retained.includes(`tab=${started.tabId}`), true);
     assert.equal(runtime.hasOpenRuns(request), false);
     assert.equal(records(parent.manager).at(-1)?.state, "retained");
+    assert.deepEqual(changes, [["stopping"], ["retained"]]);
     const destructiveCalls = client.calls.filter(({ method }) => method === "pane.close" || method === "tab.close").length;
     assert.deepEqual(await runtime.shutdown("quit"), []);
     assert.equal(client.calls.filter(({ method }) => method === "pane.close" || method === "tab.close").length, destructiveCalls);
+  } finally {
+    await rm(parent.root, { recursive: true, force: true });
+  }
+});
+
+test("bulk settlement cleans every run when one stopping journal write fails", async () => {
+  const parent = await createParent();
+  try {
+    const client = new FakeHerdr();
+    const changes: string[][] = [];
+    let failedStopping = false;
+    let runtime!: SubagentRuntime;
+    runtime = runtimeFor(parent, client, {
+      ids: ["run-one", "run-two"],
+      appendState: (customType, record) => {
+        if (record.state === "stopping" && record.runId === "run-one" && !failedStopping) {
+          failedStopping = true;
+          throw new Error("stopping journal failed");
+        }
+        parent.manager.appendCustomEntry(customType, record);
+      },
+      onRunsChanged: () => {
+        changes.push(runtime.list().map(({ id, lifecycle }) => `${id}:${lifecycle}`));
+        throw new Error("widget failed");
+      },
+    });
+    await bind(runtime, parent);
+
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => appendChildResult(client, "first");
+    await runtime.start("scout", "one", parent.root, { wait: true, timeoutMs: 100 });
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => appendChildResult(client, "second");
+    await runtime.start("researcher", "two", parent.root, { wait: true, timeoutMs: 100 });
+
+    const request = runtime.requestFor({
+      parentSessionId: "parent-session",
+      parentSessionFile: parent.parentSessionFile,
+      parentEntryId: parent.parentEntryId,
+    });
+    changes.length = 0;
+    const monitorSignals = client.calls
+      .filter(({ method }) => method === "agent.get")
+      .map(({ signal }) => signal);
+    const cleanupStart = client.calls.length;
+    const settled = await runtime.settle(request);
+
+    assert.equal(failedStopping, true);
+    assert.equal(monitorSignals.filter((signal) => signal?.aborted).length >= 2, true);
+    assert.deepEqual(settled.map(({ run }) => [run.id, run.lifecycle]), [
+      ["run-one", "closed"],
+      ["run-two", "closed"],
+    ]);
+    assert.deepEqual(changes, [
+      ["run-two:live"],
+      ["run-two:stopping"],
+      [],
+    ]);
+    assert.deepEqual(runtime.list(), []);
+    const cleanup = client.calls.slice(cleanupStart)
+      .filter(({ method }) => method === "pane.close" || method === "tab.close");
+    assert.deepEqual(cleanup.map(({ method }) => method), [
+      "pane.close", "tab.close", "pane.close", "tab.close",
+    ]);
+    assert.equal(cleanup.every(({ signal }) => signal === cleanup[0]?.signal), true);
+    assert.deepEqual(records(parent.manager)
+      .filter(({ state }) => state === "stopping" || state === "closed")
+      .map(({ runId, state }) => `${runId}:${state}`), [
+      "run-one:closed",
+      "run-two:stopping",
+      "run-two:closed",
+    ]);
   } finally {
     await rm(parent.root, { recursive: true, force: true });
   }
@@ -368,11 +456,20 @@ test("every shutdown reason aborts monitors before one fresh bounded reader clea
     try {
       const client = new FakeHerdr();
       client.statuses = ["idle"];
-      const runtime = runtimeFor(parent, client, { instanceId: `instance-${reason}` });
+      const changes: string[][] = [];
+      let runtime!: SubagentRuntime;
+      runtime = runtimeFor(parent, client, {
+        instanceId: `instance-${reason}`,
+        onRunsChanged: () => {
+          changes.push(runtime.list().map(({ lifecycle }) => lifecycle));
+          throw new Error("widget failed");
+        },
+      });
       await bind(runtime, parent);
       await runtime.start("scout", "pending", parent.root);
       await eventually(() => client.calls.filter(({ method }) => method === "agent.get").length >= 2);
       const monitorSignals = client.calls.filter(({ method }) => method === "agent.get").map(({ signal }) => signal);
+      changes.length = 0;
       const [stopped] = await runtime.shutdown(reason);
       assert.equal(stopped?.run.lifecycle, "closed", reason);
       assert.equal(monitorSignals.some((signal) => signal?.aborted), true, reason);
@@ -381,6 +478,7 @@ test("every shutdown reason aborts monitors before one fresh bounded reader clea
       assert.equal(cleanup[0]?.signal, cleanup[1]?.signal);
       assert.equal(monitorSignals.includes(cleanup[0]?.signal), false);
       assert.deepEqual(records(parent.manager).slice(-2).map(({ state }) => state), ["stopping", "closed"]);
+      assert.deepEqual(changes, [["stopping"], []], reason);
     } finally {
       await rm(parent.root, { recursive: true, force: true });
     }
