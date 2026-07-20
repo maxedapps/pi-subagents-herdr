@@ -7,8 +7,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { appendArtifactSection } from "../src/artifact.ts";
+import { HerdrError, HerdrSubscriptionTransportError } from "../src/herdr.ts";
 import { PROFILES } from "../src/profiles.ts";
 import { SubagentRuntime, type ActionDelivery, type ResultDelivery, type RuntimeOptions } from "../src/runtime.ts";
+import type { ChildSessionObservation } from "../src/session.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
 
 const parentSessionId = "parent-session";
@@ -58,6 +60,59 @@ async function eventually(check: () => boolean, timeoutMs = 500): Promise<void> 
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
+function controlledDelay() {
+  const requested: number[] = [];
+  const waits: Array<{ ms: number; release: () => void; settled: boolean }> = [];
+  return {
+    requested,
+    waits,
+    sleep(ms: number, signal: AbortSignal): Promise<void> {
+      requested.push(ms);
+      return new Promise((resolve, reject) => {
+        const wait = {
+          ms,
+          settled: false,
+          release: () => {
+            if (wait.settled) return;
+            wait.settled = true;
+            signal.removeEventListener("abort", abort);
+            resolve();
+          },
+        };
+        const abort = () => {
+          if (wait.settled) return;
+          wait.settled = true;
+          signal.removeEventListener("abort", abort);
+          reject(signal.reason);
+        };
+        waits.push(wait);
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      });
+    },
+    release(ms: number): void {
+      const wait = waits.find((candidate) => candidate.ms === ms && !candidate.settled);
+      assert.ok(wait, `missing pending ${ms}ms delay`);
+      wait.release();
+    },
+  };
+}
+
+function observation(id: string, leaf = id, compaction?: string): ChildSessionObservation {
+  return {
+    childSessionPath: `/tmp/${id}.jsonl`,
+    activeLeafId: leaf,
+    ...(compaction ? { latestCompactionId: compaction } : {}),
+    result: { childEntryId: id, text: `result ${id}`, message: assistant([`result ${id}`]) },
+  };
+}
+
 function observableSnapshot(runtime: SubagentRuntime): string[] {
   return runtime.list().map((run) => [
     run.id,
@@ -76,6 +131,7 @@ async function fixture(
     appendArtifact?: NonNullable<RuntimeOptions["appendArtifact"]>;
     gitStatus?: NonNullable<RuntimeOptions["gitStatus"]>;
     onRunsChanged?: (runtime: SubagentRuntime) => void;
+    runtimeOptions?: Pick<RuntimeOptions, "quietPeriodMs" | "monitorDelay" | "observeChildSession">;
   } = {},
 ): Promise<void> {
   const agentDir = await mkdtemp(join(tmpdir(), "runtime-agent-"));
@@ -88,6 +144,11 @@ async function fixture(
     instanceIdFactory: () => "instance-current",
     readinessTimeoutMs: 30,
     pollIntervalMs: 1,
+    quietPeriodMs: options.runtimeOptions?.quietPeriodMs ?? 1,
+    ...(options.runtimeOptions?.monitorDelay ? { monitorDelay: options.runtimeOptions.monitorDelay } : {}),
+    ...(options.runtimeOptions?.observeChildSession
+      ? { observeChildSession: options.runtimeOptions.observeChildSession }
+      : {}),
     cleanupTimeoutMs: 30,
     gitStatus: options.gitStatus ?? (async () => ""),
     appendState: options.appendState ?? (() => {}),
@@ -112,7 +173,7 @@ async function fixture(
 
 test("background start launches a deterministic persistent child and steers one exact result", async () => {
   await fixture(async (client, runtime, deliveries) => {
-    client.statuses = ["idle", "working", "idle"];
+    client.statuses = ["idle", "idle"];
     client.onSendInput = async () => { await appendResult(client, ["complete ", "answer"]); };
     const started = await runtime.start("scout", "inspect this", "/repo");
     assert.equal(started.generation?.delivery, "pending");
@@ -126,6 +187,7 @@ test("background start launches a deterministic persistent child and steers one 
     await eventually(() => deliveries.length === 1);
     const delivered = deliveries[0]!;
     assert.equal(delivered.content.includes("complete answer"), true);
+    assert.equal(delivered.content.includes(`Durable recovery artifact (read after compaction): ${started.artifactPath}`), true);
     assert.equal(delivered.content.includes("Reader reminder"), true);
     assert.deepEqual(delivered.details, {
       parentSessionId,
@@ -327,12 +389,15 @@ test("follow-up artifact failure leaves the prior delivered generation usable an
   });
 });
 
-test("run notifications expose journaled snapshots and suppress unchanged monitor polls", async () => {
+test("run notifications expose journaled snapshots without steady-state polling", async () => {
   const changes: string[][] = [];
   await fixture(async (client, runtime, deliveries) => {
     client.statuses = ["idle"];
     const started = await runtime.start("scout", "inspect this", "/repo");
-    await eventually(() => client.calls.filter(({ method }) => method === "agent.get").length >= 5);
+    await eventually(() => client.calls.filter(({ method }) => method === "agent.get").length === 2);
+    const reconciledGets = client.calls.filter(({ method }) => method === "agent.get").length;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, reconciledGets);
     assert.deepEqual(changes, [
       ["run-reader/starting/working/no-generation/"],
       ["run-reader/starting/idle/no-generation/"],
@@ -340,6 +405,7 @@ test("run notifications expose journaled snapshots and suppress unchanged monito
     ]);
 
     await appendResult(client, ["complete"]);
+    client.statusSubscriptions[0]!.emit("idle");
     await eventually(() => deliveries.length === 1);
     assert.deepEqual(changes.slice(-2), [
       ["run-reader/live/idle/g1:ready/"],
@@ -361,6 +427,198 @@ test("run notifications expose journaled snapshots and suppress unchanged monito
     ]);
   }, ["run-reader"], {
     onRunsChanged: (runtime) => changes.push(observableSnapshot(runtime)),
+  });
+});
+
+test("status events reset or replace candidates without polling and stable expiry has an exact read budget", async () => {
+  const timer = controlledDelay();
+  let observations = 0;
+  const stable = observation("stable");
+  await fixture(async (client, runtime, deliveries) => {
+    client.statuses = ["idle", "idle", "done"];
+    await runtime.start("scout", "task", "/repo");
+    await eventually(() => timer.waits.some(({ ms, settled }) => ms === 100 && !settled));
+    assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 2);
+    assert.equal(observations, 1);
+
+    for (const status of ["working", "blocked", "unknown"] as const) {
+      client.statusSubscriptions[0]!.emit(status);
+      await eventually(() => runtime.status("run-reader").status === status);
+      assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 2);
+      assert.equal(observations, 1);
+    }
+
+    client.statusSubscriptions[0]!.emit("idle");
+    await eventually(() => observations === 2);
+    await eventually(() => timer.waits.filter(({ ms, settled }) => ms === 100 && !settled).length === 1);
+    assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 2);
+    timer.release(100);
+    await eventually(() => deliveries.length === 1);
+    assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 3);
+    assert.equal(observations, 3);
+    assert.equal(runtime.status("run-reader").status, "done");
+  }, ["run-reader"], {
+    runtimeOptions: {
+      quietPeriodMs: 100,
+      monitorDelay: timer.sleep,
+      observeChildSession: async () => { observations++; return stable; },
+    },
+  });
+});
+
+test("events arriving during expiry reconciliation are processed before finalization", async (context) => {
+  for (const eventStatus of ["working", "done"] as const) await context.test(eventStatus, async () => {
+    const timer = controlledDelay();
+    const expiryStarted = deferred<void>();
+    const releaseExpiry = deferred<void>();
+    const stable = observation("stable");
+    let observationCalls = 0;
+    await fixture(async (client, runtime, deliveries) => {
+      client.statuses = ["idle", "idle", "idle", "idle"];
+      await runtime.start("scout", "task", "/repo");
+      await eventually(() => timer.waits.some(({ ms, settled }) => ms === 150 && !settled));
+      timer.release(150);
+      await expiryStarted.promise;
+      client.statusSubscriptions[0]!.emit(eventStatus);
+      releaseExpiry.resolve();
+
+      if (eventStatus === "working") {
+        await eventually(() => runtime.status("run-reader").status === "working");
+        assert.equal(deliveries.length, 0);
+        assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 3);
+        assert.equal(observationCalls, 2);
+      } else {
+        await eventually(() => observationCalls === 3);
+        assert.equal(deliveries.length, 0);
+        await eventually(() => timer.waits.filter(({ ms, settled }) => ms === 150 && !settled).length === 1);
+        timer.release(150);
+        await eventually(() => deliveries.length === 1);
+        assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 4);
+        assert.equal(observationCalls, 4);
+      }
+    }, ["run-reader"], {
+      runtimeOptions: {
+        quietPeriodMs: 150,
+        monitorDelay: timer.sleep,
+        observeChildSession: async () => {
+          observationCalls++;
+          if (observationCalls === 2) {
+            expiryStarted.resolve();
+            await releaseExpiry.promise;
+          }
+          return stable;
+        },
+      },
+    });
+  });
+});
+
+test("changed session fingerprints start a fresh independently bounded quiet window", async () => {
+  const timer = controlledDelay();
+  const observations = [observation("first", "leaf-1"), observation("second", "leaf-2", "compact-1"), observation("second", "leaf-2", "compact-1")];
+  let observationCalls = 0;
+  await fixture(async (client, runtime, deliveries) => {
+    client.statuses = ["idle", "idle", "done", "idle"];
+    await runtime.start("scout", "task", "/repo");
+    await eventually(() => timer.waits.some(({ ms, settled }) => ms === 200 && !settled));
+    timer.release(200);
+    await eventually(() => observationCalls === 2);
+    assert.equal(deliveries.length, 0);
+    assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 3);
+    await eventually(() => timer.waits.filter(({ ms, settled }) => ms === 200 && !settled).length === 1);
+    timer.release(200);
+    await eventually(() => deliveries.length === 1);
+    assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 4);
+    assert.equal(observationCalls, 3);
+    assert.equal(runtime.status("run-reader").latestResult?.childEntryId, "second");
+  }, ["run-reader"], {
+    runtimeOptions: {
+      quietPeriodMs: 200,
+      monitorDelay: timer.sleep,
+      observeChildSession: async () => observations[Math.min(observationCalls++, observations.length - 1)],
+    },
+  });
+});
+
+test("clean EOF and transport failures reconnect, while protocol failures fail closed", async (context) => {
+  for (const transport of ["eof", "error"] as const) await context.test(transport, async () => {
+    const timer = controlledDelay();
+    await fixture(async (client, runtime) => {
+      client.statuses = ["idle"];
+      await runtime.start("scout", "task", "/repo");
+      await eventually(() => client.statusSubscriptions.length === 1);
+      if (transport === "eof") client.statusSubscriptions[0]!.end();
+      else client.statusSubscriptions[0]!.fail(new HerdrSubscriptionTransportError("disconnected"));
+      await eventually(() => timer.waits.some(({ ms, settled }) => ms === 250 && !settled));
+      timer.release(250);
+      await eventually(() => client.statusSubscriptions.length === 2);
+      assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 3);
+      assert.equal(runtime.status("run-reader").lifecycle, "live");
+    }, ["run-reader"], {
+      runtimeOptions: {
+        monitorDelay: timer.sleep,
+        observeChildSession: async () => undefined,
+      },
+    });
+  });
+
+  await context.test("protocol", async () => {
+    const timer = controlledDelay();
+    await fixture(async (client, runtime) => {
+      client.statuses = ["idle"];
+      await runtime.start("scout", "task", "/repo");
+      await eventually(() => client.statusSubscriptions.length === 1);
+      client.statusSubscriptions[0]!.fail(new HerdrError("bad event"));
+      await eventually(() => runtime.status("run-reader").lifecycle === "retained");
+      assert.equal(client.statusSubscriptions.length, 1);
+      assert.deepEqual(timer.requested, []);
+    }, ["run-reader"], {
+      runtimeOptions: { monitorDelay: timer.sleep, observeChildSession: async () => undefined },
+    });
+  });
+});
+
+test("subscription retry exhaustion retains resources without polling fallback", async () => {
+  const timer = controlledDelay();
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle"];
+    await runtime.start("scout", "task", "/repo");
+    const backoffs = [250, 500, 1_000, 2_000, 4_000];
+    for (let attempt = 0; attempt < backoffs.length; attempt++) {
+      await eventually(() => client.statusSubscriptions.length === attempt + 1);
+      client.statusSubscriptions[attempt]!.end();
+      await eventually(() => timer.waits.some(({ ms, settled }) => ms === backoffs[attempt] && !settled));
+      timer.release(backoffs[attempt]!);
+    }
+    await eventually(() => client.statusSubscriptions.length === 6);
+    client.statusSubscriptions[5]!.end();
+    await eventually(() => runtime.status("run-reader").lifecycle === "retained");
+    assert.deepEqual(timer.requested, backoffs);
+    assert.equal(client.calls.filter(({ method }) => method === "agent.get").length, 7);
+    assert.equal(client.statusSubscriptions.length, 6);
+  }, ["run-reader"], {
+    runtimeOptions: { monitorDelay: timer.sleep, observeChildSession: async () => undefined },
+  });
+});
+
+test("topology changes at expiry fail closed without reconnect", async () => {
+  const timer = controlledDelay();
+  const stable = observation("stable");
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle"];
+    await runtime.start("scout", "task", "/repo");
+    await eventually(() => timer.waits.some(({ ms, settled }) => ms === 300 && !settled));
+    client.agent!.workspaceId = "w-other";
+    timer.release(300);
+    await eventually(() => runtime.status("run-reader").lifecycle === "retained");
+    assert.equal(client.statusSubscriptions.length, 1);
+    assert.equal(runtime.status("run-reader").error, "Herdr topology changed for run run-reader");
+  }, ["run-reader"], {
+    runtimeOptions: {
+      quietPeriodMs: 300,
+      monitorDelay: timer.sleep,
+      observeChildSession: async () => stable,
+    },
   });
 });
 
@@ -402,6 +660,7 @@ test("journal failures suppress ordinary phases and notify only finalized fallba
       const started = await runtime.start("scout", "task", "/repo");
       changes.length = 0;
       await appendResult(client, ["answer"]);
+      client.statusSubscriptions[0]!.emit("idle");
       await eventually(() => runtime.status(started.id).lifecycle === "retained");
       assert.deepEqual(changes, [[
         "run-reader/retained/idle/g1:ready/pane=w-parent:p-child|tab=w-parent:t-reader|sessionDir="
@@ -498,6 +757,7 @@ test("blocking timeout releases only the waiter and completion continues in back
     );
     assert.equal(runtime.status("run-reader").generation?.blockingWaiter, false);
     await appendResult(client, ["late result"]);
+    client.statusSubscriptions[0]!.emit("idle");
     await eventually(() => deliveries.length === 1);
     assert.equal(deliveries[0]?.content.includes("late result"), true);
   });
@@ -791,11 +1051,18 @@ test("successful enclosing cleanup clears stale pane but preserves any unarchive
 
 test("independent reader starts coexist", async () => {
   await fixture(async (client, runtime) => {
+    client.paneIds = ["w-parent:p-one", "w-parent:p-two"];
     client.statuses = ["idle", "idle"];
     await runtime.start("scout", "one", "/repo");
+    await eventually(() => client.calls.filter(({ method }) => method === "agent.get").length === 2);
     client.statuses = ["idle", "idle"];
     await runtime.start("researcher", "two", "/repo");
+    await eventually(() => client.calls.filter(({ method }) => method === "agent.get").length === 4);
     assert.deepEqual(runtime.list().map(({ id }) => id), ["run-one", "run-two"]);
+    assert.deepEqual(client.statusSubscriptions.map(({ paneId }) => paneId), ["w-parent:p-one", "w-parent:p-two"]);
+    client.statusSubscriptions[0]!.emit("blocked");
+    await eventually(() => runtime.status("run-one").status === "blocked");
+    assert.equal(runtime.status("run-two").status, "idle");
   }, ["run-one", "run-two"]);
 });
 

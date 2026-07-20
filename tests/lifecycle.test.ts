@@ -107,6 +107,7 @@ function runtimeFor(
     parentProcessId: options.processId ?? 200,
     readinessTimeoutMs: 40,
     pollIntervalMs: 1,
+    quietPeriodMs: 1,
     cleanupTimeoutMs: 40,
     gitStatus: options.gitStatus ?? (async () => ""),
     appendState: options.appendState
@@ -511,6 +512,7 @@ test("settlement waits for delivery confirmation, blocks tree while open, and re
     assert.equal(client.calls.some(({ method }) => method === "pane.close"), false);
 
     await appendChildResult(client, "background");
+    client.statusSubscriptions[0]!.emit("idle");
     await eventually(() => deliveries.length === 1);
     assert.equal(runtime.status(started.id).generation?.delivery, "queued");
     assert.deepEqual(await runtime.settle(request), []);
@@ -570,7 +572,7 @@ test("bulk settlement cleans every run when one stopping journal write fails", a
     });
     changes.length = 0;
     const monitorSignals = client.calls
-      .filter(({ method }) => method === "agent.get")
+      .filter(({ method }) => method === "events.subscribe")
       .map(({ signal }) => signal);
     const cleanupStart = client.calls.length;
     const settled = await runtime.settle(request);
@@ -624,8 +626,8 @@ test("every shutdown reason aborts monitors before one fresh bounded reader clea
       });
       await bind(runtime, parent);
       await runtime.start("scout", "pending", parent.root);
-      await eventually(() => client.calls.filter(({ method }) => method === "agent.get").length >= 2);
-      const monitorSignals = client.calls.filter(({ method }) => method === "agent.get").map(({ signal }) => signal);
+      await eventually(() => client.calls.some(({ method }) => method === "events.subscribe"));
+      const monitorSignals = client.calls.filter(({ method }) => method === "events.subscribe").map(({ signal }) => signal);
       changes.length = 0;
       const [stopped] = await runtime.shutdown(reason);
       assert.equal(stopped?.run.lifecycle, "closed", reason);

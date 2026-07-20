@@ -11,6 +11,7 @@ import { resolveArtifactDirectory } from "../src/artifact.ts";
 import { SocketHerdrClient } from "../src/herdr.ts";
 import { buildPiLaunch, PROFILES } from "../src/profiles.ts";
 import { SubagentRuntime, type Run } from "../src/runtime.ts";
+import { HERDR_STATE_CUSTOM_TYPE, type HerdrStateRecord } from "../src/session.ts";
 import { idSchema, sendSchema, startSchema, statusSchema } from "../src/tools.ts";
 
 interface Registered {
@@ -89,12 +90,20 @@ function mockUI(): { ui: any; calls: WidgetCall[] } {
   };
 }
 
-function mockContext(sessionId: string, hasUI: boolean, ui?: any, mode = hasUI ? "tui" : "json", branch: any[] = []) {
+function mockContext(
+  sessionId: string,
+  hasUI: boolean,
+  ui?: any,
+  mode = hasUI ? "tui" : "json",
+  branch: any[] = [],
+  entries: any[] = branch,
+) {
   const sessionManager = {
     getSessionId: () => sessionId,
     getSessionFile: () => `/tmp/${sessionId}.jsonl`,
     getLeafId: () => `${sessionId}-leaf`,
     getBranch: () => branch,
+    getEntries: () => entries,
   };
   return { sessionManager, hasUI, ui, mode, cwd: "/repo" };
 }
@@ -121,6 +130,37 @@ function queuedRun(runtime: SubagentRuntime, sessionId: string, id: string, life
       blockingWaiter: false,
     },
   });
+}
+
+function journalEntry(
+  sessionId: string,
+  id: string,
+  runId: string,
+  overrides: Partial<HerdrStateRecord> = {},
+) {
+  const record: HerdrStateRecord = {
+    state: "generation_pending",
+    at: 1,
+    parentSessionId: sessionId,
+    parentSessionFile: `/tmp/${sessionId}.jsonl`,
+    parentEntryId: `${sessionId}-leaf`,
+    parentInstanceId: "prior-instance",
+    parentProcessId: 1,
+    runId,
+    childSessionId: `child-${runId}`,
+    childSessionDir: `/sessions/${runId}`,
+    childCwd: "/repo",
+    artifactPath: `/artifacts/${runId}.md`,
+    terminalId: `term-${runId}`,
+    paneId: `pane-${runId}`,
+    tabId: `tab-${runId}`,
+    workspaceId: `workspace-${runId}`,
+    profile: "scout",
+    status: "working",
+    generation: { number: 1, baselineEntryId: null, delivery: "pending" },
+    ...overrides,
+  };
+  return { id, parentId: null, timestamp: 1, type: "custom", customType: HERDR_STATE_CUSTOM_TYPE, data: record };
 }
 
 function deliveryMessage(run: Run) {
@@ -415,51 +455,94 @@ test("parent registers exactly four tools, one skill hook, and result confirmati
   assert.equal(existsSync(resources.skillPaths[0] ?? ""), true);
 }));
 
-test("compaction reminders are transient, one-shot, session-scoped, and require run artifacts", async () => {
+test("post-compaction recovery catalogs are complete, transient, one-shot, and session-scoped", async () => {
   const fixture = extensionWithRuntimeCapture();
   const liveId = `compact-live-${Date.now()}`;
   const emptyId = `${liveId}-empty`;
   const resumedId = `${liveId}-resumed`;
   const liveDirectory = resolveArtifactDirectory(getAgentDir(), liveId);
-  const resumedDirectory = resolveArtifactDirectory(getAgentDir(), resumedId);
-  const liveCtx = mockContext(liveId, false);
+  const liveBranch: any[] = [];
+  const liveEntries: any[] = [];
+  const liveCtx = mockContext(liveId, false, undefined, "json", liveBranch, liveEntries);
   const emptyCtx = mockContext(emptyId, false);
-  const resumedCtx = mockContext(resumedId, false, undefined, "json", [{ type: "compaction" }]);
+  const compactionEntry = { id: "resume-compaction", parentId: null, timestamp: 1, type: "compaction" };
+  const resumedCtx = mockContext(resumedId, false, undefined, "json", [compactionEntry], [compactionEntry]);
   try {
     await event(fixture.registered, "session_start")({ reason: "startup" }, liveCtx);
-    fixture.restore();
-    await mkdir(liveDirectory, { recursive: true });
-    await writeFile(join(liveDirectory, "run-live.md"), "# artifact\n");
-    await event(fixture.registered, "session_compact")({}, liveCtx);
-    const originalMessages = [{ role: "user", content: "continue", timestamp: 1 }];
-    const reminded = await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx) as any;
-    assert.notEqual(reminded.messages, originalMessages);
-    assert.equal(originalMessages.length, 1);
-    assert.deepEqual(reminded.messages.at(-1), {
-      role: "custom",
-      customType: "herdr-subagent-artifact-reminder",
-      content: `Exact subagent exchanges remain under ${liveDirectory}. List or read the relevant run file before relying on compacted subagent details.`,
-      display: false,
-      timestamp: reminded.messages.at(-1).timestamp,
+    const runtime = fixture.runtime();
+    const current = journalEntry(liveId, "entry-current", "run-live", {
+      state: "result_queued",
+      status: "done",
+      generation: { number: 3, baselineEntryId: null, delivery: "queued", artifactResultPersisted: true },
     });
-    assert.equal(typeof reminded.messages.at(-1).timestamp, "number");
-    assert.equal(await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx), undefined);
+    const historical = journalEntry(liveId, "entry-historical", "run-history", {
+      state: "result_delivered",
+      status: "done",
+      generation: { number: 2, baselineEntryId: null, delivery: "delivered" },
+    });
+    const missing = journalEntry(liveId, "entry-missing", "run-missing", {
+      state: "retained",
+      status: "blocked",
+    });
+    const malformed = { id: "entry-bad", parentId: null, timestamp: 1, type: "custom", customType: HERDR_STATE_CUSTOM_TYPE, data: { runId: "bad" } };
+    liveEntries.push(current, historical, missing, malformed);
+    liveBranch.push(current, missing);
+    runtime.runs.set("run-live", queuedRun(runtime, liveId, "run-live") as any);
+
+    await mkdir(liveDirectory, { recursive: true });
+    await writeFile(join(liveDirectory, "run-live.md"), "# current\n");
+    await writeFile(join(liveDirectory, "run-history.md"), "# incomplete\n");
+    await writeFile(join(liveDirectory, "run-artifact.md"), "# artifact only\n");
+
+    const originalMessages = [{ role: "user", content: "continue", timestamp: 1 }];
+    let expectedContent = "";
+    for (const reason of ["manual", "threshold", "overflow"]) {
+      await event(fixture.registered, "session_compact")({ reason }, liveCtx);
+      const catalog = await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx) as any;
+      assert.notEqual(catalog.messages, originalMessages);
+      assert.equal(originalMessages.length, 1);
+      assert.equal(catalog.messages.at(-1).customType, "herdr-subagent-recovery-catalog");
+      assert.equal(catalog.messages.at(-1).display, false);
+      assert.equal(typeof catalog.messages.at(-1).timestamp, "number");
+      expectedContent ||= catalog.messages.at(-1).content;
+      assert.equal(catalog.messages.at(-1).content, expectedContent);
+      assert.equal(await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx), undefined);
+    }
+    assert.equal(expectedContent, [
+      "Parent-session subagent recovery catalog after compaction:",
+      `- run-live [scout] — current live/done/g3 queued; active branch; artifact: ${join(liveDirectory, "run-live.md")} (available)`,
+      `- run-history [scout] — latest durable result_delivered/done/g2 delivered; historical branch; artifact: ${join(liveDirectory, "run-history.md")} (incomplete)`,
+      "- run-missing [scout] — latest durable retained/blocked/g1 pending; active branch; artifact: artifact unavailable",
+      `- run-artifact — status/branch/completeness unknown (artifact only); artifact: ${join(liveDirectory, "run-artifact.md")} (unknown)`,
+    ].join("\n"));
     assert.deepEqual(fixture.registered.messages, []);
 
-    await event(fixture.registered, "session_start")({ reason: "new" }, emptyCtx);
-    await event(fixture.registered, "session_compact")({}, emptyCtx);
-    assert.equal(await event(fixture.registered, "context")({ messages: originalMessages }, emptyCtx), undefined);
+    await event(fixture.registered, "session_compact")({ reason: "manual" }, liveCtx);
+    const originalSessionFile = liveCtx.sessionManager.getSessionFile;
+    (liveCtx.sessionManager as any).getSessionFile = () => undefined;
+    await assert.rejects(
+      async () => await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx),
+      /persisted parent session/,
+    );
+    (liveCtx.sessionManager as any).getSessionFile = originalSessionFile;
+    const retried = await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx) as any;
+    assert.equal(retried.messages.at(-1).content, expectedContent);
 
-    await mkdir(resumedDirectory, { recursive: true });
-    await writeFile(join(resumedDirectory, "run-complete.md"), "# completed artifact\n");
+    await event(fixture.registered, "session_start")({ reason: "new" }, emptyCtx);
+    await event(fixture.registered, "session_compact")({ reason: "manual" }, emptyCtx);
+    const empty = await event(fixture.registered, "context")({ messages: originalMessages }, emptyCtx) as any;
+    assert.equal(empty.messages.at(-1).content, [
+      "Parent-session subagent recovery catalog after compaction:",
+      "No parent-session subagent runs or artifacts were discovered.",
+    ].join("\n"));
+
     await event(fixture.registered, "session_start")({ reason: "resume" }, resumedCtx);
     const resumed = await event(fixture.registered, "context")({ messages: originalMessages }, resumedCtx) as any;
-    assert.equal(resumed.messages.at(-1).content.includes(resumedDirectory), true);
+    assert.match(resumed.messages.at(-1).content, /No parent-session subagent runs or artifacts were discovered/);
     assert.equal(await event(fixture.registered, "context")({ messages: originalMessages }, liveCtx), undefined);
   } finally {
     fixture.restore();
     await rm(liveDirectory, { recursive: true, force: true });
-    await rm(resumedDirectory, { recursive: true, force: true });
   }
 });
 

@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import {
   appendArtifactSection,
+  enumerateRunArtifacts,
   renderArtifactHeader,
   renderCleanupSection,
   renderGenerationSection,
@@ -36,6 +37,28 @@ test("artifact locations are deterministic, contained, and reject invalid identi
   for (const runId of ["", ".", "..", "../escape", "/absolute", "nested/run", "nested\\run", "nul\0byte"]) {
     assert.throws(() => resolveArtifactLocation({ ...identity, runId }), /Invalid run ID/);
   }
+});
+
+test("artifact enumeration returns only sorted regular deterministic Markdown files", async () => {
+  await fixture(async (root, identity) => {
+    assert.deepEqual(await enumerateRunArtifacts(identity.agentDir, identity.parentSessionId), []);
+    const directory = resolveArtifactLocation(identity).directory;
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "run-b.md"), "## fake completion heading\n");
+    await writeFile(join(directory, "run-a.md"), "artifact\n");
+    await writeFile(join(directory, ".hidden.md"), "hidden\n");
+    await writeFile(join(directory, "run-c.txt"), "text\n");
+    await writeFile(join(directory, ".run-a.1.tmp"), "temp\n");
+    await mkdir(join(directory, "run-dir.md"));
+    const outside = join(root, "outside.md");
+    await writeFile(outside, "outside\n");
+    await symlink(outside, join(directory, "run-link.md"));
+
+    assert.deepEqual(await enumerateRunArtifacts(identity.agentDir, identity.parentSessionId), [
+      { runId: "run-a", path: join(directory, "run-a.md") },
+      { runId: "run-b", path: join(directory, "run-b.md") },
+    ]);
+  });
 });
 
 test("headers and cleanup sections contain only concise supplied facts", () => {
@@ -172,6 +195,10 @@ test("symlinked artifact directories and targets are rejected without external w
     await symlink(outside, join(identity.agentDir, "herdr-subagent-artifacts"), "dir");
 
     await assert.rejects(appendArtifactSection(identity, "escaped"), /not a real directory/);
+    await assert.rejects(
+      enumerateRunArtifacts(identity.agentDir, identity.parentSessionId),
+      /Artifact root is not a real directory/,
+    );
     assert.deepEqual(await readdir(outside), []);
   });
 

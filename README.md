@@ -33,11 +33,13 @@ subagent_stop({ id })
 
 ## Results and follow-ups
 
-`subagent_start` and `subagent_send` acknowledge input and monitor the child in the background by default. A completed generation is extracted from the child’s persistent Pi session, not terminal output, and delivered once as a provenanced `herdr-subagent-result` custom message using steer delivery with a triggered parent turn.
+`subagent_start` and `subagent_send` acknowledge input and monitor the child in the background by default. Startup readiness still uses bounded `agent.get` polling, but each live generation then owns one acknowledged exact-pane Herdr status subscription; steady state does not continuously poll. `idle` and `done` are only result candidates. Delivery waits for a 30-second quiet period and one exact status/session reconciliation. This is an approximation, not a Pi `agent_settled` guarantee, because Herdr’s Pi integration derives `idle` from debounced `agent_end`.
+
+A completed generation is extracted from the child’s persistent Pi session, not terminal output, and delivered once as a provenanced `herdr-subagent-result` custom message using steer delivery with a triggered parent turn. Clean disconnects and subscription transport failures use bounded reconnect backoff. Exhausted reconnects, unsupported protocol, or identity/topology failures retain the run and never fall back to continuous polling.
 
 With `wait:true`, the same complete structured result is returned directly and is not injected again. A wait timeout leaves the generation running in the background; it is not an implicit stop.
 
-Use `subagent_status` for lifecycle, generation, delivery, artifact, child-session, worktree, and retained-resource facts. Polling is not required for result delivery. A follow-up may be sent only after the previous generation was delivered or returned; it reuses the same child session with a fresh branch cursor. To continue after an automatic result, send the follow-up during the result-triggered parent turn before settlement cleanup becomes eligible.
+Use `subagent_status` for lifecycle, generation, delivery, artifact, child-session, worktree, and retained-resource facts—not to poll for completion. A follow-up may be sent only after the previous generation was delivered or returned; it reuses the same child session with a fresh branch cursor. To continue after an automatic result, send the follow-up during the result-triggered parent turn before settlement cleanup becomes eligible.
 
 ## Exact run artifacts
 
@@ -49,9 +51,9 @@ The extension automatically owns one Markdown artifact per run:
 
 It writes every exact parent start/follow-up before sending it and the full textual child response before readiness or delivery. Follow-ups become later generation sections in the same file. Artifacts contain only concise run/worktree/cleanup facts and verbatim exchanged text—not thinking, tool traffic, or full transcripts—and survive child-session and worktree cleanup.
 
-Agents must never create or edit these files. After compaction or uncertainty, list/read the relevant run artifact rather than relying on compacted delegation details. When a compacted parent session has artifacts, the extension adds one transient path-only reminder to the next model context; it does not persist a message, trigger a turn, or copy artifact contents.
+Agents must never create or edit these files. After every successful compaction—or when a compacted session resumes—the next model context receives one hidden, transient parent-session recovery catalog, even when no runs exist. It lists one row for every valid journal run across active and historical branches plus every safe artifact-only file. Only a currently owned run with an active latest record is labeled `current`; other journal facts are `latest durable` and may not be live. Each row reports exact artifact availability/completeness or `artifact unavailable`; artifact-only status and completeness remain unknown. The catalog never copies artifact bodies, persists a message, or triggers a turn, so read the named file before relying on compacted delegation details.
 
-Artifact paths appear in start, result, status, and stop surfaces. If result archival fails, execution is retained without delivery or child-session deletion and one action notice identifies the file. Calling the existing `subagent_stop` retries exact archival from the cached result or preserved child session, returns the result once, and then finalizes resources; later inspection does not inject it again.
+Artifact paths appear in start, result, status, and stop surfaces. Every complete result keeps the full child text and names `Durable recovery artifact (read after compaction): <agentDir>/herdr-subagent-artifacts/<parentSessionId>/<runId>.md`. If result archival fails, execution is retained without delivery or child-session deletion and one action notice identifies the file. Calling the existing `subagent_stop` retries exact archival from the cached result or preserved child session, returns the result once, and then finalizes resources; later inspection does not inject it again.
 
 ## Current-session widget
 

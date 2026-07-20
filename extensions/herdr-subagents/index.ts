@@ -1,10 +1,10 @@
 import { getAgentDir, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
-import { readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { resolveArtifactDirectory } from "../../src/artifact.ts";
+import { enumerateRunArtifacts } from "../../src/artifact.ts";
 import { SocketHerdrClient } from "../../src/herdr.ts";
+import { buildRecoveryCatalog, formatRecoveryCatalog } from "../../src/recovery.ts";
 import { SubagentRuntime, type Run, type StopResult } from "../../src/runtime.ts";
 import { registerSubagentTools } from "../../src/tools.ts";
 
@@ -12,15 +12,6 @@ const skillPath = fileURLToPath(new URL("../../skills/use-herdr-subagents/SKILL.
 const WIDGET_KEY = "herdr-subagents";
 const PROFILE_WIDTH = 10;
 const noRefresh = () => {};
-
-async function hasRunArtifacts(directory: string): Promise<boolean> {
-  try {
-    return (await readdir(directory, { withFileTypes: true }))
-      .some((entry) => entry.isFile() && entry.name.endsWith(".md"));
-  } catch {
-    return false;
-  }
-}
 
 type WidgetTone = "accent" | "success" | "warning" | "error" | "muted";
 
@@ -149,9 +140,10 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
   const parentInstanceId = randomUUID();
   let refreshWidget: () => void = noRefresh;
   let refreshOwner: object | undefined;
-  let reminderSessionId: string | undefined;
-  let reminderDirectory: string | undefined;
-  let reminderPending = false;
+  let catalogSessionId: string | undefined;
+  let catalogBuildSessionId: string | undefined;
+  let catalogVersion = 0;
+  let catalogPending = false;
   const runtime = new SubagentRuntime(
     new SocketHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH ?? "" }),
     {
@@ -181,17 +173,17 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
   pi.on("session_start", async (event, ctx) => {
     refreshWidget = noRefresh;
     refreshOwner = undefined;
-    reminderPending = false;
-    reminderSessionId = ctx.sessionManager.getSessionId();
-    reminderDirectory = resolveArtifactDirectory(getAgentDir(), reminderSessionId);
+    catalogPending = false;
+    catalogVersion++;
+    catalogSessionId = ctx.sessionManager.getSessionId();
     const diagnostics = await runtime.bindParent({
       parentSessionId: ctx.sessionManager.getSessionId(),
       parentSessionFile: ctx.sessionManager.getSessionFile(),
       parentEntryId: ctx.sessionManager.getLeafId(),
     }, ctx.sessionManager.getBranch(), event.reason);
-    if (ctx.sessionManager.getBranch().some((entry) => entry.type === "compaction")
-      && await hasRunArtifacts(reminderDirectory)) {
-      reminderPending = true;
+    if (ctx.sessionManager.getBranch().some((entry) => entry.type === "compaction")) {
+      catalogPending = true;
+      catalogVersion++;
     }
     if (ctx.hasUI) {
       const sessionManager = ctx.sessionManager;
@@ -215,24 +207,47 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
       for (const diagnostic of diagnostics) ui.notify(diagnostic.message, diagnostic.outcome === "closed" || diagnostic.outcome === "cleaned" ? "info" : "warning");
     }
   });
-  pi.on("session_compact", async (_event, ctx) => {
+  pi.on("session_compact", (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    if (sessionId !== reminderSessionId || !reminderDirectory) return;
-    reminderPending = await hasRunArtifacts(reminderDirectory);
+    if (sessionId !== catalogSessionId) return;
+    catalogPending = true;
+    catalogVersion++;
   });
-  pi.on("context", (event, ctx) => {
+  pi.on("context", async (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    if (!reminderPending || sessionId !== reminderSessionId || !reminderDirectory) return;
-    reminderPending = false;
-    return {
-      messages: [...event.messages, {
-        role: "custom" as const,
-        customType: "herdr-subagent-artifact-reminder",
-        content: `Exact subagent exchanges remain under ${reminderDirectory}. List or read the relevant run file before relying on compacted subagent details.`,
-        display: false,
-        timestamp: Date.now(),
-      }],
-    };
+    if (!catalogPending || sessionId !== catalogSessionId || catalogBuildSessionId === sessionId) return;
+    catalogBuildSessionId = sessionId;
+    const buildVersion = catalogVersion;
+    try {
+      const parentSessionFile = ctx.sessionManager.getSessionFile();
+      if (!parentSessionFile) throw new Error("Recovery catalog requires a persisted parent session");
+      const request = runtime.requestFor({
+        parentSessionId: sessionId,
+        parentSessionFile,
+        parentEntryId: ctx.sessionManager.getLeafId(),
+      });
+      const catalog = buildRecoveryCatalog({
+        entries: ctx.sessionManager.getEntries(),
+        branch: ctx.sessionManager.getBranch(),
+        parentSessionId: sessionId,
+        parentSessionFile,
+        currentRuns: runtime.list(request),
+        artifacts: await enumerateRunArtifacts(getAgentDir(), sessionId),
+      });
+      if (ctx.sessionManager.getSessionId() !== sessionId || catalogSessionId !== sessionId) return;
+      if (catalogVersion === buildVersion) catalogPending = false;
+      return {
+        messages: [...event.messages, {
+          role: "custom" as const,
+          customType: "herdr-subagent-recovery-catalog",
+          content: formatRecoveryCatalog(catalog.rows),
+          display: false,
+          timestamp: Date.now(),
+        }],
+      };
+    } finally {
+      if (catalogBuildSessionId === sessionId) catalogBuildSessionId = undefined;
+    }
   });
   pi.on("message_end", (event, ctx) => {
     runtime.requestFor({
@@ -278,10 +293,10 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
         refreshWidget = noRefresh;
         refreshOwner = undefined;
       }
-      if (reminderSessionId === sessionManager.getSessionId()) {
-        reminderPending = false;
-        reminderSessionId = undefined;
-        reminderDirectory = undefined;
+      if (catalogSessionId === sessionManager.getSessionId()) {
+        catalogPending = false;
+        if (catalogBuildSessionId === catalogSessionId) catalogBuildSessionId = undefined;
+        catalogSessionId = undefined;
       }
     }
   });

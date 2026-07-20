@@ -1,7 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { getAgentDir, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
-import type { AgentStatus } from "./herdr.ts";
+import { isAgentStatus, type AgentStatus } from "./herdr.ts";
 import type { ProfileName } from "./profiles.ts";
 import type { WorkerCleanup, WorktreeFacts } from "./worktree.ts";
 
@@ -47,6 +47,7 @@ export interface HerdrStateRecord {
   tabId: string;
   workspaceId: string;
   profile: ProfileName;
+  status?: AgentStatus;
   generation?: JournalGeneration;
   result?: ChildResult;
   worktree?: WorktreeFacts;
@@ -69,11 +70,20 @@ const JOURNAL_STATES = new Set<HerdrLifecycleState>([
   "result_delivered", "stopping", "retained", "closed",
 ]);
 
-function validGenerationArtifactFacts(value: unknown): boolean {
+function validGeneration(value: unknown): boolean {
   if (value === undefined) return true;
-  if (typeof value !== "object" || value === null) return false;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const generation = value as Record<string, unknown>;
-  return (generation.artifactParentPersisted === undefined || generation.artifactParentPersisted === true)
+  return Number.isSafeInteger(generation.number)
+    && (generation.number as number) >= 1
+    && (typeof generation.baselineEntryId === "string" || generation.baselineEntryId === null)
+    && (generation.delivery === "pending"
+      || generation.delivery === "ready"
+      || generation.delivery === "queued"
+      || generation.delivery === "delivered")
+    && (generation.resultEntryId === undefined || typeof generation.resultEntryId === "string")
+    && (generation.returned === undefined || typeof generation.returned === "boolean")
+    && (generation.artifactParentPersisted === undefined || generation.artifactParentPersisted === true)
     && (generation.artifactResultPersisted === undefined || generation.artifactResultPersisted === true);
 }
 
@@ -97,12 +107,39 @@ function isRecord(value: unknown): value is HerdrStateRecord {
     && (record.artifactPath === undefined || typeof record.artifactPath === "string")
     && (record.childStopped === undefined || record.childStopped === true)
     && (record.archivePending === undefined || record.archivePending === true)
-    && validGenerationArtifactFacts(record.generation)
+    && validGeneration(record.generation)
     && typeof record.terminalId === "string"
     && typeof record.paneId === "string"
     && typeof record.tabId === "string"
     && typeof record.workspaceId === "string"
-    && (record.profile === "scout" || record.profile === "researcher" || record.profile === "worker");
+    && (record.profile === "scout" || record.profile === "researcher" || record.profile === "worker")
+    && (record.status === undefined || isAgentStatus(record.status));
+}
+
+export interface InventoryHerdrRun {
+  runId: string;
+  latest: HerdrStateRecord;
+  latestEntryId: string;
+}
+
+export function inventoryHerdrJournal(
+  entries: readonly SessionEntry[],
+  parentSessionId: string,
+  parentSessionFile: string,
+): { runs: Map<string, InventoryHerdrRun>; invalidEntries: number } {
+  const runs = new Map<string, InventoryHerdrRun>();
+  let invalidEntries = 0;
+  for (const entry of entries) {
+    if (entry.type !== "custom" || entry.customType !== HERDR_STATE_CUSTOM_TYPE) continue;
+    if (!isRecord(entry.data)) {
+      invalidEntries++;
+      continue;
+    }
+    const record = entry.data;
+    if (record.parentSessionId !== parentSessionId || record.parentSessionFile !== parentSessionFile) continue;
+    runs.set(record.runId, { runId: record.runId, latest: record, latestEntryId: entry.id });
+  }
+  return { runs, invalidEntries };
 }
 
 export function reconstructHerdrJournal(
@@ -149,6 +186,13 @@ export interface ChildResult {
   message: AssistantMessage;
 }
 
+export interface ChildSessionObservation {
+  childSessionPath: string;
+  activeLeafId: string;
+  latestCompactionId?: string;
+  result?: ChildResult;
+}
+
 export function createChildSessionLocation(
   parentSessionId: string,
   runId: string,
@@ -190,15 +234,7 @@ export async function captureChildCursor(
   return { baselineEntryId, childSessionPath: snapshot.path };
 }
 
-export async function readChildResult(
-  location: ChildSessionLocation,
-  baselineEntryId: string | null,
-  herdrStatus: AgentStatus,
-): Promise<(ChildResult & { childSessionPath: string }) | undefined> {
-  if (herdrStatus === "working") return undefined;
-  const snapshot = await openChildSession(location);
-  if (!snapshot) return undefined;
-  const branch = snapshot.manager.getBranch();
+function selectChildResult(branch: readonly SessionEntry[], baselineEntryId: string | null): ChildResult | undefined {
   let start = 0;
   if (baselineEntryId !== null) {
     const baselineIndex = branch.findIndex(({ id }) => id === baselineEntryId);
@@ -222,5 +258,37 @@ export async function readChildResult(
       message: assistant,
     };
   }
-  return selected ? { ...selected, childSessionPath: snapshot.path } : undefined;
+  return selected;
+}
+
+export async function observeChildSession(
+  location: ChildSessionLocation,
+  baselineEntryId: string | null,
+): Promise<ChildSessionObservation | undefined> {
+  const snapshot = await openChildSession(location);
+  if (!snapshot) return undefined;
+  const branch = snapshot.manager.getBranch();
+  const activeLeafId = snapshot.manager.getLeafId();
+  if (!activeLeafId || !branch.some(({ id }) => id === activeLeafId)) {
+    throw new Error(`Child session active-branch cursor is missing: ${location.childSessionId}`);
+  }
+  const latestCompaction = [...branch].reverse().find(({ type }) => type === "compaction");
+  const result = selectChildResult(branch, baselineEntryId);
+  return {
+    childSessionPath: snapshot.path,
+    activeLeafId,
+    ...(latestCompaction ? { latestCompactionId: latestCompaction.id } : {}),
+    ...(result ? { result } : {}),
+  };
+}
+
+export async function readChildResult(
+  location: ChildSessionLocation,
+  baselineEntryId: string | null,
+  herdrStatus: AgentStatus,
+): Promise<(ChildResult & { childSessionPath: string }) | undefined> {
+  if (herdrStatus === "working") return undefined;
+  const observation = await observeChildSession(location, baselineEntryId);
+  if (!observation?.result) return undefined;
+  return { ...observation.result, childSessionPath: observation.childSessionPath };
 }

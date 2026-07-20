@@ -43,7 +43,7 @@ Unknown fields are rejected. `wait` defaults to `false`; `timeoutMs` is valid on
 ## Workflow
 
 1. Start the smallest useful task with `subagent_start`. Record the returned run ID and artifact path and, for a worker, its exact worktree path and generated branch.
-2. Prefer background mode. The child’s final assistant result is extracted from its persistent Pi session and delivered automatically as one provenanced `<subagent_result>` message that triggers a parent turn. Do not poll for terminal output.
+2. Prefer background mode. The child’s final assistant result is extracted from its persistent Pi session and delivered automatically as one provenanced `<subagent_result>` message that triggers a parent turn. Do not poll for terminal output or completion: startup readiness is bounded, then the runtime keeps one exact-pane status stream. Status changes are candidates, not proof of Pi settlement; acceptance uses a 30-second quiet/reconciliation heuristic rather than exact `agent_settled`.
 3. Use `wait:true` only when the current parent turn must block for the same result. A successful wait returns the complete result directly without a duplicate message. A timeout leaves background monitoring active.
 4. During the result-triggered turn, inspect the evidence. If more work is needed, call `subagent_send` before the parent settles. A follow-up is accepted only after the prior result was delivered or returned and uses the same child session with a fresh cursor.
 5. Use `subagent_status({ id })` for diagnostic lifecycle, generation, delivery, artifact, child-session, worktree, and retained-resource facts. Use `subagent_status({})` to list current-parent runs.
@@ -53,9 +53,9 @@ Unknown fields are rejected. `wait` defaults to `false`; `timeoutMs` is valid on
 
 Each run is archived automatically at `<agentDir>/herdr-subagent-artifacts/<parentSessionId>/<runId>.md`. Parent starts and follow-ups appear as successive generation sections with the full textual child result. The extension writes every section; agents only read it.
 
-After compaction or when prior delegation details are uncertain, list/read the relevant run file before continuing. A parent session with artifacts receives one transient path-only reminder after compaction; the reminder does not replace reading the exact file.
+Every complete result preserves the full child text and names `Durable recovery artifact (read after compaction): <exact path>`. After compaction or compacted-session resume, the next context receives one transient catalog covering valid current and historical parent-session runs plus safe artifact-only files. Distinguish `current` from `latest durable`/historical facts; artifact-only status and completeness are unknown. Read each named available or incomplete artifact before relying on compacted details. The catalog injects no artifact bodies, persists nothing, and never authorizes editing an artifact.
 
-If result archival fails, the run and child session remain retained and the result is not delivered. Use `subagent_stop({ id })` as the sole retry operation; it archives and returns the preserved result without also injecting a background duplicate, then continues safe cleanup.
+Clean stream disconnects and transport failures reconnect with bounded backoff. Reconnect exhaustion or protocol/identity failure retains the run without a polling fallback; inspect the retained facts and use `subagent_stop({ id })`. If result archival fails, the run and child session likewise remain retained and the result is not delivered. `subagent_stop` is the sole retry operation; it archives and returns the preserved result without also injecting a background duplicate, then continues safe cleanup.
 
 ## Ownership and safety
 

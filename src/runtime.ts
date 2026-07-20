@@ -10,16 +10,26 @@ import {
   resolveArtifactLocation,
   type ArtifactIdentity,
 } from "./artifact.ts";
-import { HerdrError, type AgentInfo, type AgentStatus, type HerdrClient } from "./herdr.ts";
+import {
+  HerdrError,
+  HerdrSubscriptionTransportError,
+  type AgentInfo,
+  type AgentStatus,
+  type AgentStatusEvent,
+  type AgentStatusSubscription,
+  type HerdrClient,
+} from "./herdr.ts";
 import { buildPiLaunch, type ProfileName } from "./profiles.ts";
 import {
   captureChildCursor,
   createChildSessionLocation,
   HERDR_STATE_CUSTOM_TYPE,
+  observeChildSession,
   readChildResult,
   reconstructHerdrJournal,
   type ChildResult,
   type ChildSessionLocation,
+  type ChildSessionObservation,
   type HerdrLifecycleState,
   type HerdrStateRecord,
   type JournalGeneration,
@@ -34,9 +44,28 @@ import {
 } from "./worktree.ts";
 
 const READY = new Set<AgentStatus>(["idle", "done", "blocked"]);
+const RESULT_ELIGIBLE = new Set<AgentStatus>(["idle", "done"]);
 const TERMINAL = new Set<HerdrLifecycleState>(["retained", "closed"]);
 const DEFAULT_WAIT_MS = 30_000;
 const MAX_WAIT_MS = 300_000;
+const DEFAULT_QUIET_PERIOD_MS = 30_000;
+const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
+
+interface ResultCandidate {
+  observation: ChildSessionObservation & { result: ChildResult };
+  fingerprint: string;
+}
+
+type StatusStreamOutcome =
+  | { kind: "event"; next: IteratorResult<AgentStatusEvent> }
+  | { kind: "stream-error"; error: unknown };
+
+class CleanSubscriptionEof extends Error {
+  constructor() {
+    super("Herdr subscription ended cleanly");
+    this.name = "CleanSubscriptionEof";
+  }
+}
 
 type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
@@ -150,6 +179,10 @@ export interface RuntimeOptions {
   parentProcessId?: number;
   readinessTimeoutMs?: number;
   pollIntervalMs?: number;
+  quietPeriodMs?: number;
+  reconnectDelaysMs?: readonly number[];
+  monitorDelay?: (ms: number, signal: AbortSignal) => Promise<void>;
+  observeChildSession?: typeof observeChildSession;
   cleanupTimeoutMs?: number;
   gitStatus?: GitStatus;
   appendState?: (customType: typeof HERDR_STATE_CUSTOM_TYPE, record: HerdrStateRecord) => void;
@@ -230,7 +263,7 @@ export function formatSubagentResult(run: Run, result: ChildResult): string {
   return [
     `<subagent_result run_id="${run.id}" profile="${run.profile}" generation="${generation}" child_entry_id="${result.childEntryId}" lifecycle="${run.lifecycle}">`,
     result.text,
-    `Artifact: ${run.artifactPath}`,
+    `Durable recovery artifact (read after compaction): ${run.artifactPath}`,
     ...(warning ? [warning] : ["Reader reminder: the child remains available for follow-ups; stop it when no longer needed."]),
     "</subagent_result>",
   ].join("\n");
@@ -294,6 +327,10 @@ export class SubagentRuntime {
   readonly #idFactory: () => string;
   readonly #readinessTimeoutMs: number;
   readonly #pollIntervalMs: number;
+  readonly #quietPeriodMs: number;
+  readonly #reconnectDelaysMs: readonly number[];
+  readonly #monitorDelay: (ms: number, signal: AbortSignal) => Promise<void>;
+  readonly #observeChildSession: typeof observeChildSession;
   readonly #cleanupTimeoutMs: number;
   readonly #gitStatus?: GitStatus;
   readonly #appendState?: RuntimeOptions["appendState"];
@@ -320,6 +357,10 @@ export class SubagentRuntime {
     this.parentProcessId = options.parentProcessId ?? process.pid;
     this.#readinessTimeoutMs = options.readinessTimeoutMs ?? 10_000;
     this.#pollIntervalMs = options.pollIntervalMs ?? 100;
+    this.#quietPeriodMs = options.quietPeriodMs ?? DEFAULT_QUIET_PERIOD_MS;
+    this.#reconnectDelaysMs = [...(options.reconnectDelaysMs ?? RECONNECT_DELAYS_MS)];
+    this.#monitorDelay = options.monitorDelay ?? delay;
+    this.#observeChildSession = options.observeChildSession ?? observeChildSession;
     this.#cleanupTimeoutMs = options.cleanupTimeoutMs ?? 10_000;
     this.#gitStatus = options.gitStatus;
     this.#appendState = options.appendState;
@@ -889,6 +930,7 @@ export class SubagentRuntime {
       tabId: run.tabId,
       workspaceId: run.workspaceId,
       profile: run.profile,
+      status: run.status,
       ...(run.generation ? { generation: this.#generationRecord(run.generation) } : {}),
       ...(state === "result_ready" && run.latestResult ? { result: run.latestResult } : {}),
       ...(run.worktree ? { worktree: { ...run.worktree } } : {}),
@@ -971,87 +1013,263 @@ export class SubagentRuntime {
   }
 
   #startMonitor(run: RunRecord): void {
-    const number = run.generation!.number;
-    if (run.monitorGeneration === number && run.monitor && !run.monitorController?.signal.aborted) return;
-    run.monitorController?.abort(new Error(`Generation ${number - 1} was replaced`));
+    const generation = run.generation!;
+    if (run.monitorGeneration === generation.number && run.monitor && !run.monitorController?.signal.aborted) return;
+    run.monitorController?.abort(new Error(`Generation ${generation.number - 1} was replaced`));
     const controller = new AbortController();
     run.monitorController = controller;
-    run.monitorGeneration = number;
-    run.monitor = this.#monitor(run, controller.signal);
+    run.monitorGeneration = generation.number;
+    run.monitor = this.#monitor(run, generation, controller);
   }
 
-  async #monitor(run: RunRecord, signal: AbortSignal): Promise<void> {
-    const generation = run.generation!;
+  #monitorIsCurrent(run: RunRecord, generation: Generation, controller: AbortController): boolean {
+    return !controller.signal.aborted
+      && run.lifecycle === "live"
+      && run.generation === generation
+      && run.monitorGeneration === generation.number
+      && run.monitorController === controller;
+  }
+
+  #assertMonitorCurrent(run: RunRecord, generation: Generation, controller: AbortController): void {
+    if (this.#monitorIsCurrent(run, generation, controller)) return;
+    const reason = controller.signal.reason;
+    throw reason instanceof Error ? reason : new Error(`Monitor is no longer current for run ${run.id}`);
+  }
+
+  #validateMonitorAgent(run: RunRecord, agent: AgentInfo): void {
+    if (
+      agent.terminalId !== run.terminalId
+      || agent.paneId !== run.paneId
+      || agent.tabId !== run.tabId
+      || agent.workspaceId !== run.workspaceId
+    ) throw new Error(`Herdr topology changed for run ${run.id}`);
+    if (!matchesChildSession(agent, run.childSessionId, run.childSessionDir, run.childSessionPath)) {
+      throw new Error(`Child session identity changed for run ${run.id}`);
+    }
+  }
+
+  #applyMonitorFacts(
+    run: RunRecord,
+    agentStatus: AgentStatus,
+    observation?: ChildSessionObservation,
+  ): void {
+    const statusChanged = run.status !== agentStatus;
+    run.status = agentStatus;
+    if (observation) run.childSessionPath = observation.childSessionPath;
+    run.updatedAt = this.#now();
+    if (statusChanged) this.#notifyRunsChanged();
+  }
+
+  #candidate(observation: ChildSessionObservation | undefined): ResultCandidate | undefined {
+    if (!observation?.result) return undefined;
+    return {
+      observation: observation as ChildSessionObservation & { result: ChildResult },
+      fingerprint: JSON.stringify([
+        observation.childSessionPath,
+        observation.activeLeafId,
+        observation.latestCompactionId ?? null,
+        observation.result.childEntryId,
+        observation.result.text,
+      ]),
+    };
+  }
+
+  async #reconcileMonitor(
+    run: RunRecord,
+    generation: Generation,
+    controller: AbortController,
+  ): Promise<ResultCandidate | undefined> {
+    const [agent, observation] = await Promise.all([
+      this.client.getAgent(run.terminalId, controller.signal),
+      this.#observeChildSession(run.location, generation.baselineEntryId),
+    ]);
+    this.#assertMonitorCurrent(run, generation, controller);
+    this.#validateMonitorAgent(run, agent);
+    this.#applyMonitorFacts(run, agent.status, observation);
+    return RESULT_ELIGIBLE.has(agent.status) ? this.#candidate(observation) : undefined;
+  }
+
+  async #observeEligibleEvent(
+    run: RunRecord,
+    generation: Generation,
+    controller: AbortController,
+    event: AgentStatusEvent,
+  ): Promise<ResultCandidate | undefined> {
+    if (event.paneId !== run.paneId || event.workspaceId !== run.workspaceId) {
+      throw new Error(`Herdr subscription topology changed for run ${run.id}`);
+    }
+    if (!RESULT_ELIGIBLE.has(event.status)) {
+      this.#assertMonitorCurrent(run, generation, controller);
+      this.#applyMonitorFacts(run, event.status);
+      return undefined;
+    }
+    const observation = await this.#observeChildSession(run.location, generation.baselineEntryId);
+    this.#assertMonitorCurrent(run, generation, controller);
+    this.#applyMonitorFacts(run, event.status, observation);
+    return this.#candidate(observation);
+  }
+
+  async #finalizeResult(
+    run: RunRecord,
+    generation: Generation,
+    candidate: ResultCandidate,
+    controller: AbortController,
+  ): Promise<void> {
+    this.#assertMonitorCurrent(run, generation, controller);
+    const result = candidate.observation.result;
+    run.childSessionPath = candidate.observation.childSessionPath;
+    run.latestResult = { childEntryId: result.childEntryId, text: result.text, message: result.message };
     try {
-      while (!signal.aborted && run.lifecycle === "live" && run.generation === generation) {
-        const agent = await this.client.getAgent(run.terminalId, signal);
-        this.#updateRun(run, agent);
-        if (!matchesChildSession(agent, run.childSessionId, run.childSessionDir, run.childSessionPath)) {
-          throw new Error(`Child session identity changed for run ${run.id}`);
-        }
-        const result = await readChildResult(run.location, generation.baselineEntryId, agent.status);
-        if (result) {
-          run.childSessionPath = result.childSessionPath;
-          run.latestResult = { childEntryId: result.childEntryId, text: result.text, message: result.message };
-          try {
-            await this.#appendArtifact(run,
-              renderGenerationSection({ generation: generation.number, speaker: "Subagent", body: result.text }),
-            );
-          } catch (error) {
-            run.archivePending = true;
-            run.lifecycle = "retained";
-            run.error = `Result archive required before delivery: ${errorMessage(error)}`;
-            generation.error = run.error;
-            run.retained = this.#allResourceFacts(run);
-            run.updatedAt = this.#now();
-            try { this.#record(run, "retained"); } catch { /* preserve the archive error */ }
-            this.#notifyRunsChanged();
-            if (!run.archiveActionSent) {
-              run.archiveActionSent = true;
-              try {
-                this.#deliverAction?.({
-                  customType: "herdr-subagent-action",
-                  content: `Run ${run.id} result is preserved but not delivered because its artifact could not be written. Artifact: ${run.artifactPath}. Retry with subagent_stop({ id: "${run.id}" }).`,
-                  display: true,
-                  details: {
-                    parentSessionId: run.parentSessionId,
-                    runId: run.id,
-                    artifactPath: run.artifactPath,
-                    reason: run.error,
-                  },
-                });
-              } catch { /* an action notice must not weaken retention */ }
+      await this.#appendArtifact(run,
+        renderGenerationSection({ generation: generation.number, speaker: "Subagent", body: result.text }),
+      );
+    } catch (error) {
+      if (!this.#monitorIsCurrent(run, generation, controller)) return;
+      controller.abort(error);
+      run.archivePending = true;
+      run.lifecycle = "retained";
+      run.error = `Result archive required before delivery: ${errorMessage(error)}`;
+      generation.error = run.error;
+      run.retained = this.#allResourceFacts(run);
+      run.updatedAt = this.#now();
+      try { this.#record(run, "retained"); } catch { /* preserve the archive error */ }
+      this.#notifyRunsChanged();
+      if (!run.archiveActionSent) {
+        run.archiveActionSent = true;
+        try {
+          this.#deliverAction?.({
+            customType: "herdr-subagent-action",
+            content: `Run ${run.id} result is preserved but not delivered because its artifact could not be written. Artifact: ${run.artifactPath}. Retry with subagent_stop({ id: "${run.id}" }).`,
+            display: true,
+            details: {
+              parentSessionId: run.parentSessionId,
+              runId: run.id,
+              artifactPath: run.artifactPath,
+              reason: run.error,
+            },
+          });
+        } catch { /* an action notice must not weaken retention */ }
+      }
+      run.complete?.({ error: new Error(run.error) });
+      return;
+    }
+    this.#assertMonitorCurrent(run, generation, controller);
+    generation.artifactResultPersisted = true;
+    run.resultContent = formatSubagentResult(run, run.latestResult);
+    generation.resultEntryId = result.childEntryId;
+    generation.error = undefined;
+    generation.delivery = "ready";
+    run.error = undefined;
+    run.updatedAt = this.#now();
+    this.#record(run, "result_ready");
+    this.#notifyRunsChanged();
+    if (generation.blockingWaiter) {
+      generation.delivery = "delivered";
+      generation.returned = true;
+      this.#record(run, "result_delivered");
+      this.#notifyRunsChanged();
+      this.#deliverySinceSettlement = true;
+      run.complete?.({ result: run.latestResult });
+    } else {
+      run.complete?.({ result: run.latestResult });
+      this.#queueDelivery(run, generation, run.latestResult);
+    }
+    controller.abort(new Error(`Generation ${generation.number} finalized`));
+  }
+
+  async #monitor(run: RunRecord, generation: Generation, controller: AbortController): Promise<void> {
+    let reconnectAttempt = 0;
+    let subscription: AgentStatusSubscription | undefined;
+    let quietController: AbortController | undefined;
+    try {
+      while (this.#monitorIsCurrent(run, generation, controller)) {
+        try {
+          subscription = await this.client.subscribeAgentStatus(run.paneId, run.workspaceId, controller.signal);
+          const activeSubscription = subscription;
+          this.#assertMonitorCurrent(run, generation, controller);
+          let candidate = await this.#reconcileMonitor(run, generation, controller);
+          let bufferedStreamOutcome: StatusStreamOutcome | undefined;
+          const readNextEvent = (): Promise<StatusStreamOutcome> => activeSubscription.next().then(
+            (next): StatusStreamOutcome => ({ kind: "event", next }),
+            (error: unknown): StatusStreamOutcome => ({ kind: "stream-error", error }),
+          ).then((outcome) => {
+            bufferedStreamOutcome = outcome;
+            return outcome;
+          });
+          let nextEvent = readNextEvent();
+          while (this.#monitorIsCurrent(run, generation, controller)) {
+            quietController?.abort(new Error("Quiet window replaced"));
+            quietController = undefined;
+            const quietOutcome = candidate
+              ? (() => {
+                  quietController = new AbortController();
+                  const signal = AbortSignal.any([controller.signal, quietController.signal]);
+                  return this.#monitorDelay(this.#quietPeriodMs, signal).then(
+                    () => ({ kind: "quiet" as const }),
+                    (error: unknown) => ({ kind: "quiet-error" as const, error, signal }),
+                  );
+                })()
+              : undefined;
+            const outcome = await (quietOutcome ? Promise.race([nextEvent, quietOutcome]) : nextEvent);
+            this.#assertMonitorCurrent(run, generation, controller);
+
+            if (outcome.kind === "stream-error") throw outcome.error;
+            if (outcome.kind === "quiet-error") {
+              if (outcome.signal.aborted) continue;
+              throw outcome.error;
             }
-            run.complete?.({ error: new Error(run.error) });
-            return;
+            if (outcome.kind === "event") {
+              bufferedStreamOutcome = undefined;
+              if (outcome.next.done) throw new CleanSubscriptionEof();
+              candidate = await this.#observeEligibleEvent(run, generation, controller, outcome.next.value);
+              nextEvent = readNextEvent();
+              continue;
+            }
+
+            const prior = candidate!;
+            const confirmed = await this.#reconcileMonitor(run, generation, controller);
+            await Promise.resolve();
+            const duringReconciliation = bufferedStreamOutcome;
+            if (duringReconciliation) {
+              bufferedStreamOutcome = undefined;
+              if (duringReconciliation.kind === "stream-error") throw duringReconciliation.error;
+              if (duringReconciliation.next.done) throw new CleanSubscriptionEof();
+              candidate = await this.#observeEligibleEvent(
+                run,
+                generation,
+                controller,
+                duringReconciliation.next.value,
+              );
+              nextEvent = readNextEvent();
+              continue;
+            }
+            if (!confirmed) {
+              candidate = undefined;
+            } else if (confirmed.fingerprint === prior.fingerprint) {
+              await this.#finalizeResult(run, generation, confirmed, controller);
+              return;
+            } else {
+              candidate = confirmed;
+            }
           }
-          generation.artifactResultPersisted = true;
-          run.resultContent = formatSubagentResult(run, run.latestResult);
-          generation.resultEntryId = result.childEntryId;
-          generation.error = undefined;
-          generation.delivery = "ready";
-          run.error = undefined;
-          run.updatedAt = this.#now();
-          this.#record(run, "result_ready");
-          this.#notifyRunsChanged();
-          if (generation.blockingWaiter) {
-            generation.delivery = "delivered";
-            generation.returned = true;
-            this.#record(run, "result_delivered");
-            this.#notifyRunsChanged();
-            this.#deliverySinceSettlement = true;
-            run.complete?.({ result: run.latestResult });
-          } else {
-            run.complete?.({ result: run.latestResult });
-            this.#queueDelivery(run, generation, run.latestResult);
-          }
-          return;
+        } catch (error) {
+          quietController?.abort(new Error("Subscription cycle ended"));
+          quietController = undefined;
+          try { await subscription?.return?.(); } catch { /* retain the original stream outcome */ }
+          subscription = undefined;
+          if (!this.#monitorIsCurrent(run, generation, controller)) return;
+          const recoverable = error instanceof CleanSubscriptionEof
+            || error instanceof HerdrSubscriptionTransportError;
+          if (!recoverable || reconnectAttempt >= this.#reconnectDelaysMs.length) throw error;
+          const backoff = this.#reconnectDelaysMs[reconnectAttempt++]!;
+          await this.#monitorDelay(backoff, controller.signal);
+          this.#assertMonitorCurrent(run, generation, controller);
         }
-        await delay(this.#pollIntervalMs, signal);
       }
     } catch (error) {
-      if (signal.aborted || run.lifecycle !== "live" || run.generation !== generation) return;
+      if (!this.#monitorIsCurrent(run, generation, controller)) return;
       const failure = error instanceof Error ? error : new Error(String(error));
+      controller.abort(failure);
       generation.error = failure.message;
       run.error = failure.message;
       run.lifecycle = "retained";
@@ -1077,6 +1295,9 @@ export class SubagentRuntime {
         } catch { /* an action notice must not weaken retention */ }
       }
       run.complete?.({ error: failure });
+    } finally {
+      quietController?.abort(new Error("Monitor ended"));
+      try { await subscription?.return?.(); } catch { /* monitor state already records any material failure */ }
     }
   }
 

@@ -1,5 +1,5 @@
-import { chmod, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { chmod, lstat, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const ARTIFACT_DIRECTORY = "herdr-subagent-artifacts";
@@ -15,6 +15,11 @@ export interface ArtifactIdentity {
 
 export interface ArtifactLocation {
   directory: string;
+  path: string;
+}
+
+export interface RunArtifact {
+  runId: string;
   path: string;
 }
 
@@ -84,6 +89,42 @@ export function resolveArtifactLocation(identity: ArtifactIdentity): ArtifactLoc
   const path = resolve(directory, `${identity.runId}.md`);
   assertContained(directory, path);
   return { directory, path };
+}
+
+export async function enumerateRunArtifacts(agentDir: string, parentSessionId: string): Promise<RunArtifact[]> {
+  const directory = resolveArtifactDirectory(agentDir, parentSessionId);
+  let entries;
+  try {
+    const rootStats = await lstat(dirname(directory));
+    if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
+      throw new Error(`Artifact root is not a real directory: ${dirname(directory)}`);
+    }
+    const directoryStats = await lstat(directory);
+    if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+      throw new Error(`Artifact directory is not a real directory: ${directory}`);
+    }
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+
+  const artifacts: RunArtifact[] = [];
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    if (!entry.isFile() || entry.name.startsWith(".") || !entry.name.endsWith(".md")) continue;
+    const runId = entry.name.slice(0, -3);
+    let location: ArtifactLocation;
+    try {
+      location = resolveArtifactLocation({ agentDir, parentSessionId, runId });
+    } catch {
+      continue;
+    }
+    if (location.directory !== directory || location.path !== resolve(directory, entry.name)) continue;
+    const stats = await lstat(location.path);
+    if (stats.isSymbolicLink() || !stats.isFile()) continue;
+    artifacts.push({ runId, path: location.path });
+  }
+  return artifacts;
 }
 
 export function renderArtifactHeader(header: ArtifactHeader): string {

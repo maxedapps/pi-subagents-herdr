@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 
-export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
+const AGENT_STATUSES = ["idle", "working", "blocked", "done", "unknown"] as const;
+
+export type AgentStatus = (typeof AGENT_STATUSES)[number];
 export type JsonRecord = Record<string, unknown>;
+
+export function isAgentStatus(value: unknown): value is AgentStatus {
+  return (AGENT_STATUSES as readonly unknown[]).includes(value);
+}
 
 export interface AgentSessionReference {
   agent: string;
@@ -44,10 +50,21 @@ export interface WorkspaceInfo {
   worktree: WorkspaceWorktreeInfo | null;
 }
 
+export interface AgentStatusEvent {
+  paneId: string;
+  workspaceId: string;
+  status: AgentStatus;
+}
+
+export interface AgentStatusSubscription extends AsyncIterableIterator<AgentStatusEvent> {
+  [Symbol.asyncIterator](): AgentStatusSubscription;
+}
+
 export interface HerdrClient {
   createTab(input: JsonRecord, signal?: AbortSignal): Promise<CreatedTab>;
   startAgent(input: JsonRecord, signal?: AbortSignal): Promise<AgentInfo>;
   getAgent(target: string, signal?: AbortSignal): Promise<AgentInfo>;
+  subscribeAgentStatus(paneId: string, workspaceId: string, signal?: AbortSignal): Promise<AgentStatusSubscription>;
   sendInput(paneId: string, text: string, signal?: AbortSignal): Promise<void>;
   closePane(paneId: string, signal?: AbortSignal): Promise<void>;
   closeTab(tabId: string, signal?: AbortSignal): Promise<void>;
@@ -74,6 +91,13 @@ export class HerdrTimeoutError extends HerdrError {
   }
 }
 
+export class HerdrSubscriptionTransportError extends HerdrError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "HerdrSubscriptionTransportError";
+  }
+}
+
 function record(value: unknown, label: string): JsonRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new HerdrError(`${label} must be an object`);
@@ -92,10 +116,8 @@ function boolean(value: unknown, label: string): boolean {
 }
 
 function status(value: unknown, label: string): AgentStatus {
-  if (!(["idle", "working", "blocked", "done", "unknown"] as const).includes(value as AgentStatus)) {
-    throw new HerdrError(`${label} is not a valid agent status`);
-  }
-  return value as AgentStatus;
+  if (!isAgentStatus(value)) throw new HerdrError(`${label} is not a valid agent status`);
+  return value;
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -169,6 +191,175 @@ export class SocketHerdrClient implements HerdrClient {
 
   async getAgent(target: string, signal?: AbortSignal): Promise<AgentInfo> {
     return decodeAgent((await this.#request("agent.get", { target }, "agent_info", signal)).agent);
+  }
+
+  async subscribeAgentStatus(
+    paneId: string,
+    workspaceId: string,
+    signal?: AbortSignal,
+  ): Promise<AgentStatusSubscription> {
+    if (signal?.aborted) throw abortError(signal);
+    const id = this.#idFactory();
+    let socket: Socket;
+    try {
+      socket = await this.#connect(signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      throw new HerdrSubscriptionTransportError("Herdr subscription setup failed", { cause: error });
+    }
+
+    return new Promise<AgentStatusSubscription>((resolve, reject) => {
+      let buffer = "";
+      let acknowledged = false;
+      let finished = false;
+      let terminalError: unknown;
+      const queued: AgentStatusEvent[] = [];
+      const waiters: Array<{
+        resolve: (result: IteratorResult<AgentStatusEvent>) => void;
+        reject: (error: unknown) => void;
+      }> = [];
+      const timer = setTimeout(
+        () => finish(new HerdrSubscriptionTransportError(
+          `Herdr subscription acknowledgement timed out after ${this.responseTimeoutMs}ms`,
+        )),
+        this.responseTimeoutMs,
+      );
+      const onAbort = () => {
+        queued.length = 0;
+        finish(abortError(signal!));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        socket.removeAllListeners();
+        socket.destroy();
+      };
+      const finish = (error?: unknown) => {
+        if (finished) return;
+        finished = true;
+        terminalError = error;
+        cleanup();
+        if (!acknowledged) {
+          reject(error ?? new HerdrSubscriptionTransportError("Herdr disconnected before acknowledging the subscription"));
+          return;
+        }
+        for (const waiter of waiters.splice(0)) {
+          if (error === undefined) waiter.resolve({ value: undefined, done: true });
+          else waiter.reject(error);
+        }
+      };
+      const subscription: AgentStatusSubscription = {
+        next: () => {
+          const event = queued.shift();
+          if (event) return Promise.resolve({ value: event, done: false });
+          if (finished) {
+            return terminalError === undefined
+              ? Promise.resolve({ value: undefined, done: true })
+              : Promise.reject(terminalError);
+          }
+          return new Promise((resolveNext, rejectNext) => {
+            waiters.push({ resolve: resolveNext, reject: rejectNext });
+          });
+        },
+        return: async () => {
+          queued.length = 0;
+          finish();
+          return { value: undefined, done: true };
+        },
+        throw: async (error?: unknown) => {
+          const rejection = error ?? new HerdrError("Herdr subscription consumer failed");
+          queued.length = 0;
+          finish(rejection);
+          throw rejection;
+        },
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      };
+      const emit = (event: AgentStatusEvent) => {
+        const waiter = waiters.shift();
+        if (waiter) waiter.resolve({ value: event, done: false });
+        else queued.push(event);
+      };
+      const decodeLine = (line: string) => {
+        const envelope = record(JSON.parse(line) as unknown, acknowledged ? "Herdr event" : "Herdr response");
+        if (!acknowledged) {
+          if (string(envelope.id, "response.id") !== id) throw new HerdrError("Herdr response ID mismatch");
+          const hasResult = Object.hasOwn(envelope, "result");
+          const hasError = Object.hasOwn(envelope, "error");
+          if (hasResult === hasError) throw new HerdrError("Herdr response must contain exactly one result or error");
+          if (hasError) {
+            const error = record(envelope.error, "response.error");
+            const code = string(error.code, "error.code");
+            throw new HerdrError(`Herdr ${code}: ${string(error.message, "error.message")}`, { code });
+          }
+          const result = record(envelope.result, "response.result");
+          if (string(result.type, "result.type") !== "subscription_started") {
+            throw new HerdrError(`Expected Herdr result subscription_started, received ${String(result.type)}`);
+          }
+          acknowledged = true;
+          clearTimeout(timer);
+          resolve(subscription);
+          return;
+        }
+
+        if (string(envelope.event, "event.event") !== "pane.agent_status_changed") {
+          throw new HerdrError(`Unexpected Herdr event type: ${String(envelope.event)}`);
+        }
+        const data = record(envelope.data, "event.data");
+        const eventPaneId = string(data.pane_id, "event.data.pane_id");
+        const eventWorkspaceId = string(data.workspace_id, "event.data.workspace_id");
+        if (eventPaneId !== paneId) throw new HerdrError(`Herdr event pane mismatch: ${eventPaneId}`);
+        if (eventWorkspaceId !== workspaceId) throw new HerdrError(`Herdr event workspace mismatch: ${eventWorkspaceId}`);
+        emit({
+          paneId: eventPaneId,
+          workspaceId: eventWorkspaceId,
+          status: status(data.agent_status, "event.data.agent_status"),
+        });
+      };
+
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        let newline = buffer.indexOf("\n");
+        while (newline >= 0 && !finished) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          try {
+            decodeLine(line);
+          } catch (error) {
+            finish(error instanceof SyntaxError ? new HerdrError("Herdr returned malformed JSON", { cause: error }) : error);
+          }
+          newline = buffer.indexOf("\n");
+        }
+      });
+      socket.once("error", (error) => finish(new HerdrSubscriptionTransportError(
+        "Herdr subscription transport failed",
+        { cause: error },
+      )));
+      socket.once("end", () => {
+        if (buffer.length > 0) finish(new HerdrError("Herdr subscription stream was truncated"));
+        else if (!acknowledged) finish(new HerdrSubscriptionTransportError(
+          "Herdr disconnected before acknowledging the subscription",
+        ));
+        else finish();
+      });
+      socket.once("close", () => {
+        if (!finished) finish(new HerdrSubscriptionTransportError(
+          "Herdr subscription transport closed unexpectedly",
+        ));
+      });
+      socket.write(`${JSON.stringify({
+        id,
+        method: "events.subscribe",
+        params: { subscriptions: [{ type: "pane.agent_status_changed", pane_id: paneId }] },
+      })}\n`);
+    });
   }
 
   async sendInput(paneId: string, text: string, signal?: AbortSignal): Promise<void> {

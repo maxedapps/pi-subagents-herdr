@@ -8,6 +8,8 @@ import test from "node:test";
 import {
   captureChildCursor,
   HERDR_STATE_CUSTOM_TYPE,
+  inventoryHerdrJournal,
+  observeChildSession,
   openChildSession,
   readChildResult,
   reconstructHerdrJournal,
@@ -52,6 +54,7 @@ test("first cursor is null before Pi persists a session and discovery uses the e
   await fixture(async (location, manager) => {
     assert.deepEqual(await captureChildCursor(location, true), { baselineEntryId: null });
     assert.equal(await openChildSession(location), undefined);
+    assert.equal(await observeChildSession(location, null), undefined);
     manager.appendMessage({ role: "user", content: "task", timestamp: Date.now() });
     manager.appendMessage(assistant(["done"]));
     const other = SessionManager.create(location.childCwd, location.childSessionDir, { id: "herdr-run-other" });
@@ -79,6 +82,50 @@ test("fresh snapshots select the last non-toolUse assistant after the active-bra
     assert.equal(result?.text, "second result");
     assert.equal(result?.message.responseId, "response-metadata");
     assert.deepEqual(result?.message, final);
+  });
+});
+
+test("child observations fingerprint the active leaf, latest compaction, and latest eligible result", async () => {
+  await fixture(async (location, manager) => {
+    const rootId = manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+    const baselineId = manager.appendMessage(assistant(["baseline"]));
+
+    const baseline = await observeChildSession(location, baselineId);
+    assert.equal(baseline?.activeLeafId, baselineId);
+    assert.equal(baseline?.latestCompactionId, undefined);
+    assert.equal(baseline?.result, undefined);
+    assert.deepEqual(await observeChildSession(location, baselineId), baseline);
+
+    manager.appendMessage(assistant(["tool output"], "toolUse"));
+    const firstResult = assistant(["first ", "eligible"]);
+    const firstResultId = manager.appendMessage(firstResult);
+    const withResult = await observeChildSession(location, baselineId);
+    assert.equal(withResult?.activeLeafId, firstResultId);
+    assert.deepEqual(withResult?.result, {
+      childEntryId: firstResultId,
+      text: "first eligible",
+      message: firstResult,
+    });
+
+    const compactionId = manager.appendCompaction("summary", baselineId, 100);
+    const compacted = await observeChildSession(location, baselineId);
+    assert.equal(compacted?.activeLeafId, compactionId);
+    assert.equal(compacted?.latestCompactionId, compactionId);
+    assert.equal(compacted?.result?.childEntryId, firstResultId);
+
+    const replacement = assistant(["replacement"]);
+    const replacementId = manager.appendMessage(replacement);
+    const replaced = await observeChildSession(location, baselineId);
+    assert.equal(replaced?.activeLeafId, replacementId);
+    assert.equal(replaced?.latestCompactionId, compactionId);
+    assert.equal(replaced?.result?.childEntryId, replacementId);
+
+    manager.branch(rootId);
+    const branchResultId = manager.appendMessage(assistant(["branch result"]));
+    const moved = await observeChildSession(location, null);
+    assert.equal(moved?.activeLeafId, branchResultId);
+    assert.equal(moved?.latestCompactionId, undefined);
+    assert.equal(moved?.result?.childEntryId, branchResultId);
   });
 });
 
@@ -131,8 +178,66 @@ test("journal replay accepts old records and validates optional artifact milesto
       ...base,
       generation: { ...base.generation, artifactResultPersisted: false },
     });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { baselineEntryId: null, delivery: "pending" } });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { number: 1, baselineEntryId: 4, delivery: "pending" } });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { number: 1, baselineEntryId: null, delivery: "settled" } });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { ...base.generation, returned: "yes" } });
     replayed = reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile);
-    assert.equal(replayed.invalidEntries, 3);
+    assert.equal(replayed.invalidEntries, 7);
+  });
+});
+
+test("full-session inventory includes historical branches with append-latest values and first-seen order", async () => {
+  await fixture(async (_location, manager) => {
+    const rootId = manager.appendMessage({ role: "user", content: "parent", timestamp: Date.now() });
+    const parentSessionFile = manager.getSessionFile()!;
+    const base = {
+      state: "generation_pending" as const,
+      at: 1,
+      parentSessionId: manager.getSessionId(),
+      parentSessionFile,
+      parentEntryId: rootId,
+      parentInstanceId: "instance",
+      parentProcessId: 1,
+      childSessionId: "child",
+      childSessionDir: "/sessions/child",
+      childCwd: "/repo",
+      terminalId: "term",
+      paneId: "pane",
+      tabId: "tab",
+      workspaceId: "workspace",
+      profile: "scout" as const,
+      status: "working" as const,
+    };
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, runId: "run-one" });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, runId: "run-two", profile: "worker" });
+    const latestOneId = manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, {
+      ...base,
+      runId: "run-one",
+      at: 2,
+      state: "result_delivered",
+      status: "done",
+      generation: { number: 1, baselineEntryId: null, delivery: "delivered", artifactResultPersisted: true },
+    });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, runId: "run-foreign", parentSessionId: "other" });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, runId: "run-malformed", status: "settled" });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, {
+      ...base,
+      runId: "run-one",
+      at: 3,
+      generation: { number: "three", baselineEntryId: null, delivery: "delivered" },
+    });
+    manager.branch(rootId);
+    manager.appendMessage(assistant(["active branch"]));
+
+    const inventory = inventoryHerdrJournal(manager.getEntries(), manager.getSessionId(), parentSessionFile);
+    assert.deepEqual([...inventory.runs.keys()], ["run-one", "run-two"]);
+    assert.equal(inventory.runs.get("run-one")?.latestEntryId, latestOneId);
+    assert.equal(inventory.runs.get("run-one")?.latest.state, "result_delivered");
+    assert.equal(inventory.runs.get("run-one")?.latest.status, "done");
+    assert.equal(inventory.invalidEntries, 2);
+    assert.equal(manager.getBranch().some(({ id }) => id === latestOneId), false);
+    assert.equal(reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile).runs.size, 0);
   });
 });
 

@@ -2,6 +2,8 @@ import type {
   AgentInfo,
   AgentSessionReference,
   AgentStatus,
+  AgentStatusEvent,
+  AgentStatusSubscription,
   CreatedTab,
   CreatedWorktree,
   HerdrClient,
@@ -15,12 +17,123 @@ export interface Call {
   signal?: AbortSignal;
 }
 
+export class ControllableAgentStatusStream implements AgentStatusSubscription {
+  readonly paneId: string;
+  readonly workspaceId: string;
+  readonly signal?: AbortSignal;
+  readonly ready: Promise<AgentStatusSubscription>;
+  acknowledged = false;
+  aborted = false;
+  closed = false;
+  closeCount = 0;
+  emittedStatuses: AgentStatus[] = [];
+
+  readonly #queued: AgentStatusEvent[] = [];
+  readonly #waiters: Array<{
+    resolve: (result: IteratorResult<AgentStatusEvent>) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  readonly #resolveReady: (subscription: AgentStatusSubscription) => void;
+  readonly #rejectReady: (error: unknown) => void;
+  #terminalError: unknown;
+
+  constructor(paneId: string, workspaceId: string, signal?: AbortSignal) {
+    this.paneId = paneId;
+    this.workspaceId = workspaceId;
+    this.signal = signal;
+    let resolveReady!: (subscription: AgentStatusSubscription) => void;
+    let rejectReady!: (error: unknown) => void;
+    this.ready = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    this.#resolveReady = resolveReady;
+    this.#rejectReady = rejectReady;
+    if (signal?.aborted) this.#abort();
+    else signal?.addEventListener("abort", this.#abort, { once: true });
+  }
+
+  acknowledge(): void {
+    if (this.closed) throw new Error("Cannot acknowledge a closed status stream");
+    if (this.acknowledged) return;
+    this.acknowledged = true;
+    this.#resolveReady(this);
+  }
+
+  emit(status: AgentStatus): void {
+    if (!this.acknowledged || this.closed) throw new Error("Status stream is not open");
+    const event = { paneId: this.paneId, workspaceId: this.workspaceId, status };
+    this.emittedStatuses.push(status);
+    const waiter = this.#waiters.shift();
+    if (waiter) waiter.resolve({ value: event, done: false });
+    else this.#queued.push(event);
+  }
+
+  end(): void {
+    this.#finish();
+  }
+
+  fail(error = new Error("status stream failed")): void {
+    this.#finish(error);
+  }
+
+  next(): Promise<IteratorResult<AgentStatusEvent>> {
+    const event = this.#queued.shift();
+    if (event) return Promise.resolve({ value: event, done: false });
+    if (this.closed) {
+      return this.#terminalError === undefined
+        ? Promise.resolve({ value: undefined, done: true })
+        : Promise.reject(this.#terminalError);
+    }
+    return new Promise((resolve, reject) => this.#waiters.push({ resolve, reject }));
+  }
+
+  async return(): Promise<IteratorResult<AgentStatusEvent>> {
+    this.#queued.length = 0;
+    this.#finish();
+    return { value: undefined, done: true };
+  }
+
+  async throw(error?: unknown): Promise<IteratorResult<AgentStatusEvent>> {
+    const rejection = error ?? new Error("status stream consumer failed");
+    this.#queued.length = 0;
+    this.#finish(rejection);
+    throw rejection;
+  }
+
+  [Symbol.asyncIterator](): AgentStatusSubscription {
+    return this;
+  }
+
+  readonly #abort = (): void => {
+    this.aborted = true;
+    this.#queued.length = 0;
+    this.#finish(this.signal?.reason ?? new DOMException("The operation was aborted", "AbortError"));
+  };
+
+  #finish(error?: unknown): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.closeCount++;
+    this.#terminalError = error;
+    this.signal?.removeEventListener("abort", this.#abort);
+    if (!this.acknowledged) this.#rejectReady(error ?? new Error("Status stream ended before acknowledgement"));
+    for (const waiter of this.#waiters.splice(0)) {
+      if (error === undefined) waiter.resolve({ value: undefined, done: true });
+      else waiter.reject(error);
+    }
+  }
+}
+
 export class FakeHerdr implements HerdrClient {
   calls: Call[] = [];
+  statusSubscriptions: ControllableAgentStatusStream[] = [];
+  autoAcknowledgeSubscriptions = true;
   startStatus: AgentStatus = "working";
   statuses: AgentStatus[] = ["idle"];
   agentNames: Array<string | undefined> = [];
   sessionValues: Array<string | undefined> = [];
+  paneIds: string[] = [];
   agentSessionForStart?: (input: JsonRecord, sessionId: string) => AgentSessionReference;
   failStartAgent = false;
   failClosePane = false;
@@ -56,7 +169,7 @@ export class FakeHerdr implements HerdrClient {
       terminalId: "term-child",
       workspaceId: String(input.workspace_id),
       tabId: String(input.tab_id),
-      paneId: `${String(input.workspace_id)}:p-child`,
+      paneId: this.paneIds.shift() ?? `${String(input.workspace_id)}:p-child`,
       status: this.startStatus,
     };
     return this.copyAgent();
@@ -85,6 +198,20 @@ export class FakeHerdr implements HerdrClient {
       else this.agent.agentSession = { agent: "pi", kind: "id", value };
     }
     return this.copyAgent();
+  }
+
+  async subscribeAgentStatus(
+    paneId: string,
+    workspaceId: string,
+    signal?: AbortSignal,
+  ): Promise<AgentStatusSubscription> {
+    this.calls.push({ method: "events.subscribe", input: { paneId, workspaceId }, signal });
+    const stream = new ControllableAgentStatusStream(paneId, workspaceId, signal);
+    this.statusSubscriptions.push(stream);
+    if (this.autoAcknowledgeSubscriptions) queueMicrotask(() => {
+      if (!stream.closed) stream.acknowledge();
+    });
+    return await stream.ready;
   }
 
   async sendInput(paneId: string, text: string, signal?: AbortSignal): Promise<void> {
