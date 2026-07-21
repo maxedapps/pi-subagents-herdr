@@ -1,12 +1,47 @@
 # Pi Herdr Subagents
 
-A private Pi extension for visible, persistent subagents in Herdr. It exposes exactly four strict tools, delivers structured results automatically by default, and binds every run to one persisted parent session and extension instance.
+A [Pi](https://github.com/earendil-works/pi-mono) package for visible, persistent subagents in [Herdr](https://herdr.dev). It exposes exactly four strict tools, delivers structured results automatically by default, and binds every run to one persisted parent session and extension instance.
 
 ## Requirements
 
-The parent Pi process must run inside Herdr with `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID`. Starting a child from an ephemeral parent is rejected because durable ownership cannot be recorded.
+- Node.js 22.19.0 or newer.
+- A Pi installation running inside Herdr.
+- A persisted parent Pi session.
 
-Children set `PI_HERDR_SUBAGENT=1`, which prevents recursive extension and skill registration.
+Herdr must provide `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID` to enable the extension. When either value is unavailable, the extension deactivates safely: Pi still starts, the Herdr tools and bundled skill are not registered, and UI-capable modes show one short informational notice. This package is not a standalone subagent runner and cannot start children from an ordinary Pi process outside Herdr. Starting a child from an ephemeral parent is rejected because durable ownership cannot be recorded.
+
+Children set `PI_HERDR_SUBAGENT=1`, which silently prevents recursive extension and skill registration even if the parent Herdr environment is unavailable. The package intentionally loads its bundled skill through the active parent extension rather than declaring it as an independently discovered Pi package resource.
+
+## Installation
+
+Install the package globally for your Pi user:
+
+```bash
+pi install npm:@maxedapps/pi-subagents-herdr
+```
+
+To test a specific version for one Pi run without installing it permanently:
+
+```bash
+pi -e npm:@maxedapps/pi-subagents-herdr@0.1.0
+```
+
+Run those Pi processes through Herdr to enable the subagent tools and bundled skill.
+
+Update or remove the package with:
+
+```bash
+pi update npm:@maxedapps/pi-subagents-herdr
+pi remove npm:@maxedapps/pi-subagents-herdr
+```
+
+Installing an explicit npm version pins that version. Pi package updates do not move pinned installations to a newer release.
+
+## Security
+
+Pi extensions execute with the current user's full system permissions. Review this package before installing it, and run it only in repositories and Herdr workspaces you trust.
+
+Reader profiles are read-only. Worker profiles can execute shell commands and edit files only in an isolated Herdr worktree. Cleanup deliberately retains dirty or uncheckable worktrees and generated branches for manual inspection; it never force-removes worktrees, deletes branches, or integrates commits.
 
 ## Fixed profiles
 
@@ -91,8 +126,14 @@ Herdr labels are diagnostic only: `subagent:<parentSessionShortId>:<runId>`.
 ## Development
 
 ```bash
+npm ci
 npm run check
 npm pack --dry-run
+npm publish --dry-run
 ```
 
-The package is private, has no runtime dependencies, and declares only Pi AI, Pi coding-agent, and TypeBox as peers.
+The package has no third-party runtime dependencies. Pi AI, Pi coding-agent, Pi TUI, and TypeBox are declared as peer dependencies and are provided by Pi at runtime.
+
+## License
+
+[MIT](LICENSE)

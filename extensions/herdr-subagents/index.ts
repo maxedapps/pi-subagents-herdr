@@ -137,6 +137,18 @@ function tuiWidget(presentation: WidgetPresentation) {
 export default function herdrSubagents(pi: ExtensionAPI): void {
   if (process.env.PI_HERDR_SUBAGENT === "1") return;
 
+  const socketPath = process.env.HERDR_SOCKET_PATH;
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!socketPath || !workspaceId) {
+    let notified = false;
+    pi.on("session_start", (_event, ctx) => {
+      if (notified || !ctx.hasUI) return;
+      notified = true;
+      ctx.ui.notify("Herdr subagents inactive: start Pi through Herdr to enable them.", "info");
+    });
+    return;
+  }
+
   const parentInstanceId = randomUUID();
   let refreshWidget: () => void = noRefresh;
   let refreshOwner: object | undefined;
@@ -145,9 +157,9 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
   let catalogVersion = 0;
   let catalogPending = false;
   const runtime = new SubagentRuntime(
-    new SocketHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH ?? "" }),
+    new SocketHerdrClient({ socketPath }),
     {
-      workspaceId: process.env.HERDR_WORKSPACE_ID ?? "",
+      workspaceId,
       agentDir: getAgentDir(),
     },
     {

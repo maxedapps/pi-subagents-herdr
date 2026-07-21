@@ -29,6 +29,11 @@ interface WidgetCall {
   options: unknown;
 }
 
+interface NotificationCall {
+  message: string;
+  type: "info" | "warning" | "error" | undefined;
+}
+
 function fakeTheme() {
   const calls: Array<{ token: string; text: string }> = [];
   return {
@@ -77,12 +82,16 @@ function mockRun(overrides: Partial<Run> = {}): Run {
   };
 }
 
-function mockUI(): { ui: any; calls: WidgetCall[] } {
+function mockUI(): { ui: any; calls: WidgetCall[]; notifications: NotificationCall[] } {
   const calls: WidgetCall[] = [];
+  const notifications: NotificationCall[] = [];
   return {
     calls,
+    notifications,
     ui: {
-      notify() {},
+      notify(message: string, type?: NotificationCall["type"]) {
+        notifications.push({ message, type });
+      },
       setWidget(key: string, content: string[] | WidgetFactory | undefined, options?: unknown) {
         calls.push({ key, content, options });
       },
@@ -191,21 +200,28 @@ function mockPi(): { pi: ExtensionAPI; registered: Registered } {
   return { pi: pi as unknown as ExtensionAPI, registered };
 }
 
-function withParentEnvironment(run: () => void): void {
+function withExtensionEnvironment(
+  environment: { child?: string; socket?: string; workspace?: string },
+  run: () => void,
+): void {
   const before = {
     child: process.env.PI_HERDR_SUBAGENT,
     socket: process.env.HERDR_SOCKET_PATH,
     workspace: process.env.HERDR_WORKSPACE_ID,
   };
-  delete process.env.PI_HERDR_SUBAGENT;
-  process.env.HERDR_SOCKET_PATH = "/tmp/test-herdr.sock";
-  process.env.HERDR_WORKSPACE_ID = "w-test";
+  if (environment.child === undefined) delete process.env.PI_HERDR_SUBAGENT; else process.env.PI_HERDR_SUBAGENT = environment.child;
+  if (environment.socket === undefined) delete process.env.HERDR_SOCKET_PATH; else process.env.HERDR_SOCKET_PATH = environment.socket;
+  if (environment.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = environment.workspace;
   try { run(); }
   finally {
     if (before.child === undefined) delete process.env.PI_HERDR_SUBAGENT; else process.env.PI_HERDR_SUBAGENT = before.child;
     if (before.socket === undefined) delete process.env.HERDR_SOCKET_PATH; else process.env.HERDR_SOCKET_PATH = before.socket;
     if (before.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = before.workspace;
   }
+}
+
+function withParentEnvironment(run: () => void): void {
+  withExtensionEnvironment({ socket: "/tmp/test-herdr.sock", workspace: "w-test" }, run);
 }
 
 function extensionWithRuntimeCapture() {
@@ -454,6 +470,62 @@ test("parent registers exactly four tools, one skill hook, and result confirmati
   assert.match(resources.skillPaths[0] ?? "", /skills\/use-herdr-subagents\/SKILL\.md$/);
   assert.equal(existsSync(resources.skillPaths[0] ?? ""), true);
 }));
+
+test("missing Herdr environment deactivates all tools, skills, and operational hooks", async () => {
+  const cases = [
+    { name: "both missing", environment: {} },
+    { name: "both empty", environment: { socket: "", workspace: "" } },
+    { name: "socket missing", environment: { workspace: "w-test" } },
+    { name: "workspace missing", environment: { socket: "/tmp/test-herdr.sock" } },
+  ];
+
+  for (const { name, environment } of cases) {
+    let registered!: Registered;
+    withExtensionEnvironment(environment, () => {
+      const mocked = mockPi();
+      registered = mocked.registered;
+      extension(mocked.pi);
+    });
+    assert.deepEqual(registered.tools, [], name);
+    assert.deepEqual(registered.events.map(({ name }) => name), ["session_start"], name);
+    assert.deepEqual(registered.commands, [], name);
+    assert.deepEqual(registered.messages, [], name);
+
+    const mockedUI = mockUI();
+    const ctx = mockContext(`inactive-${name}`, true, mockedUI.ui);
+    await event(registered, "session_start")({ reason: "startup" }, ctx);
+    await event(registered, "session_start")({ reason: "reload" }, ctx);
+    assert.deepEqual(mockedUI.notifications, [{
+      message: "Herdr subagents inactive: start Pi through Herdr to enable them.",
+      type: "info",
+    }], name);
+    assert.deepEqual(mockedUI.calls, [], name);
+  }
+});
+
+test("inactive notification respects UI-capable and headless modes", async () => {
+  for (const { mode, hasUI } of [
+    { mode: "tui", hasUI: true },
+    { mode: "rpc", hasUI: true },
+    { mode: "json", hasUI: false },
+    { mode: "print", hasUI: false },
+  ]) {
+    let registered!: Registered;
+    withExtensionEnvironment({}, () => {
+      const mocked = mockPi();
+      registered = mocked.registered;
+      extension(mocked.pi);
+    });
+    const mockedUI = mockUI();
+    await event(registered, "session_start")(
+      { reason: "startup" },
+      mockContext(`inactive-${mode}`, hasUI, mockedUI.ui, mode),
+    );
+    assert.equal(mockedUI.notifications.length, hasUI ? 1 : 0, mode);
+    assert.deepEqual(mockedUI.calls, [], mode);
+    assert.deepEqual(registered.messages, [], mode);
+  }
+});
 
 test("post-compaction recovery catalogs are complete, transient, one-shot, and session-scoped", async () => {
   const fixture = extensionWithRuntimeCapture();
@@ -742,17 +814,11 @@ test("print and JSON no-UI lifecycles leave widget handling as a no-op", async (
   }
 });
 
-test("child guard registers nothing", () => {
-  const before = process.env.PI_HERDR_SUBAGENT;
-  process.env.PI_HERDR_SUBAGENT = "1";
-  try {
-    const { pi, registered } = mockPi();
-    extension(pi);
-    assert.deepEqual(registered, { tools: [], events: [], commands: [], messages: [] });
-  } finally {
-    if (before === undefined) delete process.env.PI_HERDR_SUBAGENT; else process.env.PI_HERDR_SUBAGENT = before;
-  }
-});
+test("child guard registers nothing even without the parent Herdr environment", () => withExtensionEnvironment({ child: "1" }, () => {
+  const { pi, registered } = mockPi();
+  extension(pi);
+  assert.deepEqual(registered, { tools: [], events: [], commands: [], messages: [] });
+}));
 
 test("fixed profiles expose only approved controls", () => {
   assert.deepEqual(Object.keys(PROFILES), ["scout", "researcher", "worker"]);

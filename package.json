@@ -1,17 +1,29 @@
 {
-  "name": "pi-subagents-herdr",
+  "name": "@maxedapps/pi-subagents-herdr",
   "version": "0.1.0",
-  "private": true,
-  "description": "Minimal visible Pi subagents backed by Herdr",
+  "description": "Visible, persistent Pi subagents backed by Herdr",
   "type": "module",
   "keywords": ["pi-package", "pi", "herdr", "subagents"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maxedapps/pi-subagents-herdr.git"
+  },
+  "homepage": "https://github.com/maxedapps/pi-subagents-herdr#readme",
+  "bugs": {
+    "url": "https://github.com/maxedapps/pi-subagents-herdr/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run check"
   },
   "pi": {
     "extensions": ["./extensions/herdr-subagents/index.ts"]
@@ -20,7 +32,8 @@
     "extensions/",
     "src/",
     "skills/",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
