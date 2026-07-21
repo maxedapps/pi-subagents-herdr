@@ -1,16 +1,31 @@
 # Pi Herdr Subagents
 
-A [Pi](https://github.com/earendil-works/pi-mono) package for visible, persistent subagents in [Herdr](https://herdr.dev). It exposes exactly four strict tools, delivers structured results automatically by default, and binds every run to one persisted parent session and extension instance.
+Visible, persistent Pi subagents for [Herdr](https://herdr.dev).
+
+This Pi package lets the parent agent delegate focused work to additional Pi sessions. Each subagent appears in its own Herdr pane, uses a fixed safety profile, and returns a structured result to the parent automatically. Read-only agents can investigate in parallel, while a worker makes changes only in an isolated Herdr worktree.
+
+## What it provides
+
+- Visible subagents running in dedicated Herdr panes
+- Background execution by default
+- Read-only `scout` and `researcher` profiles
+- One isolated implementation `worker`
+- Automatic structured result delivery
+- Follow-up messages in the same child session
+- A compact current-session status widget
+- Durable Markdown artifacts for recovery after compaction
+- Conservative cleanup that never discards uncommitted worker changes
 
 ## Requirements
 
-- Node.js 22.19.0 or newer.
-- A Pi installation running inside Herdr.
-- A persisted parent Pi session.
+- Node.js 22.19.0 or newer
+- [Pi](https://github.com/earendil-works/pi-mono)
+- [Herdr](https://herdr.dev)
+- A persisted parent Pi session
 
-Herdr must provide `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID` to enable the extension. When either value is unavailable, the extension deactivates safely: Pi still starts, the Herdr tools and bundled skill are not registered, and UI-capable modes show one short informational notice. This package is not a standalone subagent runner and cannot start children from an ordinary Pi process outside Herdr. Starting a child from an ephemeral parent is rejected because durable ownership cannot be recorded.
+Pi must be launched through Herdr so that `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID` are available. Do not start the parent with `--no-session`; durable ownership requires a persisted session.
 
-Children set `PI_HERDR_SUBAGENT=1`, which silently prevents recursive extension and skill registration even if the parent Herdr environment is unavailable. The package intentionally loads its bundled skill through the active parent extension rather than declaring it as an independently discovered Pi package resource.
+Outside Herdr, the package deactivates safely. Pi still starts, no subagent tools or skill are registered, and UI-capable modes show a short informational notice.
 
 ## Installation
 
@@ -20,119 +35,145 @@ Install the package globally for your Pi user:
 pi install npm:@maxedapps/pi-subagents-herdr
 ```
 
-To test a specific version for one Pi run without installing it permanently:
+To try it for one Pi run without installing it permanently:
 
 ```bash
-pi -e npm:@maxedapps/pi-subagents-herdr@0.1.0
+pi -e npm:@maxedapps/pi-subagents-herdr
 ```
 
-Run those Pi processes through Herdr to enable the subagent tools and bundled skill.
+Run that Pi process through Herdr to enable the package.
 
-Update or remove the package with:
+Update or remove it with:
 
 ```bash
-pi update npm:@maxedapps/pi-subagents-herdr
+pi update --extension npm:@maxedapps/pi-subagents-herdr
 pi remove npm:@maxedapps/pi-subagents-herdr
 ```
 
-Installing an explicit npm version pins that version. Pi package updates do not move pinned installations to a newer release.
+## Quick start
 
-## Security
-
-Pi extensions execute with the current user's full system permissions. Review this package before installing it, and run it only in repositories and Herdr workspaces you trust.
-
-Reader profiles are read-only. Worker profiles can execute shell commands and edit files only in an isolated Herdr worktree. Cleanup deliberately retains dirty or uncheckable worktrees and generated branches for manual inspection; it never force-removes worktrees, deletes branches, or integrates commits.
-
-## Fixed profiles
-
-| Profile | Thinking | Tools | Writes |
-|---|---|---|---|
-| `scout` | low | `read,grep,find,ls` | no |
-| `researcher` | medium | `read,grep,find,ls,web_search,fetch_content,get_search_content` | no |
-| `worker` | high | `read,grep,find,ls,bash,edit,write` | isolated worktree only |
-
-Readers may run concurrently. At most one worker may be active. Profiles, models, tools, child cwd, and cleanup policy are not configurable.
-
-## Tools
+Start Pi through Herdr and ask it to delegate a bounded task:
 
 ```text
-subagent_start({ profile, task, wait?: false })
-subagent_start({ profile, task, wait: true, timeoutMs?: 1..300000 })
-subagent_status({ id? })
-subagent_send({ id, message, wait?: false })
-subagent_send({ id, message, wait: true, timeoutMs?: 1..300000 })
-subagent_stop({ id })
+Use a scout subagent to inspect how authentication is implemented and report the important files and risks.
 ```
 
-`profile` is `scout`, `researcher`, or `worker`. Unknown fields are rejected. `wait` defaults to `false`; `timeoutMs` is accepted only with `wait:true`.
+Pi starts the child in a visible Herdr pane and continues monitoring it in the background. The `Subagents` widget shows the run while it is active. When the child finishes, its structured result is delivered automatically to the parent conversation.
+
+Other examples:
+
+```text
+Use a researcher subagent to compare the current official documentation for these two APIs.
+```
+
+```text
+Use a worker subagent to implement the validated input-handling fix and run the relevant tests.
+```
+
+You can also ask Pi to wait for the result when the current turn must block:
+
+```text
+Start a scout for this investigation and wait for its result.
+```
+
+A wait timeout does not stop the child. The run continues in the background and can still deliver its result later.
+
+## Profiles
+
+| Profile | Best for | Available capabilities | Writes |
+|---|---|---|---|
+| `scout` | Repository inspection and codebase questions | Read, grep, find, list | No |
+| `researcher` | Repository inspection plus web research | Read-only repository and web tools | No |
+| `worker` | One bounded implementation task | Read, shell, edit, write | Isolated worktree only |
+
+Multiple reader profiles may run concurrently. At most one worker may be active at a time.
+
+Profiles are intentionally fixed. Their models, thinking levels, tools, child working directories, and cleanup policy are not configurable.
+
+## Available tools
+
+Pi normally selects these tools for you based on your request.
+
+| Tool | Purpose |
+|---|---|
+| `subagent_start` | Start one `scout`, `researcher`, or `worker` run |
+| `subagent_status` | Inspect current-session runs and retained resources |
+| `subagent_send` | Send one follow-up after the previous result was delivered |
+| `subagent_stop` | Stop a run or retry retained cleanup |
+
+Starts and follow-ups run in the background unless `wait: true` is requested. Blocking waits accept a timeout of up to five minutes.
+
+Run IDs belong to the current parent session and extension instance. They cannot be reused from another session or after a reload.
 
 ## Results and follow-ups
 
-`subagent_start` and `subagent_send` acknowledge input and monitor the child in the background by default. Startup readiness still uses bounded `agent.get` polling, but each live generation then owns one acknowledged exact-pane Herdr status subscription; steady state does not continuously poll. `idle` and `done` are only result candidates. Delivery waits for a 30-second quiet period and one exact status/session reconciliation. This is an approximation, not a Pi `agent_settled` guarantee, because Herdr’s Pi integration derives `idle` from debounced `agent_end`.
+Completed results come from the child’s persisted Pi session, not from terminal output. Background results are delivered once to the parent and trigger a parent turn. With `wait: true`, the result is returned directly instead and is not injected a second time.
 
-A completed generation is extracted from the child’s persistent Pi session, not terminal output, and delivered once as a provenanced `herdr-subagent-result` custom message using steer delivery with a triggered parent turn. Clean disconnects and subscription transport failures use bounded reconnect backoff. Exhausted reconnects, unsupported protocol, or identity/topology failures retain the run and never fall back to continuous polling.
+A follow-up reuses the same child session, but it must be sent after the previous result arrives and before automatic cleanup becomes eligible. If the run has already been cleaned up, start a new subagent instead.
 
-With `wait:true`, the same complete structured result is returned directly and is not injected again. A wait timeout leaves the generation running in the background; it is not an implicit stop.
+Use `subagent_status` when you need the full run ID, generation, result, artifact path, child session, worktree, branch, error, or retained-resource details.
 
-Use `subagent_status` for lifecycle, generation, delivery, artifact, child-session, worktree, and retained-resource facts—not to poll for completion. A follow-up may be sent only after the previous generation was delivered or returned; it reuses the same child session with a fresh branch cursor. To continue after an automatic result, send the follow-up during the result-triggered parent turn before settlement cleanup becomes eligible.
+## Status widget
 
-## Exact run artifacts
+While the current session owns visible runs, Pi shows a compact `Subagents` widget above the editor. It displays:
 
-The extension automatically owns one Markdown artifact per run:
+- Profile
+- Short run ID
+- Generation number
+- Current phase
+- Separate active and retained counts
+
+A red `retained` phase means cleanup needs manual attention. Use `subagent_status` for the exact reason and paths.
+
+## Recovery artifacts
+
+Every run has one extension-managed Markdown artifact:
 
 ```text
 <agentDir>/herdr-subagent-artifacts/<parentSessionId>/<runId>.md
 ```
 
-It writes every exact parent start/follow-up before sending it and the full textual child response before readiness or delivery. Follow-ups become later generation sections in the same file. Artifacts contain only concise run/worktree/cleanup facts and verbatim exchanged text—not thinking, tool traffic, or full transcripts—and survive child-session and worktree cleanup.
+The artifact records the exact parent requests, full textual child responses, and concise worktree and cleanup facts. Follow-ups are stored as later generations in the same file.
 
-Agents must never create or edit these files. After every successful compaction—or when a compacted session resumes—the next model context receives one hidden, transient parent-session recovery catalog, even when no runs exist. It lists one row for every valid journal run across active and historical branches plus every safe artifact-only file. Only a currently owned run with an active latest record is labeled `current`; other journal facts are `latest durable` and may not be live. Each row reports exact artifact availability/completeness or `artifact unavailable`; artifact-only status and completeness remain unknown. The catalog never copies artifact bodies, persists a message, or triggers a turn, so read the named file before relying on compacted delegation details.
+Artifacts survive child-session and worktree cleanup. After conversation compaction, Pi receives a recovery catalog containing the available artifact paths. Read the referenced artifact before relying on delegation details that may have been compacted away.
 
-Artifact paths appear in start, result, status, and stop surfaces. Every complete result keeps the full child text and names `Durable recovery artifact (read after compaction): <agentDir>/herdr-subagent-artifacts/<parentSessionId>/<runId>.md`. If result archival fails, execution is retained without delivery or child-session deletion and one action notice identifies the file. Calling the existing `subagent_stop` retries exact archival from the cached result or preserved child session, returns the result once, and then finalizes resources; later inspection does not inject it again.
+Do not create or edit these files manually; they are owned by the extension.
 
-## Current-session widget
+## Worker worktrees and cleanup
 
-In Pi’s interactive UI, the extension automatically shows a compact `Subagents` widget above the editor while the current parent session owns visible runs. A responsive rounded border uses Pi’s semantic border color (blue in the bundled themes), and each row pairs a semantic colored dot with the textual phase. Rows still contain only the profile, shortened run ID, optional generation number, and phase. The titled border plus at most five rows uses no more than seven lines, summarizing overflow as `+N more`; RPC clients retain the plain six-line text representation.
+Workers never edit the parent checkout directly. Each worker receives an isolated Herdr worktree and generated branch.
 
-Active and retained counts are separate. A red indicator and `retained` phase warn that resources need manual attention; the run is not counted as active, and the literal phase remains visible without color. The widget hides when no rows remain and clears during session shutdown or reload. Use `subagent_status` for full IDs, errors, child-session, worktree, branch, and retained-resource details.
+The extension does not merge, cherry-pick, or otherwise integrate worker changes. Review the reported worktree and branch, then integrate the work yourself when appropriate.
 
-## Parent ownership and lifecycle
+During cleanup:
 
-Each meaningful transition is stored as a compact `herdr-subagent-state` custom entry on the active parent branch. These entries do not enter model context. Ownership includes the parent session ID/file/leaf, extension instance ID, PID, run and child session IDs, and exact Herdr topology.
+- Reader panes, tabs, and child-session storage are removed when safe.
+- A clean worker worktree is removed without force.
+- Generated worker branches are retained.
+- Dirty or uncheckable worktrees are retained untouched.
+- Child-session storage is kept until the result is safely archived and the child is stopped.
 
-Tools accept only runs owned by the current parent session and extension instance. While an owned run is open, parent `/tree` navigation is cancelled so results cannot move to another branch.
+When cleanup is retained, Pi reports the exact worktree, branch, workspace, reason, artifact, and retry command. Inspect or preserve the work, make the checkout clean if appropriate, then ask Pi to retry `subagent_stop` with the same run ID.
 
-After every completed generation is delivered or returned, the next eligible parent `agent_settled` cleans remaining runs. Settlement does nothing while a child is working, a generation is pending, or a result is queued. Submitting a follow-up during result processing suppresses cleanup until that generation is complete.
+Do not use raw Git-only worktree removal for extension-owned worktrees. The extension deliberately avoids force removal and branch deletion so that uncertain or uncommitted work is not lost.
 
-Every parent shutdown reason—quit, reload, new, resume, or fork—aborts all monitors first and performs one bounded cleanup pass. Reload cleans rather than transfers ownership. On a later non-reload start, records from a dead prior PID are cleanup-only and require exact topology, child identity, and deterministic child storage. Live-owner, malformed, or mismatched residue is reported and left untouched; prior runs are never adopted for follow-ups or delivery.
+## Session behavior
 
-## Cleanup policy
+Open runs are owned by the current persisted parent session. While a run is open, Pi blocks `/tree` navigation so a result cannot be delivered onto another branch.
 
-Reader cleanup closes the child pane, closes only its owned tab, then removes its generated child session directory.
+Quitting, reloading, creating or resuming a session, and forking all trigger bounded cleanup. Reloading does not transfer live run ownership. Resources that cannot be verified safely are reported and retained instead of being modified speculatively.
 
-Worker cleanup closes the child pane, runs bounded `git status --porcelain`, and:
+Child agents cannot create further Herdr subagents, preventing recursive delegation.
 
-- removes a clean Herdr worktree with `force:false`;
-- retains dirty or uncheckable worktrees with their exact path;
-- retains and reports every generated branch;
-- removes child session storage only after the child is stopped and its result artifact is recorded.
+## Security
 
-Retained proven-stopped cleanup is safely retryable through the same `subagent_stop` run ID. Each retry performs a fresh status check; dirty work remains untouched, while a checkout made clean by the parent is removed non-forcibly. Automatic retention sends one concise action with the exact run, worktree, branch, workspace, reason, artifact, and retry call; explicit stop returns the same facts without another message, and shutdown never triggers a turn.
+Pi extensions execute with the current user’s full system permissions. Install this package only from a source you trust and use it only in trusted repositories and Herdr workspaces.
 
-Do not use raw Git-only worktree removal. If an operator already removed the checkout externally, the extension calls `workspace.get` and closes Herdr state only when the exact journaled workspace ID, normalized checkout path, and linked-worktree flag match. Structured `workspace_not_found` means it is already finalized; every malformed, mismatched, or other error remains retained. The extension never force-removes a worktree, deletes a branch, integrates commits, or scans for unknown resources.
+The reader profiles cannot write files or run shell commands. The worker can run commands and edit files, but only in its isolated worktree. Always review worker output before integrating it.
 
-Herdr labels are diagnostic only: `subagent:<parentSessionShortId>:<runId>`.
+## Support
 
-## Development
-
-```bash
-npm ci
-npm run check
-npm pack --dry-run
-npm publish --dry-run
-```
-
-The package has no third-party runtime dependencies. Pi AI, Pi coding-agent, Pi TUI, and TypeBox are declared as peer dependencies and are provided by Pi at runtime.
+Report bugs and feature requests through [GitHub Issues](https://github.com/maxedapps/pi-subagents-herdr/issues).
 
 ## License
 
