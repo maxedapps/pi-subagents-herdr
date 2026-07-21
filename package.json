@@ -1,6 +1,6 @@
 {
   "name": "@maxedapps/pi-subagents-herdr",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Visible, persistent Pi subagents backed by Herdr",
   "type": "module",
   "keywords": ["pi-package", "pi", "herdr", "subagents"],
