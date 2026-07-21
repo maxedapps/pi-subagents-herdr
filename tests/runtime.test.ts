@@ -2,15 +2,21 @@ import assert from "node:assert/strict";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { appendArtifactSection } from "../src/artifact.ts";
 import { HerdrError, HerdrSubscriptionTransportError } from "../src/herdr.ts";
 import { PROFILES } from "../src/profiles.ts";
-import { SubagentRuntime, type ActionDelivery, type ResultDelivery, type RuntimeOptions } from "../src/runtime.ts";
-import type { ChildSessionObservation } from "../src/session.ts";
+import {
+  persistAbortedGeneration,
+  SubagentRuntime,
+  type ActionDelivery,
+  type ResultDelivery,
+  type RuntimeOptions,
+} from "../src/runtime.ts";
+import type { ChildSessionObservation, HerdrStateRecord } from "../src/session.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
 
 const parentSessionId = "parent-session";
@@ -41,13 +47,23 @@ function launch(client: FakeHerdr): { cwd: string; sessionDir: string; sessionId
   };
 }
 
-async function appendResult(client: FakeHerdr, text: string[]): Promise<string> {
+async function childSession(client: FakeHerdr): Promise<SessionManager> {
   const facts = launch(client);
   await mkdir(facts.sessionDir, { recursive: true });
   const listed = (await SessionManager.list(facts.cwd, facts.sessionDir)).find(({ id }) => id === facts.sessionId);
-  const manager = listed
+  return listed
     ? SessionManager.open(listed.path, facts.sessionDir, facts.cwd)
     : SessionManager.create(facts.cwd, facts.sessionDir, { id: facts.sessionId });
+}
+
+async function appendIncompleteSession(client: FakeHerdr): Promise<string> {
+  const manager = await childSession(client);
+  manager.appendMessage({ role: "user", content: "input", timestamp: Date.now() });
+  return manager.getSessionFile()!;
+}
+
+async function appendResult(client: FakeHerdr, text: string[]): Promise<string> {
+  const manager = await childSession(client);
   manager.appendMessage({ role: "user", content: "input", timestamp: Date.now() });
   return manager.appendMessage(assistant(text));
 }
@@ -249,6 +265,222 @@ test("input artifact failure prevents Herdr input and uses startup cleanup", asy
   }, ["run-reader"], {
     appendArtifact: async () => { throw new Error("archive unavailable"); },
   });
+});
+
+test("aborted generation persistence is artifact-first and retry-safe after journal failure", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "runtime-abort-"));
+  const identity = { agentDir, parentSessionId, runId: "run-abort" };
+  const generation: { number: number; outcome?: "aborted" } = { number: 2 };
+  const order: string[] = [];
+  let failArtifact = true;
+  let failJournal = true;
+  const persist = () => persistAbortedGeneration(
+    generation,
+    async (section) => {
+      order.push("artifact");
+      if (failArtifact) throw new Error("abort artifact failed");
+      await appendArtifactSection(identity, section);
+    },
+    () => {
+      order.push("stopping-journal");
+      assert.equal(generation.outcome, "aborted");
+      if (failJournal) throw new Error("abort journal failed");
+    },
+  );
+
+  try {
+    await assert.rejects(persist(), /abort artifact failed/);
+    assert.deepEqual(order, ["artifact"]);
+    assert.equal(Object.hasOwn(generation, "outcome"), false);
+
+    failArtifact = false;
+    order.length = 0;
+    await assert.rejects(persist(), /abort journal failed/);
+    assert.deepEqual(order, ["artifact", "stopping-journal"]);
+    assert.equal(Object.hasOwn(generation, "outcome"), false);
+
+    failJournal = false;
+    order.length = 0;
+    await persist();
+    assert.deepEqual(order, ["artifact", "stopping-journal"]);
+    assert.equal(generation.outcome, "aborted");
+    const artifact = await readFile(join(
+      agentDir,
+      "herdr-subagent-artifacts",
+      parentSessionId,
+      "run-abort.md",
+    ), "utf8");
+    assert.equal(artifact.match(/## Generation 2 — Aborted/g)?.length, 1);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("ordinary stop retains a no-result reader and explicit discard records one abort before session removal", async () => {
+  const outcomes: Array<"aborted" | undefined> = [];
+  await fixture(async (client, runtime, deliveries) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("scout", "task", "/repo");
+    await appendIncompleteSession(client);
+
+    const ordinary = await runtime.stop(started.id);
+    assert.equal(ordinary.run.lifecycle, "retained");
+    assert.equal(ordinary.run.generation?.outcome, undefined);
+    assert.deepEqual(ordinary.retained, [`sessionDir=${started.childSessionDir}`]);
+    assert.equal(existsSync(started.childSessionDir), true);
+    assert.match(
+      await readFile(started.artifactPath, "utf8"),
+      /discardIncompleteResult: true.*raced complete result is recovered first/s,
+    );
+
+    const discarded = await runtime.stop(started.id, { discardIncompleteResult: true });
+    assert.equal(discarded.run.lifecycle, "closed");
+    assert.equal(discarded.run.generation?.outcome, "aborted");
+    assert.deepEqual(discarded.retained, []);
+    assert.equal(existsSync(started.childSessionDir), false);
+    assert.deepEqual(deliveries, []);
+    assert.equal(outcomes.includes("aborted"), true);
+    const artifact = await readFile(started.artifactPath, "utf8");
+    assert.equal(artifact.match(/## Generation 1 — Aborted/g)?.length, 1);
+    assert.doesNotMatch(artifact, /## Generation 1 — Subagent/);
+  }, ["run-reader-discard"], {
+    appendState: (_customType, record) => {
+      if (record.state === "stopping") outcomes.push(record.generation?.outcome);
+    },
+  });
+});
+
+test("explicit discard recovers a raced final result once instead of aborting it", async () => {
+  await fixture(async (client, runtime, deliveries) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("scout", "task", "/repo");
+    const childEntryId = await appendResult(client, ["raced result"]);
+
+    const stopped = await runtime.stop(started.id, { discardIncompleteResult: true });
+    assert.equal(stopped.run.lifecycle, "closed");
+    assert.equal(stopped.run.latestResult?.childEntryId, childEntryId);
+    assert.equal(stopped.run.latestResult?.text, "raced result");
+    assert.equal(stopped.run.generation?.delivery, "delivered");
+    assert.equal(stopped.run.generation?.returned, true);
+    assert.equal(stopped.run.generation?.outcome, undefined);
+    assert.equal(stopped.run.resultContent?.includes("raced result"), true);
+    assert.deepEqual(deliveries, []);
+    assert.equal(existsSync(started.childSessionDir), false);
+    const artifact = await readFile(started.artifactPath, "utf8");
+    assert.equal(artifact.match(/## Generation 1 — Subagent/g)?.length, 1);
+    assert.doesNotMatch(artifact, /— Aborted/);
+  }, ["run-reader-race"]);
+});
+
+test("discard reconciliation failures remain retryable and never authorize session removal", async (context) => {
+  await context.test("invalid session observation", async () => {
+    let observations = 0;
+    await fixture(async (client, runtime) => {
+      client.autoAcknowledgeSubscriptions = false;
+      client.statuses = ["idle"];
+      const started = await runtime.start("scout", "task", "/repo");
+      await mkdir(started.childSessionDir, { recursive: true });
+      const stopped = await runtime.stop(started.id, { discardIncompleteResult: true });
+      assert.equal(stopped.run.lifecycle, "retained");
+      assert.match(stopped.run.error ?? "", /Incomplete result reconciliation failed: malformed session/);
+      assert.equal(stopped.run.generation?.outcome, undefined);
+      assert.equal(existsSync(started.childSessionDir), true);
+      assert.equal(observations, 1);
+    }, ["run-reader-invalid"], {
+      runtimeOptions: {
+        observeChildSession: async () => {
+          observations++;
+          throw new Error("malformed session");
+        },
+      },
+    });
+  });
+
+  await context.test("abort artifact and journal failures", async () => {
+    let failArtifact = true;
+    let failJournal = true;
+    await fixture(async (client, runtime) => {
+      client.statuses = ["idle"];
+      const started = await runtime.start("scout", "task", "/repo");
+      await appendIncompleteSession(client);
+
+      const artifactFailure = await runtime.stop(started.id, { discardIncompleteResult: true });
+      assert.equal(artifactFailure.run.lifecycle, "retained");
+      assert.match(artifactFailure.run.error ?? "", /Abort persistence failed:.*abort artifact failed/);
+      assert.equal(artifactFailure.run.generation?.outcome, undefined);
+      assert.equal(existsSync(started.childSessionDir), true);
+
+      failArtifact = false;
+      const journalFailure = await runtime.stop(started.id, { discardIncompleteResult: true });
+      assert.equal(journalFailure.run.lifecycle, "retained");
+      assert.match(journalFailure.run.error ?? "", /Abort persistence failed: Abort journal persistence failed: abort journal failed/);
+      assert.equal(journalFailure.run.generation?.outcome, undefined);
+      assert.equal(existsSync(started.childSessionDir), true);
+
+      failJournal = false;
+      const recovered = await runtime.stop(started.id, { discardIncompleteResult: true });
+      assert.equal(recovered.run.lifecycle, "closed");
+      assert.equal(recovered.run.generation?.outcome, "aborted");
+      assert.equal(existsSync(started.childSessionDir), false);
+      assert.equal((await readFile(started.artifactPath, "utf8")).match(/— Aborted/g)?.length, 1);
+    }, ["run-reader-abort-failures"], {
+      appendArtifact: async (identity, section, operations) => {
+        if (failArtifact && section.includes("— Aborted")) throw new Error("abort artifact failed");
+        await appendArtifactSection(identity, section, operations);
+      },
+      appendState: (_customType, record) => {
+        if (failJournal && record.state === "stopping" && record.generation?.outcome === "aborted") {
+          throw new Error("abort journal failed");
+        }
+      },
+    });
+  });
+});
+
+test("successful enclosing cleanup can prove stop before explicit reader or worker discard", async (context) => {
+  for (const profile of ["scout", "worker"] as const) {
+    await context.test(profile, async () => fixture(async (client, runtime) => {
+      client.statuses = ["idle"];
+      const started = await runtime.start(profile, "task", profile === "worker" ? process.cwd() : "/repo");
+      await appendIncompleteSession(client);
+      client.failClosePane = true;
+      const stopped = await runtime.stop(started.id, { discardIncompleteResult: true });
+      assert.equal(stopped.run.lifecycle, "closed");
+      assert.equal(stopped.run.childStopped, true);
+      assert.equal(stopped.run.generation?.outcome, "aborted");
+      assert.equal(stopped.retained.includes(`pane=${started.paneId}`), false);
+      assert.equal(existsSync(started.childSessionDir), false);
+      if (profile === "worker") {
+        assert.equal(stopped.workerCleanup?.action, "removed");
+        assert.deepEqual(stopped.retained, [`branch=${started.worktree!.branch}`]);
+      } else {
+        assert.deepEqual(stopped.retained, []);
+      }
+    }, [`run-${profile}-enclosing-discard`]));
+  }
+});
+
+test("aborted session removal failure retains exact residue for ordinary retry", async () => {
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("scout", "task", "/repo");
+    await appendIncompleteSession(client);
+    const sessionParent = dirname(started.childSessionDir);
+    await chmod(sessionParent, 0o500);
+    try {
+      const failed = await runtime.stop(started.id, { discardIncompleteResult: true });
+      assert.equal(failed.run.lifecycle, "retained");
+      assert.equal(failed.run.generation?.outcome, "aborted");
+      assert.equal(failed.retained.includes(`sessionDir=${started.childSessionDir}`), true);
+      assert.match(failed.run.error ?? "", /Child session removal failed/);
+    } finally {
+      await chmod(sessionParent, 0o700);
+    }
+    const retried = await runtime.stop(started.id);
+    assert.equal(retried.run.lifecycle, "closed");
+    assert.equal(retried.run.generation?.outcome, "aborted");
+    assert.equal(existsSync(started.childSessionDir), false);
+  }, ["run-reader-session-remove"]);
 });
 
 test("failed result archival retains one exact source and subagent_stop recovers without injection", async () => {
@@ -680,14 +912,20 @@ test("journal failures suppress ordinary phases and notify only finalized fallba
     await fixture(async (client, runtime) => {
       client.statuses = ["idle"];
       const started = await runtime.start("scout", "task", "/repo");
+      await appendIncompleteSession(client);
       changes.length = 0;
-      const stopped = await runtime.stop(started.id);
+      const stopped = await runtime.stop(started.id, { discardIncompleteResult: true });
       assert.equal(stopped.run.lifecycle, "retained");
       assert.deepEqual(changes, [
         ["run-reader/stopping/idle/g1:pending/"],
         ["run-reader/retained/idle/g1:pending/journal=herdr-subagent-state"],
       ]);
       assert.equal(runtime.list()[0]?.lifecycle, "retained");
+      assert.equal(existsSync(started.childSessionDir), false);
+      const retried = await runtime.stop(started.id);
+      assert.equal(retried.run.lifecycle, "retained");
+      const artifact = await readFile(started.artifactPath, "utf8");
+      assert.equal(artifact.match(/- Reason: Cleanup journal failed: cleanup journal failed/g)?.length, 1);
     }, ["run-reader"], {
       appendState: (_customType, record) => {
         if (record.state === "closed") throw new Error("cleanup journal failed");
@@ -813,10 +1051,16 @@ test("ownership, uncertain input, fresh startup cleanup, and once-only stop pres
   await context.test("stop race", async () => fixture(async (client, runtime) => {
     client.statuses = ["idle"];
     await runtime.start("scout", "task", "/repo");
-    const [one, two] = await Promise.all([runtime.stop("run-reader"), runtime.stop("run-reader")]);
+    const [one, two] = await Promise.all([
+      runtime.stop("run-reader"),
+      runtime.stop("run-reader", { discardIncompleteResult: true }),
+    ]);
     assert.deepEqual(one, two);
+    assert.equal(one.run.lifecycle, "retained");
+    const discarded = await runtime.stop("run-reader", { discardIncompleteResult: true });
+    assert.equal(discarded.run.lifecycle, "closed");
     assert.equal(client.calls.filter(({ method }) => method === "pane.close").length, 1);
-    assert.equal(client.calls.filter(({ method }) => method === "tab.close").length, 1);
+    assert.equal(client.calls.filter(({ method }) => method === "tab.close").length, 2);
     assert.deepEqual(runtime.list(), []);
   }));
 });
@@ -851,6 +1095,61 @@ test("retained worker finalization retries dirty-to-clean without stopping the c
   }, ["run-worker-retry"], {
     gitStatus: async () => {
       statusCalls++;
+      return dirty ? " M file.ts\n" : "";
+    },
+  });
+});
+
+test("no-result worker progresses dirty to session-only retention, then explicit discard closes already-finalized residue", async () => {
+  let statusCall = 0;
+  let dirty = true;
+  const journal: HerdrStateRecord[] = [];
+  await fixture(async (client, runtime, deliveries) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("worker", "task", process.cwd());
+    await appendIncompleteSession(client);
+
+    const dirtyStop = await runtime.stop(started.id);
+    assert.equal(dirtyStop.run.lifecycle, "retained");
+    assert.equal(dirtyStop.run.generation?.outcome, undefined);
+    assert.equal(dirtyStop.workerCleanup?.action, "retained");
+    assert.deepEqual(dirtyStop.retained, [
+      `branch=${started.worktree!.branch}`,
+      `worktree=${started.worktree!.path}`,
+      `sessionDir=${started.childSessionDir}`,
+    ]);
+
+    dirty = false;
+    const cleaned = await runtime.stop(started.id);
+    assert.equal(cleaned.run.lifecycle, "retained");
+    assert.equal(cleaned.workerCleanup?.action, "removed");
+    assert.deepEqual(cleaned.retained, [
+      `branch=${started.worktree!.branch}`,
+      `sessionDir=${started.childSessionDir}`,
+    ]);
+    assert.equal(existsSync(started.childSessionDir), true);
+
+    client.failGetWorkspace = new HerdrError("missing", { code: "workspace_not_found" });
+    const discarded = await runtime.stop(started.id, { discardIncompleteResult: true });
+    assert.equal(discarded.run.lifecycle, "closed");
+    assert.equal(discarded.run.generation?.outcome, "aborted");
+    assert.equal(discarded.workerCleanup?.action, "already-finalized");
+    assert.deepEqual(discarded.retained, [`branch=${started.worktree!.branch}`]);
+    assert.equal(existsSync(started.childSessionDir), false);
+    assert.equal((await readFile(started.artifactPath, "utf8")).match(/— Aborted/g)?.length, 1);
+    assert.equal(client.calls.filter(({ method }) => method === "pane.close").length, 1);
+    assert.equal(client.calls.filter(({ method }) => method === "worktree.remove").length, 1);
+    assert.equal(client.calls.filter(({ method }) => method === "workspace.get").length, 1);
+    assert.equal(journal.some((record) => record.state === "stopping" && record.generation?.outcome === "aborted"), true);
+    assert.equal(journal.at(-1)?.state, "closed");
+    assert.equal(journal.at(-1)?.generation?.outcome, "aborted");
+    assert.deepEqual(deliveries, []);
+    assert.deepEqual(runtime.list(), []);
+  }, ["run-worker-incomplete"], {
+    appendState: (_customType, record) => journal.push(record),
+    gitStatus: async () => {
+      statusCall++;
+      if (statusCall === 3) throw new Error("checkout absent");
       return dirty ? " M file.ts\n" : "";
     },
   });

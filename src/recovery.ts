@@ -17,6 +17,7 @@ export interface RecoveryCatalogRow {
   status?: AgentStatus;
   generation?: number;
   delivery?: JournalGeneration["delivery"];
+  outcome?: JournalGeneration["outcome"];
   branch: "active" | "historical" | "unknown";
   artifactPath?: string;
   artifactCompleteness?: "available" | "incomplete" | "unknown";
@@ -46,7 +47,10 @@ export function buildRecoveryCatalog(input: RecoveryCatalogInput): {
     const current = active ? currentRuns.get(item.runId) : undefined;
     const artifactPath = artifacts.get(item.runId);
     const artifactCompleteness = artifactPath
-      ? item.latest.generation?.artifactResultPersisted === true ? "available" : "incomplete"
+      ? item.latest.generation?.artifactResultPersisted === true
+        || item.latest.generation?.outcome === "aborted"
+        ? "available"
+        : "incomplete"
       : undefined;
     rows.push(current ? {
       runId: item.runId,
@@ -57,6 +61,7 @@ export function buildRecoveryCatalog(input: RecoveryCatalogInput): {
       ...(current.generation ? {
         generation: current.generation.number,
         delivery: current.generation.delivery,
+        ...(current.generation.outcome ? { outcome: current.generation.outcome } : {}),
       } : {}),
       branch: "active",
       ...(artifactPath ? { artifactPath, artifactCompleteness } : {}),
@@ -69,6 +74,7 @@ export function buildRecoveryCatalog(input: RecoveryCatalogInput): {
       ...(item.latest.generation ? {
         generation: item.latest.generation.number,
         delivery: item.latest.generation.delivery,
+        ...(item.latest.generation.outcome ? { outcome: item.latest.generation.outcome } : {}),
       } : {}),
       branch: active ? "active" : "historical",
       ...(artifactPath ? { artifactPath, artifactCompleteness } : {}),
@@ -91,7 +97,7 @@ export function buildRecoveryCatalog(input: RecoveryCatalogInput): {
 function generation(row: RecoveryCatalogRow): string {
   return row.generation === undefined
     ? "g? unknown"
-    : `g${row.generation} ${row.delivery ?? "unknown"}`;
+    : `g${row.generation} ${row.outcome ?? row.delivery ?? "unknown"}`;
 }
 
 function artifact(row: RecoveryCatalogRow): string {

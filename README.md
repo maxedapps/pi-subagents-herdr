@@ -99,7 +99,7 @@ Pi normally selects these tools for you based on your request.
 | `subagent_start` | Start one `scout`, `researcher`, or `worker` run |
 | `subagent_status` | Inspect current-session runs and retained resources |
 | `subagent_send` | Send one follow-up after the previous result was delivered |
-| `subagent_stop` | Stop a run or retry retained cleanup |
+| `subagent_stop` | Stop a run, retry retained cleanup, or explicitly abort an incomplete generation |
 
 Starts and follow-ups run in the background unless `wait: true` is requested. Blocking waits accept a timeout of up to five minutes.
 
@@ -112,6 +112,14 @@ Completed results come from the child’s persisted Pi session, not from termina
 A follow-up reuses the same child session, but it must be sent after the previous result arrives and before automatic cleanup becomes eligible. If the run has already been cleaned up, start a new subagent instead.
 
 Use `subagent_status` when you need the full run ID, generation, result, artifact path, child session, worktree, branch, error, or retained-resource details.
+
+Ordinary `subagent_stop({ id: "<run-id>" })` remains fail-safe: after proving the child stopped, it recovers and returns any raced complete result, but retains a generation that has no archived final result. If that incomplete transcript is no longer needed, explicitly call:
+
+```text
+subagent_stop({ id: "<run-id>", discardIncompleteResult: true })
+```
+
+This option is irreversible for a genuinely incomplete transcript. It still recovers a complete result first and never authorizes dirty-worktree removal. Repeating ordinary stops does not imply discard consent.
 
 ## Status widget
 
@@ -135,7 +143,7 @@ Every run has one extension-managed Markdown artifact:
 
 The artifact records the exact parent requests, full textual child responses, and concise worktree and cleanup facts. Follow-ups are stored as later generations in the same file.
 
-Artifacts survive child-session and worktree cleanup. After conversation compaction, Pi receives a recovery catalog containing the available artifact paths. Read the referenced artifact before relying on delegation details that may have been compacted away.
+Artifacts survive child-session and worktree cleanup. An explicitly aborted generation is recorded in the artifact and treated as terminal by recovery catalogs. After conversation compaction, Pi receives a recovery catalog containing the available artifact paths. Read the referenced artifact before relying on delegation details that may have been compacted away.
 
 Do not create or edit these files manually; they are owned by the extension.
 
@@ -151,9 +159,15 @@ During cleanup:
 - A clean worker worktree is removed without force.
 - Generated worker branches are retained.
 - Dirty or uncheckable worktrees are retained untouched.
-- Child-session storage is kept until the result is safely archived and the child is stopped.
+- Child-session storage is kept until the result is safely archived or an explicit incomplete-result discard is durably recorded, and the child is proven stopped.
 
-When cleanup is retained, Pi reports the exact worktree, branch, workspace, reason, artifact, and retry command. Inspect or preserve the work, make the checkout clean if appropriate, then ask Pi to retry `subagent_stop` with the same run ID.
+Retained guidance reflects the actual blocker:
+
+- For a dirty or uncheckable worktree, preserve the work, make the checkout safe if appropriate, then retry ordinary `subagent_stop`.
+- For an incomplete session only, use `discardIncompleteResult: true` only when irreversible transcript loss is intended.
+- For artifact, journal, or session-removal failures, address the named failure and retry ordinary `subagent_stop`.
+
+Generated worker branches remain retained even after the worktree and child session close. Do not interpret a retained branch by itself as an actionable widget row.
 
 Do not use raw Git-only worktree removal for extension-owned worktrees. The extension deliberately avoids force removal and branch deletion so that uncertain or uncommitted work is not lost.
 

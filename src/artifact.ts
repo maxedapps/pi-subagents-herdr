@@ -43,6 +43,10 @@ export interface GenerationSection {
   body: string;
 }
 
+export interface AbortedGenerationSection {
+  generation: number;
+}
+
 export interface CleanupSection {
   state: "removed" | "action required" | "finalized";
   reason?: string;
@@ -146,12 +150,21 @@ function longestBacktickRun(body: string): number {
   return longest;
 }
 
-export function renderGenerationSection(section: GenerationSection): string {
-  if (!Number.isSafeInteger(section.generation) || section.generation < 1) {
+function validateGenerationNumber(generation: number): void {
+  if (!Number.isSafeInteger(generation) || generation < 1) {
     throw new Error("Invalid generation number");
   }
+}
+
+export function renderGenerationSection(section: GenerationSection): string {
+  validateGenerationNumber(section.generation);
   const fence = "`".repeat(Math.max(3, longestBacktickRun(section.body) + 1));
   return `\n## Generation ${section.generation} — ${section.speaker}\n${fence}text\n${section.body}\n${fence}\n`;
+}
+
+export function renderAbortedGenerationSection(section: AbortedGenerationSection): string {
+  validateGenerationNumber(section.generation);
+  return `\n## Generation ${section.generation} — Aborted\n- Explicitly stopped before a final result.\n`;
 }
 
 export function renderCleanupSection(section: CleanupSection): string {
@@ -193,6 +206,7 @@ async function performUpdate(
   if (targetStats && !targetStats.isFile()) throw new Error(`Artifact target is not a regular file: ${location.path}`);
 
   const prior = targetStats ? await readFile(location.path, "utf8") : "";
+  if (prior.endsWith(renderedSection)) return;
   const tempPath = resolve(location.directory, `.${identity.runId}.${process.pid}.${randomUUID()}.tmp`);
   assertContained(location.directory, tempPath);
 

@@ -41,6 +41,11 @@ export const sendSchema = Type.Union([
 
 export const idSchema = Type.Object({ id: Type.String({ minLength: 1 }) }, strict);
 
+export const stopSchema = Type.Object({
+  id: Type.String({ minLength: 1 }),
+  discardIncompleteResult: Type.Optional(Type.Literal(true)),
+}, strict);
+
 function result(value: unknown) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
@@ -118,14 +123,17 @@ export function registerSubagentTools(pi: ExtensionAPI, runtime: SubagentRuntime
   pi.registerTool({
     name: "subagent_stop",
     label: "Stop subagent",
-    description: "Stop or retry finalization for a current-parent run and report its artifact plus exactly which owned resources were removed or retained.",
-    parameters: idSchema,
+    description: "Stop or retry finalization for a current-parent run. A raced final result is recovered first; discardIncompleteResult:true irreversibly aborts only a proven-stopped generation with no final result.",
+    parameters: stopSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return result(await runtime.stop(params.id, runtime.requestFor({
-        parentSessionId: ctx.sessionManager.getSessionId(),
-        parentSessionFile: ctx.sessionManager.getSessionFile(),
-        parentEntryId: ctx.sessionManager.getLeafId(),
-      })));
+      return result(await runtime.stop(params.id, {
+        ...runtime.requestFor({
+          parentSessionId: ctx.sessionManager.getSessionId(),
+          parentSessionFile: ctx.sessionManager.getSessionFile(),
+          parentEntryId: ctx.sessionManager.getLeafId(),
+        }),
+        ...(params.discardIncompleteResult ? { discardIncompleteResult: true as const } : {}),
+      }));
     },
   });
 }

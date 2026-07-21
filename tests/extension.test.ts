@@ -12,7 +12,7 @@ import { SocketHerdrClient } from "../src/herdr.ts";
 import { buildPiLaunch, PROFILES } from "../src/profiles.ts";
 import { SubagentRuntime, type Run } from "../src/runtime.ts";
 import { HERDR_STATE_CUSTOM_TYPE, type HerdrStateRecord } from "../src/session.ts";
-import { idSchema, sendSchema, startSchema, statusSchema } from "../src/tools.ts";
+import { idSchema, sendSchema, startSchema, statusSchema, stopSchema } from "../src/tools.ts";
 
 interface Registered {
   tools: Array<{ name: string; parameters?: unknown }>;
@@ -471,6 +471,34 @@ test("parent registers exactly four tools, one skill hook, and result confirmati
   assert.equal(existsSync(resources.skillPaths[0] ?? ""), true);
 }));
 
+test("subagent_stop forwards explicit discard without sending an automatic action", async () => {
+  const fixture = extensionWithRuntimeCapture();
+  const ctx = mockContext("stop-parent", false);
+  try {
+    await event(fixture.registered, "session_start")({ reason: "startup" }, ctx);
+    const runtime = fixture.runtime();
+    let captured: { id: string; request: Record<string, unknown> } | undefined;
+    (runtime as any).stop = async (id: string, request: Record<string, unknown>) => {
+      captured = { id, request };
+      return { run: mockRun({ id, lifecycle: "closed" }), retained: [] };
+    };
+    const tool = fixture.registered.tools.find(({ name }) => name === "subagent_stop") as any;
+    assert.ok(tool?.execute);
+    await tool.execute(
+      "tool-call",
+      { id: "run-discard", discardIncompleteResult: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(captured?.id, "run-discard");
+    assert.equal(captured?.request.discardIncompleteResult, true);
+    assert.equal(fixture.registered.messages.length, 0);
+  } finally {
+    fixture.restore();
+  }
+});
+
 test("missing Herdr environment deactivates all tools, skills, and operational hooks", async () => {
   const cases = [
     { name: "both missing", environment: {} },
@@ -641,6 +669,35 @@ test("automatic retained worker cleanup sends one exact action while clean outco
     };
     const action = retainedCleanupAction(retained);
     assert.match(action?.content ?? "", /run-action.*Worktree: \/repo\/worker.*Branch: herdr-subagents\/run-action.*Workspace: w-worker.*worktree is dirty.*Artifact: .*subagent_stop.*Do not use raw Git-only/s);
+
+    const incompleteRun = mockRun({
+      ...run,
+      id: "run-incomplete",
+      error: "Incomplete generation has no archived final result",
+      generation: {
+        number: 1,
+        input: "task",
+        baselineEntryId: null,
+        delivery: "pending",
+        blockingWaiter: false,
+        artifactParentPersisted: true,
+      },
+    });
+    const incompleteAction = retainedCleanupAction({
+      run: incompleteRun,
+      retained: ["branch=herdr-subagents/run-action", `sessionDir=${incompleteRun.childSessionDir}`],
+      workerCleanup: { action: "removed", removed: true, branch: "herdr-subagents/run-action" },
+    });
+    assert.match(incompleteAction?.content ?? "", /Explicit irreversible discard: subagent_stop\(\{ id: "run-incomplete", discardIncompleteResult: true \}\).*raced complete result is recovered first/is);
+    assert.doesNotMatch(incompleteAction?.content ?? "", /Worktree:/);
+
+    const failureAction = retainedCleanupAction({
+      run: mockRun({ ...run, id: "run-journal", error: "Cleanup journal failed: unavailable" }),
+      retained: ["journal=herdr-subagent-state"],
+    });
+    assert.match(failureAction?.content ?? "", /Cleanup journal failed: unavailable.*Retry: subagent_stop\(\{ id: "run-journal" \}\)/s);
+    assert.doesNotMatch(failureAction?.content ?? "", /discardIncompleteResult/);
+
     let calls = 0;
     (runtime as any).settle = async () => calls++ === 0 ? [retained] : [];
     await event(fixture.registered, "agent_settled")({}, ctx);
@@ -859,4 +916,10 @@ test("strict schemas accept only background/default or bounded blocking start/se
   assert.equal(Value.Check(sendSchema, { id: "run", message: "x", cleanup: "retain" }), false);
   assert.equal(Value.Check(idSchema, { id: "run" }), true);
   assert.equal(Value.Check(idSchema, { id: "run", integration: {} }), false);
+
+  assert.equal(Value.Check(stopSchema, { id: "run" }), true);
+  assert.equal(Value.Check(stopSchema, { id: "run", discardIncompleteResult: true }), true);
+  assert.equal(Value.Check(stopSchema, { id: "run", discardIncompleteResult: false }), false);
+  assert.equal(Value.Check(stopSchema, { id: "run", unknown: true }), false);
+  assert.equal(Value.Check(idSchema, { id: "run", discardIncompleteResult: true }), false);
 });

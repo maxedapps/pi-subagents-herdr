@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   appendArtifactSection,
   enumerateRunArtifacts,
+  renderAbortedGenerationSection,
   renderArtifactHeader,
   renderCleanupSection,
   renderGenerationSection,
@@ -100,6 +101,18 @@ test("headers and cleanup sections contain only concise supplied facts", () => {
   ].join("\n"));
 });
 
+test("aborted generation sections are concise and validate their generation", () => {
+  assert.equal(renderAbortedGenerationSection({ generation: 2 }), [
+    "",
+    "## Generation 2 — Aborted",
+    "- Explicitly stopped before a final result.",
+    "",
+  ].join("\n"));
+  for (const generation of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => renderAbortedGenerationSection({ generation }), /Invalid generation number/);
+  }
+});
+
 test("generation bodies remain verbatim inside a minimally longer backtick fence", () => {
   const body = "first line\n## generated heading\n`````\nlast line";
   assert.equal(renderGenerationSection({ generation: 2, speaker: "Subagent", body }), [
@@ -153,6 +166,20 @@ test("serialized updates preserve call order and create private files and direct
     assert.equal((await stat(join(identity.agentDir, "herdr-subagent-artifacts"))).mode & 0o777, 0o700);
     assert.equal((await stat(location.directory)).mode & 0o777, 0o700);
     assert.equal((await stat(location.path)).mode & 0o777, 0o600);
+  });
+});
+
+test("only an exact artifact tail suppresses a repeated section", async () => {
+  await fixture(async (_root, identity) => {
+    const aborted = renderAbortedGenerationSection({ generation: 1 });
+    const cleanup = renderCleanupSection({ state: "finalized" });
+    await appendArtifactSection(identity, aborted);
+    await appendArtifactSection(identity, aborted);
+    assert.equal(await readFile(resolveArtifactLocation(identity).path, "utf8"), aborted);
+
+    await appendArtifactSection(identity, cleanup);
+    await appendArtifactSection(identity, aborted);
+    assert.equal(await readFile(resolveArtifactLocation(identity).path, "utf8"), aborted + cleanup + aborted);
   });
 });
 

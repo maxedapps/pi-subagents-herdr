@@ -161,11 +161,17 @@ test("journal replay accepts old records and validates optional artifact milesto
       ...base,
       artifactPath: "/agent/herdr-subagent-artifacts/parent/run-old.md",
       archivePending: true,
-      generation: { ...base.generation, artifactParentPersisted: true, artifactResultPersisted: true },
+      generation: {
+        ...base.generation,
+        outcome: "aborted",
+        artifactParentPersisted: true,
+        artifactResultPersisted: true,
+      },
     });
     replayed = reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile);
     assert.equal(replayed.invalidEntries, 0);
     assert.equal(replayed.runs.get("run-old")?.latest.archivePending, true);
+    assert.equal(replayed.runs.get("run-old")?.latest.generation?.outcome, "aborted");
 
     manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, childStopped: true });
     manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, at: 2 });
@@ -182,8 +188,10 @@ test("journal replay accepts old records and validates optional artifact milesto
     manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { number: 1, baselineEntryId: 4, delivery: "pending" } });
     manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { number: 1, baselineEntryId: null, delivery: "settled" } });
     manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { ...base.generation, returned: "yes" } });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { ...base.generation, outcome: "completed" } });
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, generation: { ...base.generation, outcome: null } });
     replayed = reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile);
-    assert.equal(replayed.invalidEntries, 7);
+    assert.equal(replayed.invalidEntries, 9);
   });
 });
 

@@ -66,7 +66,17 @@ test("recovery catalog merges current, durable, missing, historical, and artifac
     status: "done",
     generation: { number: 2, baselineEntryId: "base", delivery: "queued", artifactResultPersisted: true },
   }));
-  const missing = entry("m1", record("run-missing", { state: "closed", status: "idle" }));
+  const missing = entry("m1", record("run-missing", {
+    state: "closed",
+    status: "idle",
+    generation: {
+      number: 1,
+      baselineEntryId: null,
+      delivery: "pending",
+      outcome: "aborted",
+      artifactParentPersisted: true,
+    },
+  }));
   const historicalLatest = entry("h2", record("run-historical", {
     at: 2,
     state: "result_delivered",
@@ -86,6 +96,7 @@ test("recovery catalog merges current, durable, missing, historical, and artifac
       { runId: "run-artifact", path: "/artifacts/run-artifact.md" },
       { runId: "run-current", path: "/artifacts/run-current.md" },
       { runId: "run-historical", path: "/artifacts/run-historical.md" },
+      { runId: "run-missing", path: "/artifacts/run-missing.md" },
     ],
   });
 
@@ -123,7 +134,10 @@ test("recovery catalog merges current, durable, missing, historical, and artifac
       status: "idle",
       generation: 1,
       delivery: "pending",
+      outcome: "aborted",
       branch: "active",
+      artifactPath: "/artifacts/run-missing.md",
+      artifactCompleteness: "available",
     },
     {
       runId: "run-artifact",
@@ -138,9 +152,55 @@ test("recovery catalog merges current, durable, missing, historical, and artifac
     "Parent-session subagent recovery catalog after compaction:",
     "- run-historical [scout] — latest durable result_delivered/done/g3 delivered; historical branch; artifact: /artifacts/run-historical.md (incomplete)",
     "- run-current [scout] — current live/idle/g1 queued; active branch; artifact: /artifacts/run-current.md (available)",
-    "- run-missing [scout] — latest durable closed/idle/g1 pending; active branch; artifact: artifact unavailable",
+    "- run-missing [scout] — latest durable closed/idle/g1 aborted; active branch; artifact: /artifacts/run-missing.md (available)",
     "- run-artifact — status/branch/completeness unknown (artifact only); artifact: /artifacts/run-artifact.md (unknown)",
   ].join("\n"));
+});
+
+test("current aborted generations are formatted as terminal available artifacts", () => {
+  const durable = entry("a1", record("run-aborted", {
+    state: "retained",
+    generation: {
+      number: 2,
+      baselineEntryId: "base",
+      delivery: "pending",
+      outcome: "aborted",
+      artifactParentPersisted: true,
+    },
+  }));
+  const result = buildRecoveryCatalog({
+    entries: [durable],
+    branch: [durable],
+    parentSessionId,
+    parentSessionFile,
+    currentRuns: [run("run-aborted", {
+      lifecycle: "retained",
+      generation: {
+        number: 2,
+        input: "task",
+        baselineEntryId: "base",
+        delivery: "pending",
+        outcome: "aborted",
+        blockingWaiter: false,
+        artifactParentPersisted: true,
+      },
+    })],
+    artifacts: [{ runId: "run-aborted", path: "/artifacts/run-aborted.md" }],
+  });
+  assert.deepEqual(result.rows, [{
+    runId: "run-aborted",
+    profile: "scout",
+    source: "current",
+    lifecycle: "retained",
+    status: "idle",
+    generation: 2,
+    delivery: "pending",
+    outcome: "aborted",
+    branch: "active",
+    artifactPath: "/artifacts/run-aborted.md",
+    artifactCompleteness: "available",
+  }]);
+  assert.match(formatRecoveryCatalog(result.rows), /current retained\/idle\/g2 aborted/);
 });
 
 test("empty recovery catalog is explicit", () => {

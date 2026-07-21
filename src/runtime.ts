@@ -4,6 +4,7 @@ import { basename, dirname, resolve } from "node:path";
 import { getAgentDir, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   appendArtifactSection,
+  renderAbortedGenerationSection,
   renderArtifactHeader,
   renderCleanupSection,
   renderGenerationSection,
@@ -38,6 +39,7 @@ import {
 import {
   cleanupWorkerWorktree,
   createWorkerWorktree,
+  readGitStatus,
   type GitStatus,
   type WorkerCleanup,
   type WorktreeFacts,
@@ -75,6 +77,7 @@ export interface Generation {
   baselineEntryId: string | null;
   resultEntryId?: string;
   delivery: "pending" | "ready" | "queued" | "delivered";
+  outcome?: "aborted";
   blockingWaiter: boolean;
   returned?: boolean;
   artifactParentPersisted?: true;
@@ -126,6 +129,8 @@ interface RunRecord extends Run {
   cleanup?: Promise<StopResult>;
   archiveActionSent?: boolean;
   archiveRecovered?: boolean;
+  abortArtifactAwaitingJournal?: boolean;
+  cleanupArtifactAwaitingJournal?: boolean;
 }
 
 export interface ParentSessionBinding {
@@ -200,6 +205,10 @@ export interface GenerationRequest extends Partial<ParentRequest> {
   signal?: AbortSignal;
 }
 
+export interface StopRequest extends Partial<ParentRequest> {
+  discardIncompleteResult?: true;
+}
+
 export interface ActionDelivery {
   customType: "herdr-subagent-action";
   content: string;
@@ -213,8 +222,40 @@ export interface StopResult {
   workerCleanup?: WorkerCleanup;
 }
 
+interface CleanupRunOptions {
+  allowUnjournaledWorkerSessionRemoval?: boolean;
+  discardIncompleteResult?: boolean;
+  reconcileIncompleteResult?: boolean;
+  skipReaderContainerCleanup?: boolean;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+class AbortJournalPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super(`Abort journal persistence failed: ${errorMessage(cause)}`, { cause });
+    this.name = "AbortJournalPersistenceError";
+  }
+}
+
+export async function persistAbortedGeneration(
+  generation: Pick<Generation, "number" | "outcome">,
+  appendArtifact: (section: string) => Promise<void>,
+  recordStopping: () => void,
+): Promise<void> {
+  await appendArtifact(renderAbortedGenerationSection({ generation: generation.number }));
+  const hadOutcome = Object.hasOwn(generation, "outcome");
+  const previousOutcome = generation.outcome;
+  generation.outcome = "aborted";
+  try {
+    recordStopping();
+  } catch (error) {
+    if (hadOutcome) generation.outcome = previousOutcome;
+    else delete generation.outcome;
+    throw new AbortJournalPersistenceError(error);
+  }
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -441,7 +482,59 @@ export class SubagentRuntime {
         });
         continue;
       }
-      if (record.state === "retained" && replay.childStopped && record.worktree) {
+      if (record.state !== "closed" && replay.childStopped && record.generation?.outcome === "aborted") {
+        if (this.#isProcessAlive(record.parentProcessId)) {
+          this.#diagnostics.push({
+            runId: record.runId,
+            outcome: "live_owner",
+            message: `Run ${record.runId} belongs to live parent process ${record.parentProcessId}; left untouched`,
+          });
+          continue;
+        }
+        const mismatch = record.worktree
+          ? await this.#stoppedWorkerResidueMismatch(record, cleanupSignal)
+          : await this.#stoppedSessionResidueMismatch(record);
+        if (mismatch) {
+          this.#diagnostics.push({
+            runId: record.runId,
+            outcome: "identity_mismatch",
+            message: `Run ${record.runId} aborted cleanup-only reconciliation was not authorized: ${mismatch}`,
+          });
+          continue;
+        }
+        const run = this.#replayedRun(replay);
+        run.lifecycle = "stopping";
+        try {
+          this.#record(run, "stopping");
+        } catch (error) {
+          this.#diagnostics.push({
+            runId: record.runId,
+            outcome: "retained",
+            message: `Run ${record.runId} aborted cleanup-only reconciliation was not started because its journal failed: ${errorMessage(error)}`,
+          });
+          continue;
+        }
+        const stopped = await this.#cleanupRun(run, cleanupSignal, {
+          skipReaderContainerCleanup: !record.worktree,
+        });
+        if (stopped.run.lifecycle === "retained") this.runs.set(run.id, run);
+        this.#diagnostics.push({
+          runId: record.runId,
+          outcome: stopped.run.lifecycle === "closed" ? "cleaned" : "retained",
+          message: `Proven-aborted run ${record.runId} cleanup ${stopped.run.lifecycle}`,
+          ...(stopped.retained.length ? { retained: [...stopped.retained] } : {}),
+        });
+        continue;
+      }
+      if (
+        record.state === "retained"
+        && replay.childStopped
+        && record.worktree
+        && (
+          record.generation?.artifactParentPersisted !== true
+          || record.generation.artifactResultPersisted === true
+        )
+      ) {
         if (this.#isProcessAlive(record.parentProcessId)) {
           this.#diagnostics.push({
             runId: record.runId,
@@ -471,13 +564,29 @@ export class SubagentRuntime {
           });
           continue;
         }
-        const stopped = await this.#cleanupRun(run, cleanupSignal, false);
+        const stopped = await this.#cleanupRun(run, cleanupSignal);
         if (stopped.run.lifecycle === "retained") this.runs.set(run.id, run);
         this.#diagnostics.push({
           runId: record.runId,
           outcome: stopped.run.lifecycle === "closed" ? "cleaned" : "retained",
           message: `Proven-stopped worker ${record.runId} cleanup ${stopped.run.lifecycle}`,
           ...(stopped.retained.length ? { retained: [...stopped.retained] } : {}),
+        });
+        continue;
+      }
+      if (
+        record.state !== "closed"
+        && record.generation?.artifactParentPersisted === true
+        && record.generation.artifactResultPersisted !== true
+      ) {
+        const missingStopProof = record.generation.outcome === "aborted" && !replay.childStopped;
+        this.#diagnostics.push({
+          runId: record.runId,
+          outcome: missingStopProof ? "identity_mismatch" : "retained",
+          message: missingStopProof
+            ? `Run ${record.runId} aborted cleanup-only reconciliation was not authorized: durable child-stop proof is missing`
+            : `Run ${record.runId} has an incomplete generation without durable abort authorization; left untouched`,
+          ...(record.retained ? { retained: [...record.retained] } : {}),
         });
         continue;
       }
@@ -521,7 +630,7 @@ export class SubagentRuntime {
         });
         continue;
       }
-      const stopped = await this.#cleanupRun(run, cleanupSignal, false);
+      const stopped = await this.#cleanupRun(run, cleanupSignal);
       this.#diagnostics.push({
         runId: record.runId,
         outcome: stopped.run.lifecycle === "closed" ? "cleaned" : "retained",
@@ -720,7 +829,7 @@ export class SubagentRuntime {
           this.#notifyRunsChanged();
         } catch { /* preserve the original startup error */ }
         const signal = AbortSignal.timeout(this.#cleanupTimeoutMs);
-        const stopped = await this.#cleanupRun(run, signal, true);
+        const stopped = await this.#cleanupRun(run, signal, { allowUnjournaledWorkerSessionRemoval: true });
         retained = stopped.retained;
       } else {
         retained = await this.#cleanupStartup(agent, tabId, rootPaneId, worktree, childSessionDir);
@@ -778,14 +887,14 @@ export class SubagentRuntime {
     return cloneRun(run);
   }
 
-  async stop(id: string, request: Partial<ParentRequest> = {}): Promise<StopResult> {
+  async stop(id: string, request: StopRequest = {}): Promise<StopResult> {
     const run = this.#run(id, request);
     if (run.cleanup) return run.cleanup;
     if (run.lifecycle === "closed") {
       return { run: cloneRun(run), retained: [...(run.retained ?? [])] };
     }
     const signal = AbortSignal.timeout(this.#cleanupTimeoutMs);
-    const attempt = this.#stopAttempt(run, signal);
+    const attempt = this.#stopAttempt(run, signal, request.discardIncompleteResult === true);
     run.cleanup = attempt;
     void attempt.then(
       () => { if (run.lifecycle === "retained" && run.cleanup === attempt) run.cleanup = undefined; },
@@ -794,7 +903,7 @@ export class SubagentRuntime {
     return attempt;
   }
 
-  async #stopAttempt(run: RunRecord, signal: AbortSignal): Promise<StopResult> {
+  async #stopAttempt(run: RunRecord, signal: AbortSignal, discardIncompleteResult: boolean): Promise<StopResult> {
     if (run.archivePending && !await this.#recoverPendingArtifact(run)) {
       return { run: cloneRun(run), retained: [...(run.retained ?? [])] };
     }
@@ -812,7 +921,7 @@ export class SubagentRuntime {
       this.#notifyRunsChanged();
       return { run: cloneRun(run), retained };
     }
-    return this.#cleanupRun(run, signal, false);
+    return this.#cleanupRun(run, signal, { discardIncompleteResult, reconcileIncompleteResult: true });
   }
 
   async settle(request: Partial<ParentRequest> = {}): Promise<readonly StopResult[]> {
@@ -901,6 +1010,7 @@ export class SubagentRuntime {
       number: generation.number,
       baselineEntryId: generation.baselineEntryId,
       delivery: generation.delivery,
+      ...(generation.outcome ? { outcome: generation.outcome } : {}),
       ...(generation.resultEntryId ? { resultEntryId: generation.resultEntryId } : {}),
       ...(generation.returned ? { returned: true } : {}),
       ...(generation.artifactParentPersisted ? { artifactParentPersisted: true } : {}),
@@ -952,6 +1062,64 @@ export class SubagentRuntime {
       }, section);
     } catch (error) {
       throw new Error(`Artifact persistence failed for run ${run.id} at ${run.artifactPath}: ${errorMessage(error)}`, { cause: error });
+    }
+  }
+
+  async #persistAbortedGeneration(run: RunRecord): Promise<void> {
+    const generation = run.generation;
+    if (!generation) throw new Error(`Run has no generation to abort: ${run.id}`);
+    await persistAbortedGeneration(
+      generation,
+      (section) => this.#appendArtifact(run, section),
+      () => this.#record(run, "stopping"),
+    );
+  }
+
+  async #reconcileStoppedGeneration(run: RunRecord, discardIncompleteResult: boolean): Promise<boolean> {
+    const generation = run.generation;
+    if (
+      !generation?.artifactParentPersisted
+      || generation.artifactResultPersisted
+      || generation.outcome === "aborted"
+    ) return true;
+
+    let observation: ChildSessionObservation | undefined;
+    try {
+      observation = await this.#observeChildSession(run.location, generation.baselineEntryId);
+    } catch (error) {
+      run.error = `Incomplete result reconciliation failed: ${errorMessage(error)}`;
+      generation.error = run.error;
+      return false;
+    }
+
+    if (observation?.result) {
+      run.childSessionPath = observation.childSessionPath;
+      run.latestResult = {
+        childEntryId: observation.result.childEntryId,
+        text: observation.result.text,
+        message: observation.result.message,
+      };
+      run.archivePending = true;
+      return this.#recoverPendingArtifact(run);
+    }
+
+    if (!discardIncompleteResult) {
+      run.error = "Incomplete generation has no archived final result";
+      generation.error = run.error;
+      return false;
+    }
+
+    try {
+      await this.#persistAbortedGeneration(run);
+      run.abortArtifactAwaitingJournal = false;
+      run.error = undefined;
+      generation.error = undefined;
+      return true;
+    } catch (error) {
+      run.abortArtifactAwaitingJournal = error instanceof AbortJournalPersistenceError;
+      run.error = `Abort persistence failed: ${errorMessage(error)}`;
+      generation.error = run.error;
+      return false;
     }
   }
 
@@ -1416,7 +1584,7 @@ export class SubagentRuntime {
             run.updatedAt = previousUpdatedAt;
           }
         }
-        run.cleanup = this.#cleanupRun(run, signal, false);
+        run.cleanup = this.#cleanupRun(run, signal);
       }
       const attempt = run.cleanup;
       const result = await attempt;
@@ -1468,11 +1636,26 @@ export class SubagentRuntime {
     return retained;
   }
 
-  async #cleanupRun(run: RunRecord, signal: AbortSignal, allowUnjournaledWorkerSessionRemoval: boolean): Promise<StopResult> {
+  async #cleanupRun(
+    run: RunRecord,
+    signal: AbortSignal,
+    options: CleanupRunOptions = {},
+  ): Promise<StopResult> {
+    const {
+      allowUnjournaledWorkerSessionRemoval = false,
+      discardIncompleteResult = false,
+      reconcileIncompleteResult = false,
+      skipReaderContainerCleanup = false,
+    } = options;
     const retained: string[] = [];
     let partial = false;
     let mayFinalize = true;
     let workerCleanup: WorkerCleanup | undefined;
+    let generationReconciled: boolean | undefined;
+    const reconcileGeneration = async (): Promise<void> => {
+      if (!reconcileIncompleteResult || generationReconciled !== undefined || !run.childStopped) return;
+      generationReconciled = await this.#reconcileStoppedGeneration(run, discardIncompleteResult);
+    };
 
     if (!run.childStopped) {
       try {
@@ -1480,6 +1663,7 @@ export class SubagentRuntime {
         if (!this.#persistChildStopped(run)) mayFinalize = false;
       } catch { /* an enclosing tab/worktree cleanup may still prove the child stopped */ }
     }
+    await reconcileGeneration();
 
     if (!mayFinalize) {
       partial = true;
@@ -1499,7 +1683,7 @@ export class SubagentRuntime {
         if (!run.childStopped) retained.unshift(`pane=${run.paneId}`);
         retained.push(`worktree=${workerCleanup.path}`);
       }
-    } else {
+    } else if (!skipReaderContainerCleanup) {
       try {
         await this.client.closeTab(run.tabId, signal);
         if (!run.childStopped && !this.#persistChildStopped(run)) {
@@ -1512,19 +1696,28 @@ export class SubagentRuntime {
         retained.push(`tab=${run.tabId}`);
       }
     }
+    await reconcileGeneration();
 
     const childSessionPresent = await pathExists(run.childSessionDir);
     const generationMayContainResult = run.generation?.artifactParentPersisted === true;
-    const resultArchived = run.generation?.artifactResultPersisted === true;
+    const resultArchived = run.generation?.artifactResultPersisted === true && !run.archivePending;
+    const generationAborted = run.generation?.outcome === "aborted";
     const sessionRemovalAuthorized = run.childStopped === true
-      && (!generationMayContainResult || resultArchived || allowUnjournaledWorkerSessionRemoval);
-    if (childSessionPresent && !sessionRemovalAuthorized) {
+      && (!generationMayContainResult || resultArchived || generationAborted || allowUnjournaledWorkerSessionRemoval);
+    if (generationMayContainResult && !resultArchived && !generationAborted && !allowUnjournaledWorkerSessionRemoval) {
+      partial = true;
+      if (!retained.includes(`sessionDir=${run.childSessionDir}`)) retained.push(`sessionDir=${run.childSessionDir}`);
+    } else if (childSessionPresent && !sessionRemovalAuthorized) {
       partial = true;
       retained.push(`sessionDir=${run.childSessionDir}`);
     }
 
     let cleanupArtifactPersisted = true;
-    if (run.generation?.artifactParentPersisted) {
+    if (
+      run.generation?.artifactParentPersisted
+      && !run.abortArtifactAwaitingJournal
+      && !run.cleanupArtifactAwaitingJournal
+    ) {
       const state = partial
         ? "action required"
         : workerCleanup?.removed && workerCleanup.action === "removed"
@@ -1535,14 +1728,25 @@ export class SubagentRuntime {
         : partial
           ? run.error ?? "owned resource cleanup was incomplete"
           : undefined;
+      const actionable = retained.filter((fact) => !fact.startsWith("branch="));
+      const worktreeBlocked = actionable.some((fact) => fact.startsWith("worktree="))
+        || (workerCleanup !== undefined && !workerCleanup.removed);
+      const incompleteSessionOnly = actionable.length === 1
+        && actionable[0]?.startsWith("sessionDir=")
+        && run.generation.artifactResultPersisted !== true
+        && run.generation.outcome !== "aborted"
+        && (run.error === undefined || run.error === "Incomplete generation has no archived final result");
+      const next = worktreeBlocked
+        ? `Preserve the work, make the checkout safe, then retry subagent_stop({ id: "${run.id}" }). Do not use raw Git-only removal.`
+        : incompleteSessionOnly
+          ? `To irreversibly discard this incomplete transcript, call subagent_stop({ id: "${run.id}", discardIncompleteResult: true }). A raced complete result is recovered first.`
+          : `Retry subagent_stop({ id: "${run.id}" }).`;
       try {
         await this.#appendArtifact(run, renderCleanupSection({
           state,
           ...(reason ? { reason } : {}),
           ...(retained.length ? { retained: [...retained] } : {}),
-          ...(state === "action required" ? {
-            next: `Preserve the work, make the checkout safe, then retry subagent_stop({ id: "${run.id}" }). Do not use raw Git-only removal.`,
-          } : {}),
+          ...(state === "action required" ? { next } : {}),
         }));
       } catch (error) {
         cleanupArtifactPersisted = false;
@@ -1555,8 +1759,9 @@ export class SubagentRuntime {
     if (childSessionPresent) {
       if (cleanupArtifactPersisted && sessionRemovalAuthorized) {
         try { await rm(run.childSessionDir, { recursive: true, force: true }); }
-        catch {
+        catch (error) {
           partial = true;
+          run.error = `Child session removal failed: ${errorMessage(error)}`;
           retained.push(`sessionDir=${run.childSessionDir}`);
           try {
             await this.#appendArtifact(run, renderCleanupSection({
@@ -1578,11 +1783,23 @@ export class SubagentRuntime {
     run.updatedAt = this.#now();
     try {
       this.#record(run, run.lifecycle, workerCleanup);
+      run.cleanupArtifactAwaitingJournal = false;
     } catch (error) {
       run.lifecycle = "retained";
+      run.cleanupArtifactAwaitingJournal = true;
       run.error = `Cleanup journal failed: ${errorMessage(error)}`;
       if (!retained.includes("journal=herdr-subagent-state")) retained.push("journal=herdr-subagent-state");
       run.retained = retained;
+      if (run.generation?.artifactParentPersisted) {
+        try {
+          await this.#appendArtifact(run, renderCleanupSection({
+            state: "action required",
+            reason: run.error,
+            retained: ["journal=herdr-subagent-state"],
+            next: `Retry subagent_stop({ id: "${run.id}" }).`,
+          }));
+        } catch { /* the prior complete artifact remains valid */ }
+      }
     }
     const result: StopResult = {
       run: cloneRun(run),
@@ -1616,15 +1833,40 @@ export class SubagentRuntime {
     ];
   }
 
-  async #stoppedWorkerResidueMismatch(record: HerdrStateRecord, signal: AbortSignal): Promise<string | undefined> {
-    const worktree = record.worktree;
-    if (!worktree) return "worker facts are missing";
+  async #stoppedSessionResidueMismatch(record: HerdrStateRecord): Promise<string | undefined> {
     if (!/^run-[A-Za-z0-9._-]+$/.test(record.runId) || record.childSessionId !== `herdr-${record.runId}`) {
       return "run and child session IDs are not deterministic";
     }
     const expectedLocation = createChildSessionLocation(record.parentSessionId, record.runId, record.childCwd, this.#agentDir);
     if (resolve(record.childSessionDir) !== resolve(expectedLocation.childSessionDir)) {
       return "child session directory is not the deterministic owned path";
+    }
+    if (record.childSessionPath) {
+      const path = resolve(record.childSessionPath);
+      const suffix = `_${record.childSessionId}.jsonl`;
+      const filename = basename(path);
+      const timestamp = filename.endsWith(suffix) ? filename.slice(0, -suffix.length) : "";
+      if (
+        dirname(path) !== resolve(expectedLocation.childSessionDir)
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(timestamp)
+      ) return "child session file is not the exact owned Pi session path";
+      try {
+        const stats = await lstat(path);
+        if (stats.isSymbolicLink()) return "child session file is a symbolic link";
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          return `child session file could not be checked (${errorMessage(error)})`;
+        }
+      }
+    }
+    try {
+      const stats = await lstat(expectedLocation.childSessionDir);
+      if (stats.isSymbolicLink()) return "child session directory is a symbolic link";
+      if (!stats.isDirectory()) return "child session path is not a directory";
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return `child session directory could not be checked (${errorMessage(error)})`;
+      }
     }
     const expectedArtifactPath = resolveArtifactLocation({
       agentDir: this.#agentDir,
@@ -1634,6 +1876,14 @@ export class SubagentRuntime {
     if (record.artifactPath && resolve(record.artifactPath) !== resolve(expectedArtifactPath)) {
       return "artifact path is not the deterministic owned path";
     }
+    return undefined;
+  }
+
+  async #stoppedWorkerResidueMismatch(record: HerdrStateRecord, signal: AbortSignal): Promise<string | undefined> {
+    const sessionMismatch = await this.#stoppedSessionResidueMismatch(record);
+    if (sessionMismatch) return sessionMismatch;
+    const worktree = record.worktree;
+    if (!worktree) return "worker facts are missing";
     if (
       worktree.workspaceId !== record.workspaceId
       || resolve(worktree.path) !== resolve(record.childCwd)
@@ -1662,6 +1912,14 @@ export class SubagentRuntime {
     } catch (error) {
       if (error instanceof HerdrError && error.code === "workspace_not_found" && pathAbsent) return undefined;
       return `current Herdr workspace could not be proven (${errorMessage(error)})`;
+    }
+    if (!pathAbsent) {
+      try {
+        const status = await (this.#gitStatus ?? readGitStatus)(worktree.path, signal);
+        if (status.trim()) return "worker checkout is dirty";
+      } catch (error) {
+        return `worker checkout status could not be proven (${errorMessage(error)})`;
+      }
     }
     return undefined;
   }
@@ -1717,6 +1975,7 @@ export class SubagentRuntime {
       ...(record.generation.resultEntryId ? { resultEntryId: record.generation.resultEntryId } : {}),
       delivery: record.generation.delivery,
       blockingWaiter: false,
+      ...(record.generation.outcome ? { outcome: record.generation.outcome } : {}),
       ...(record.generation.returned ? { returned: true } : {}),
       ...(record.generation.artifactParentPersisted ? { artifactParentPersisted: true } : {}),
       ...(record.generation.artifactResultPersisted ? { artifactResultPersisted: true } : {}),

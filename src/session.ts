@@ -22,6 +22,7 @@ export interface JournalGeneration {
   number: number;
   baselineEntryId: string | null;
   delivery: "pending" | "ready" | "queued" | "delivered";
+  outcome?: "aborted";
   resultEntryId?: string;
   returned?: boolean;
   artifactParentPersisted?: true;
@@ -81,6 +82,7 @@ function validGeneration(value: unknown): boolean {
       || generation.delivery === "ready"
       || generation.delivery === "queued"
       || generation.delivery === "delivered")
+    && (generation.outcome === undefined || generation.outcome === "aborted")
     && (generation.resultEntryId === undefined || typeof generation.resultEntryId === "string")
     && (generation.returned === undefined || typeof generation.returned === "boolean")
     && (generation.artifactParentPersisted === undefined || generation.artifactParentPersisted === true)

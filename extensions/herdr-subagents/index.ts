@@ -48,12 +48,34 @@ function phase(run: Run): { label: string; tone: WidgetTone } {
 
 export function retainedCleanupAction(result: StopResult) {
   const { run, workerCleanup } = result;
-  if (run.lifecycle !== "retained" || !run.worktree) return undefined;
+  if (run.lifecycle !== "retained") return undefined;
+
+  const actionable = result.retained.filter((fact) => !fact.startsWith("branch="));
+  const worktreeBlocked = actionable.some((fact) => fact.startsWith("worktree="))
+    || (workerCleanup !== undefined && !workerCleanup.removed);
+  const incompleteSessionOnly = actionable.length === 1
+    && actionable[0]?.startsWith("sessionDir=")
+    && run.generation?.artifactParentPersisted === true
+    && run.generation.artifactResultPersisted !== true
+    && run.generation.outcome !== "aborted"
+    && (run.error === undefined || run.error === "Incomplete generation has no archived final result");
   const reason = workerCleanup && !workerCleanup.removed
     ? workerCleanup.reason
-    : run.error ?? "owned worker cleanup was incomplete";
-  return {
+    : run.error ?? "owned resource cleanup was incomplete";
+  const common = {
     customType: "herdr-subagent-action" as const,
+    display: true,
+    details: {
+      parentSessionId: run.parentSessionId,
+      runId: run.id,
+      artifactPath: run.artifactPath,
+      ...(run.worktree ? { worktree: { ...run.worktree } } : {}),
+      reason,
+    },
+  };
+
+  if (worktreeBlocked && run.worktree) return {
+    ...common,
     content: [
       `Run ${run.id} cleanup requires action.`,
       `Worktree: ${run.worktree.path}`,
@@ -64,14 +86,26 @@ export function retainedCleanupAction(result: StopResult) {
       `Retry: subagent_stop({ id: "${run.id}" })`,
       "Do not use raw Git-only worktree removal; preserve the work and retry through the extension.",
     ].join("\n"),
-    display: true,
-    details: {
-      parentSessionId: run.parentSessionId,
-      runId: run.id,
-      artifactPath: run.artifactPath,
-      worktree: { ...run.worktree },
-      reason,
-    },
+  };
+
+  if (incompleteSessionOnly) return {
+    ...common,
+    content: [
+      `Run ${run.id} stopped without an archived final result.`,
+      `Artifact: ${run.artifactPath}`,
+      `Explicit irreversible discard: subagent_stop({ id: "${run.id}", discardIncompleteResult: true })`,
+      "A raced complete result is recovered first. Do not treat repeated ordinary stops as discard consent.",
+    ].join("\n"),
+  };
+
+  return {
+    ...common,
+    content: [
+      `Run ${run.id} cleanup remains retained.`,
+      `Reason: ${reason}`,
+      `Artifact: ${run.artifactPath}`,
+      `Retry: subagent_stop({ id: "${run.id}" })`,
+    ].join("\n"),
   };
 }
 

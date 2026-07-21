@@ -36,9 +36,10 @@ subagent_status({ id? })
 subagent_send({ id, message, wait?: false })
 subagent_send({ id, message, wait: true, timeoutMs?: 1..300000 })
 subagent_stop({ id })
+subagent_stop({ id, discardIncompleteResult: true })
 ```
 
-Unknown fields are rejected. `wait` defaults to `false`; `timeoutMs` is valid only with `wait:true`.
+Unknown fields are rejected. `wait` defaults to `false`; `timeoutMs` is valid only with `wait:true`. `discardIncompleteResult` accepts only literal `true`; it is explicit irreversible consent, not a retry mode.
 
 ## Workflow
 
@@ -47,7 +48,7 @@ Unknown fields are rejected. `wait` defaults to `false`; `timeoutMs` is valid on
 3. Use `wait:true` only when the current parent turn must block for the same result. A successful wait returns the complete result directly without a duplicate message. A timeout leaves background monitoring active.
 4. During the result-triggered turn, inspect the evidence. If more work is needed, call `subagent_send` before the parent settles. A follow-up is accepted only after the prior result was delivered or returned and uses the same child session with a fresh cursor.
 5. Use `subagent_status({ id })` for diagnostic lifecycle, generation, delivery, artifact, child-session, worktree, and retained-resource facts. Use `subagent_status({})` to list current-parent runs.
-6. Call `subagent_stop` when explicit early cleanup or a reported archival/finalization retry is needed. Otherwise, the first eligible post-result parent settlement cleans the run automatically.
+6. Call ordinary `subagent_stop({ id })` for explicit early cleanup or a reported archival/finalization retry. It remains fail-safe and recovers a raced complete result first. Only when a proven-stopped generation has no final result and the transcript may be irreversibly discarded, call `subagent_stop({ id, discardIncompleteResult: true })`. Repeated ordinary stops never imply consent. Otherwise, the first eligible post-result parent settlement cleans the run automatically.
 
 ## Exact artifact recovery
 
@@ -55,7 +56,7 @@ Each run is archived automatically at `<agentDir>/herdr-subagent-artifacts/<pare
 
 Every complete result preserves the full child text and names `Durable recovery artifact (read after compaction): <exact path>`. After compaction or compacted-session resume, the next context receives one transient catalog covering valid current and historical parent-session runs plus safe artifact-only files. Distinguish `current` from `latest durable`/historical facts; artifact-only status and completeness are unknown. Read each named available or incomplete artifact before relying on compacted details. The catalog injects no artifact bodies, persists nothing, and never authorizes editing an artifact.
 
-Clean stream disconnects and transport failures reconnect with bounded backoff. Reconnect exhaustion or protocol/identity failure retains the run without a polling fallback; inspect the retained facts and use `subagent_stop({ id })`. If result archival fails, the run and child session likewise remain retained and the result is not delivered. `subagent_stop` is the sole retry operation; it archives and returns the preserved result without also injecting a background duplicate, then continues safe cleanup.
+Clean stream disconnects and transport failures reconnect with bounded backoff. Reconnect exhaustion or protocol/identity failure retains the run without a polling fallback; inspect the retained facts and use ordinary `subagent_stop({ id })`. If result archival fails, the run and child session likewise remain retained and the result is not delivered. Ordinary stop is the recovery action: it archives and returns a preserved or raced complete result without a background duplicate, then continues safe cleanup. When no complete result exists, ordinary stop retains the session; the explicit discard form records an aborted generation in the artifact and parent journal before session removal.
 
 ## Ownership and safety
 
@@ -65,8 +66,8 @@ Clean stream disconnects and transport failures reconnect with bounded backoff. 
 - Quit, reload, new, resume, and fork abort monitors and perform bounded cleanup. Reload does not preserve live ownership.
 - On a later start, only exact residue from a dead prior parent PID is cleanup-eligible. Live-owner, malformed, or identity-mismatched residue is reported and left untouched. Never reuse a prior-instance run ID or treat residue as adopted.
 
-Reader cleanup closes its pane and owned tab, then removes its child session storage only after any result is archived. Worker cleanup closes its pane, removes only a clean worktree with `force:false`, and always retains the generated branch. Dirty or uncheckable worktrees remain untouched and reported with the same `subagent_stop` retry call.
+Reader cleanup closes its pane and owned tab, then removes child-session storage only after a result is archived or explicit abort evidence is durable. Worker cleanup closes its pane, removes only a clean worktree with `force:false`, and always retains the generated branch. Dirty or uncheckable worktrees remain untouched and use ordinary `subagent_stop` after they are made safe. If only an incomplete session remains, the reported action names the explicit irreversible discard call; artifact, journal, and session-removal failures use ordinary retry.
 
-A worker result and start response identify its checkout, branch, parent owner, artifact, and cleanup warning. Preserve reported work, make the checkout clean, then retry through `subagent_stop`; simultaneous retries share one attempt and a later call can retry a retained outcome. Do not use raw Git-only worktree removal, force cleanup, or branch deletion.
+A worker result and start response identify its checkout, branch, parent owner, artifact, and cleanup warning. Preserve reported work, make the checkout clean, then retry through ordinary `subagent_stop`; simultaneous calls share the options of the attempt that started, while a later explicit discard can retry a retained incomplete generation. Do not use raw Git-only worktree removal, force cleanup, or branch deletion. Generated branches remain retained after successful closure and do not by themselves require an actionable widget row.
 
 If the checkout was already removed externally, `subagent_stop` closes only the exact journal-owned Herdr workspace after `workspace.get` proves the same ID, normalized checkout path, and linked-worktree identity. Any mismatch or untyped lookup failure remains retained. Explicit stop reports the outcome without a duplicate action message; shutdown records it without triggering a turn.

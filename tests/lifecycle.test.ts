@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -410,8 +410,8 @@ test("cleanup-only reconciliation requires dead ownership, durable stop proof, a
         assert.notEqual(diagnostics[0]?.outcome, "cleaned");
         assert.equal(client.calls.some(({ method }) => method === "worktree.remove" || method === "workspace.close"), false);
         if (scenario === "dirty") {
-          assert.equal(diagnostics[0]?.outcome, "retained");
-          assert.equal(runtime.status("run-prior").childStopped, true);
+          assert.equal(diagnostics[0]?.outcome, "identity_mismatch");
+          assert.equal(runtime.list().length, 0);
         }
       } finally {
         await rm(parent.root, { recursive: true, force: true });
@@ -434,6 +434,199 @@ test("cleanup-only reconciliation requires dead ownership, durable stop proof, a
       assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get", "workspace.get"]);
     } finally {
       await rm(parent.root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("aborted cleanup-only replay requires dead ownership, stop proof, and exact reader or worker residue", async (context) => {
+  function aborted(parent: ParentFixture, overrides: Partial<HerdrStateRecord> = {}): HerdrStateRecord {
+    return priorRecord(parent, {
+      state: "stopping",
+      artifactPath: resolveArtifactLocation({
+        agentDir: parent.agentDir,
+        parentSessionId: "parent-session",
+        runId: "run-prior",
+      }).path,
+      childStopped: true,
+      generation: {
+        number: 1,
+        baselineEntryId: null,
+        delivery: "pending",
+        outcome: "aborted",
+        artifactParentPersisted: true,
+      },
+      ...overrides,
+    });
+  }
+
+  await context.test("dead exact reader residue", async () => {
+    const parent = await createParent();
+    try {
+      const record = aborted(parent);
+      await mkdir(record.childSessionDir, { recursive: true });
+      parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, record);
+      const client = new FakeHerdr();
+      const runtime = runtimeFor(parent, client, { isProcessAlive: () => false });
+      const diagnostics = await bind(runtime, parent);
+      assert.equal(diagnostics[0]?.outcome, "cleaned");
+      assert.deepEqual(client.calls, []);
+      assert.equal(existsSync(record.childSessionDir), false);
+      assert.deepEqual(records(parent.manager).slice(-2).map(({ state }) => state), ["stopping", "closed"]);
+      assert.deepEqual(runtime.list(), []);
+    } finally {
+      await rm(parent.root, { recursive: true, force: true });
+    }
+  });
+
+  await context.test("dead exact worker residue", async () => {
+    const parent = await createParent();
+    try {
+      const path = join(parent.root, ".herdr-subagents-worktrees", "run-prior");
+      await mkdir(path, { recursive: true });
+      const record = aborted(parent, {
+        profile: "worker",
+        childCwd: path,
+        workspaceId: "w-worker",
+        worktree: { workspaceId: "w-worker", path, branch: "herdr-subagents/run-prior" },
+      });
+      await mkdir(record.childSessionDir, { recursive: true });
+      parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, record);
+      const client = new FakeHerdr();
+      client.workspace = { workspaceId: "w-worker", worktree: { checkoutPath: path, isLinkedWorktree: true } };
+      const runtime = runtimeFor(parent, client, { isProcessAlive: () => false, gitStatus: async () => "" });
+      const diagnostics = await bind(runtime, parent);
+      assert.equal(diagnostics[0]?.outcome, "cleaned");
+      assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get", "worktree.remove"]);
+      assert.equal(existsSync(record.childSessionDir), false);
+      assert.equal(client.calls.some(({ method }) => method === "pane.close"), false);
+    } finally {
+      await rm(parent.root, { recursive: true, force: true });
+    }
+  });
+
+  await context.test("already-finalized aborted worker residue", async () => {
+    const parent = await createParent();
+    try {
+      const path = join(parent.root, ".herdr-subagents-worktrees", "run-prior");
+      const record = aborted(parent, {
+        profile: "worker",
+        childCwd: path,
+        workspaceId: "w-worker",
+        worktree: { workspaceId: "w-worker", path, branch: "herdr-subagents/run-prior" },
+      });
+      await mkdir(record.childSessionDir, { recursive: true });
+      parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, record);
+      const client = new FakeHerdr();
+      client.failGetWorkspace = new HerdrError("missing", { code: "workspace_not_found" });
+      const runtime = runtimeFor(parent, client, {
+        isProcessAlive: () => false,
+        gitStatus: async () => { throw new Error("checkout absent"); },
+      });
+      const diagnostics = await bind(runtime, parent);
+      assert.equal(diagnostics[0]?.outcome, "cleaned");
+      assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get", "workspace.get"]);
+      assert.equal(existsSync(record.childSessionDir), false);
+    } finally {
+      await rm(parent.root, { recursive: true, force: true });
+    }
+  });
+
+  for (const scenario of ["live owner", "missing stop", "missing abort", "wrong path"] as const) {
+    await context.test(scenario, async () => {
+      const parent = await createParent();
+      try {
+        const record = aborted(parent, scenario === "missing stop"
+          ? { childStopped: undefined }
+          : scenario === "missing abort"
+            ? { generation: { number: 1, baselineEntryId: null, delivery: "pending", artifactParentPersisted: true } }
+            : scenario === "wrong path"
+              ? { childSessionPath: join(parent.root, "wrong", "session.jsonl") }
+              : {});
+        await mkdir(record.childSessionDir, { recursive: true });
+        parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, record);
+        const client = new FakeHerdr();
+        const runtime = runtimeFor(parent, client, { isProcessAlive: () => scenario === "live owner" });
+        const diagnostics = await bind(runtime, parent);
+        assert.notEqual(diagnostics[0]?.outcome, "cleaned");
+        assert.equal(client.calls.length, 0);
+        assert.equal(existsSync(record.childSessionDir), true);
+        assert.equal(records(parent.manager).length, 1);
+      } finally {
+        await rm(parent.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  await context.test("symlinked reader session directory", async () => {
+    const parent = await createParent();
+    try {
+      const record = aborted(parent);
+      const external = join(parent.root, "external-session");
+      await mkdir(external, { recursive: true });
+      await mkdir(join(record.childSessionDir, ".."), { recursive: true });
+      await symlink(external, record.childSessionDir, "dir");
+      parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, record);
+      const client = new FakeHerdr();
+      const runtime = runtimeFor(parent, client, { isProcessAlive: () => false });
+      const diagnostics = await bind(runtime, parent);
+      assert.equal(diagnostics[0]?.outcome, "identity_mismatch");
+      assert.equal(client.calls.length, 0);
+      assert.equal(existsSync(external), true);
+      assert.equal(records(parent.manager).length, 1);
+    } finally {
+      await rm(parent.root, { recursive: true, force: true });
+    }
+  });
+
+  await context.test("dirty aborted worker is untouched", async () => {
+    const parent = await createParent();
+    try {
+      const path = join(parent.root, ".herdr-subagents-worktrees", "run-prior");
+      await mkdir(path, { recursive: true });
+      const record = aborted(parent, {
+        profile: "worker",
+        childCwd: path,
+        workspaceId: "w-worker",
+        worktree: { workspaceId: "w-worker", path, branch: "herdr-subagents/run-prior" },
+      });
+      await mkdir(record.childSessionDir, { recursive: true });
+      parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, record);
+      const client = new FakeHerdr();
+      client.workspace = { workspaceId: "w-worker", worktree: { checkoutPath: path, isLinkedWorktree: true } };
+      const runtime = runtimeFor(parent, client, { isProcessAlive: () => false, gitStatus: async () => " M file.ts\n" });
+      const diagnostics = await bind(runtime, parent);
+      assert.equal(diagnostics[0]?.outcome, "identity_mismatch");
+      assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get"]);
+      assert.equal(existsSync(record.childSessionDir), true);
+      assert.equal(client.calls.some(({ method }) => method === "worktree.remove"), false);
+      assert.equal(records(parent.manager).length, 1);
+    } finally {
+      await rm(parent.root, { recursive: true, force: true });
+    }
+  });
+
+  await context.test("reload and closed abortion are non-mutating terminal states", async () => {
+    for (const [reason, state] of [["reload", "stopping"], ["startup", "closed"]] as const) {
+      const parent = await createParent();
+      try {
+        const record = aborted(parent, { state });
+        await mkdir(record.childSessionDir, { recursive: true });
+        parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, record);
+        const client = new FakeHerdr();
+        const runtime = runtimeFor(parent, client, { isProcessAlive: () => false });
+        const diagnostics = await bind(runtime, parent, reason);
+        assert.equal(client.calls.length, 0);
+        assert.equal(existsSync(record.childSessionDir), true);
+        assert.deepEqual(runtime.list(), []);
+        if (state === "closed") {
+          assert.equal(diagnostics[0]?.outcome, "closed");
+          assert.match(diagnostics[0]?.message ?? "", /left run run-prior closed/);
+        } else {
+          assert.deepEqual(diagnostics, []);
+        }
+      } finally {
+        await rm(parent.root, { recursive: true, force: true });
+      }
     }
   });
 });
@@ -630,14 +823,14 @@ test("every shutdown reason aborts monitors before one fresh bounded reader clea
       const monitorSignals = client.calls.filter(({ method }) => method === "events.subscribe").map(({ signal }) => signal);
       changes.length = 0;
       const [stopped] = await runtime.shutdown(reason);
-      assert.equal(stopped?.run.lifecycle, "closed", reason);
+      assert.equal(stopped?.run.lifecycle, "retained", reason);
       assert.equal(monitorSignals.some((signal) => signal?.aborted), true, reason);
       const cleanup = client.calls.filter(({ method }) => method === "pane.close" || method === "tab.close");
       assert.deepEqual(cleanup.map(({ method }) => method), ["pane.close", "tab.close"]);
       assert.equal(cleanup[0]?.signal, cleanup[1]?.signal);
       assert.equal(monitorSignals.includes(cleanup[0]?.signal), false);
-      assert.deepEqual(records(parent.manager).slice(-2).map(({ state }) => state), ["stopping", "closed"]);
-      assert.deepEqual(changes, [["stopping"], []], reason);
+      assert.deepEqual(records(parent.manager).slice(-2).map(({ state }) => state), ["stopping", "retained"]);
+      assert.deepEqual(changes, [["stopping"], ["retained"]], reason);
     } finally {
       await rm(parent.root, { recursive: true, force: true });
     }
