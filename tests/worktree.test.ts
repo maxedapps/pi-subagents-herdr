@@ -57,14 +57,50 @@ test("arbitrary worktree profiles use isolation and share one active-start limit
   assert.match(String(rejected?.reason), /Only one worktree-backed subagent/);
   const launch = client.calls.find(({ method }) => method === "agent.start")?.input as Record<string, unknown>;
   assert.equal(launch.cwd, workerPath);
+  assert.equal(client.calls.filter(({ method }) => method === "worktree.list").length, 1);
+  assert.deepEqual(client.calls.find(({ method }) => method === "worktree.list")?.input, { workspace_id: "w-parent" });
   assert.equal(client.calls.filter(({ method }) => method === "worktree.create").length, 1);
-  assert.equal((client.calls.find(({ method }) => method === "worktree.create")?.input as Record<string, unknown>).label, "subagent:parent:run-worker");
+  const createInput = client.calls.find(({ method }) => method === "worktree.create")?.input as Record<string, unknown>;
+  assert.equal(createInput.cwd, checkoutRoot);
+  assert.equal(createInput.workspace_id, undefined);
+  assert.equal(createInput.label, "subagent:parent:run-worker");
   assert.equal(client.calls.some(({ method }) => method === "tab.create"), false);
   assert.match(started?.warning ?? "", /Generated branch: herdr-subagents\/run-worker/);
   assert.match(started?.warning ?? "", /Parent owner: parent/);
   assert.match(started?.warning ?? "", /dirty or uncheckable worktree is also retained/);
   if (started) await subject.stop(started.id);
   await rm(workerPath, { recursive: true, force: true });
+});
+
+test("worker start rejects a cwd from another repository before creating resources", async () => {
+  const foreignCheckout = await mkdtemp(join(tmpdir(), "worker-foreign-checkout-"));
+  try {
+    const client = new FakeHerdr();
+    client.worktreeSource = {
+      repoKey: "foreign-repo",
+      repoRoot: foreignCheckout,
+      sourceCheckoutPath: foreignCheckout,
+    };
+    const subject = new SubagentRuntime(client, { workspaceId: "w-parent" }, TEST_PROFILES, {
+      idFactory: () => "run-mismatch",
+      instanceIdFactory: () => "instance-mismatch",
+      appendState: () => {},
+    });
+    await subject.bindParent({
+      parentSessionId: "parent",
+      parentSessionFile: "/tmp/parent-session.jsonl",
+      parentEntryId: "parent-leaf",
+    }, [], "startup");
+
+    await assert.rejects(
+      subject.start("worker", "must not start", process.cwd()),
+      /Parent Pi checkout .* does not match Herdr workspace w-parent checkout .*Start Pi in a Herdr workspace for the intended repository/,
+    );
+    assert.deepEqual(client.calls.map(({ method }) => method), ["worktree.list"]);
+    assert.deepEqual(subject.list(), []);
+  } finally {
+    await rm(foreignCheckout, { recursive: true, force: true });
+  }
 });
 
 test("clean worker removal is bounded, non-force, and retains the branch", async () => {

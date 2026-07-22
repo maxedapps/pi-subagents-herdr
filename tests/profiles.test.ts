@@ -69,6 +69,11 @@ test("bundled Markdown profiles expose the approved launch controls and role gui
     assert.match(worker.systemPrompt, /No particular tool sequence is required/);
     assert.match(worker.systemPrompt, /Prefer the simplest coherent implementation/);
     assert.match(worker.systemPrompt, /Validation should be proportionate to the task/);
+    assert.match(worker.systemPrompt, /create one task-only commit on the generated branch/);
+    assert.match(worker.systemPrompt, /leave `git status` clean/);
+    assert.match(worker.systemPrompt, /generated branch and task commit SHA/);
+    assert.match(worker.systemPrompt, /without manufacturing a commit/);
+    assert.match(worker.systemPrompt, /Do not merge, rebase, cherry-pick, or otherwise integrate/);
 
     assert.equal(Object.isFrozen(catalog), true);
     assert.equal(Object.isFrozen(scout), true);

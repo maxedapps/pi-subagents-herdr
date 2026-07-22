@@ -105,7 +105,7 @@ export function registerSubagentTools(
   pi.registerTool({
     name: "subagent_start",
     label: "Start subagent",
-    description: `Start one visible Markdown-profile Pi subagent. Loaded profiles: ${guidance}. Background is the default; wait:true returns its structured result and automatic artifact path directly.`,
+    description: `Start one visible Markdown-profile Pi subagent. Loaded profiles: ${guidance}. Background is the default; wait:true returns its structured result and automatic artifact path directly. Without timeoutMs it waits up to 300000ms; explicit shorter waits are supported. Results still use a separate 30000ms reconciliation period.`,
     parameters: startSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       return result(await runtime.start(
@@ -138,7 +138,7 @@ export function registerSubagentTools(
   pi.registerTool({
     name: "subagent_send",
     label: "Send to subagent",
-    description: "Send one follow-up when the prior generation is delivered. Background is the default; wait:true returns the structured result directly.",
+    description: "Send one follow-up when the prior generation is delivered. Background is the default; wait:true returns the structured result directly. Without timeoutMs it waits up to 300000ms; explicit shorter waits are supported. Results still use a separate 30000ms reconciliation period.",
     parameters: sendSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       return result(await runtime.send(

@@ -40,6 +40,12 @@ export interface CreatedWorktree {
   branch: string;
 }
 
+export interface WorktreeSourceInfo {
+  repoKey: string;
+  repoRoot: string;
+  sourceCheckoutPath: string;
+}
+
 export interface WorkspaceWorktreeInfo {
   checkoutPath: string;
   isLinkedWorktree: boolean;
@@ -68,6 +74,7 @@ export interface HerdrClient {
   sendInput(paneId: string, text: string, signal?: AbortSignal): Promise<void>;
   closePane(paneId: string, signal?: AbortSignal): Promise<void>;
   closeTab(tabId: string, signal?: AbortSignal): Promise<void>;
+  getWorktreeSource(input: JsonRecord, signal?: AbortSignal): Promise<WorktreeSourceInfo>;
   createWorktree(input: JsonRecord, signal?: AbortSignal): Promise<CreatedWorktree>;
   removeWorktree(workspaceId: string, signal?: AbortSignal): Promise<void>;
   getWorkspace(workspaceId: string, signal?: AbortSignal): Promise<WorkspaceInfo>;
@@ -372,6 +379,16 @@ export class SocketHerdrClient implements HerdrClient {
 
   async closeTab(tabId: string, signal?: AbortSignal): Promise<void> {
     await this.#request("tab.close", { tab_id: tabId }, "ok", signal);
+  }
+
+  async getWorktreeSource(input: JsonRecord, signal?: AbortSignal): Promise<WorktreeSourceInfo> {
+    const result = await this.#request("worktree.list", input, "worktree_list", signal);
+    const source = record(result.source, "worktree.list.source");
+    return {
+      repoKey: string(source.repo_key, "worktree.source.repo_key"),
+      repoRoot: string(source.repo_root, "worktree.source.repo_root"),
+      sourceCheckoutPath: string(source.source_checkout_path, "worktree.source.source_checkout_path"),
+    };
   }
 
   async createWorktree(input: JsonRecord, signal?: AbortSignal): Promise<CreatedWorktree> {

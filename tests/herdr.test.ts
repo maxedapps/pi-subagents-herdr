@@ -114,6 +114,7 @@ function success(request: Request): JsonRecord {
   switch (request.method) {
     case "tab.create": return { ...base, result: { type: "tab_created", tab: { workspace_id: "w1", tab_id: "w1:t2" }, root_pane: { pane_id: "w1:p2" } } };
     case "agent.start": case "agent.get": return { ...base, result: { type: request.method === "agent.start" ? "agent_started" : "agent_info", agent: { agent: "pi", agent_session: { agent: "pi", kind: "id", value: "child-session" }, terminal_id: "term", workspace_id: "w1", tab_id: "w1:t2", pane_id: "w1:p3", agent_status: "idle" } } };
+    case "worktree.list": return { ...base, result: { type: "worktree_list", source: { repo_key: "repo-key", repo_root: "/repo", source_checkout_path: "/repo" }, worktrees: [] } };
     case "worktree.create": return { ...base, result: { type: "worktree_created", workspace: { workspace_id: "w2" }, tab: { tab_id: "w2:t1" }, root_pane: { pane_id: "w2:p1" }, worktree: { path: "/tmp/w2", branch: "branch" } } };
     case "worktree.remove": return { ...base, result: { type: "worktree_removed", workspace_id: "w2", path: "/tmp/w2", forced: false } };
     case "workspace.get": return { ...base, result: { type: "workspace_info", workspace: { workspace_id: "w2", worktree: { checkout_path: "/tmp/w2", is_linked_worktree: true } } } };
@@ -123,8 +124,8 @@ function success(request: Request): JsonRecord {
 
 test("client exposes and sends exactly the approved Herdr methods", async () => {
   assert.deepEqual(Object.getOwnPropertyNames(SocketHerdrClient.prototype).filter((name) => name !== "constructor"), [
-    "createTab", "startAgent", "getAgent", "subscribeAgentStatus", "sendInput", "closePane", "closeTab", "createWorktree", "removeWorktree",
-    "getWorkspace", "closeWorkspace",
+    "createTab", "startAgent", "getAgent", "subscribeAgentStatus", "sendInput", "closePane", "closeTab", "getWorktreeSource",
+    "createWorktree", "removeWorktree", "getWorkspace", "closeWorkspace",
   ]);
   const requests: Request[] = [];
   await withServer((request) => { requests.push(request); return success(request); }, async (client) => {
@@ -135,6 +136,11 @@ test("client exposes and sends exactly the approved Herdr methods", async () => 
     await client.sendInput("w1:p3", "task");
     await client.closePane("w1:p3");
     await client.closeTab("w1:t2");
+    assert.deepEqual(await client.getWorktreeSource({ workspace_id: "w1" }), {
+      repoKey: "repo-key",
+      repoRoot: "/repo",
+      sourceCheckoutPath: "/repo",
+    });
     await client.createWorktree({ workspace_id: "w1", path: "/tmp/w2", branch: "branch", focus: false });
     await client.removeWorktree("w2");
     assert.deepEqual(await client.getWorkspace("w2"), {
@@ -144,14 +150,15 @@ test("client exposes and sends exactly the approved Herdr methods", async () => 
     await client.closeWorkspace("w2");
   });
   assert.deepEqual(requests.map(({ method }) => method), [
-    "tab.create", "agent.start", "agent.get", "pane.send_input", "pane.close", "tab.close", "worktree.create", "worktree.remove",
-    "workspace.get", "workspace.close",
+    "tab.create", "agent.start", "agent.get", "pane.send_input", "pane.close", "tab.close", "worktree.list", "worktree.create",
+    "worktree.remove", "workspace.get", "workspace.close",
   ]);
   assert.deepEqual(requests[2]?.params, { target: "term" });
   assert.deepEqual(requests[3]?.params, { pane_id: "w1:p3", text: "task", keys: ["return"] });
-  assert.deepEqual(requests[7]?.params, { workspace_id: "w2", force: false });
-  assert.deepEqual(requests[8]?.params, { workspace_id: "w2" });
+  assert.deepEqual(requests[6]?.params, { workspace_id: "w1" });
+  assert.deepEqual(requests[8]?.params, { workspace_id: "w2", force: false });
   assert.deepEqual(requests[9]?.params, { workspace_id: "w2" });
+  assert.deepEqual(requests[10]?.params, { workspace_id: "w2" });
 });
 
 test("status subscription waits for its correlated acknowledgement and sends an exact-pane request", async () => {
@@ -351,6 +358,24 @@ test("status subscription cleanup is idempotent before acknowledgement, while st
       assert.equal(state.closes, 1);
     });
   });
+});
+
+test("worktree.list source fails closed on malformed required fields", async (context) => {
+  const malformed = [
+    { label: "repo key", source: { repo_key: "", repo_root: "/repo", source_checkout_path: "/repo" } },
+    { label: "repo root", source: { repo_key: "key", repo_root: null, source_checkout_path: "/repo" } },
+    { label: "source checkout", source: { repo_key: "key", repo_root: "/repo", source_checkout_path: "" } },
+  ];
+  for (const entry of malformed) {
+    await context.test(entry.label, async () => {
+      await withServer((request) => ({
+        id: request.id,
+        result: { type: "worktree_list", source: entry.source, worktrees: [] },
+      }), async (client) => {
+        await assert.rejects(client.getWorktreeSource({ workspace_id: "w1" }), (error) => error instanceof HerdrError);
+      });
+    });
+  }
 });
 
 test("workspace.get accepts an explicitly null worktree", async () => {

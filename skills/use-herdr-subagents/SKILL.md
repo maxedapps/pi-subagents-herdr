@@ -19,8 +19,9 @@ compatibility: Requires a persisted parent Pi session running inside Herdr with 
 - Give each child one bounded assignment with explicit scope, constraints, evidence, checks, and handoff requirements.
 - Use normal parent tools for small local work. Do not use this workflow as a general queue, batch system, or replacement for browser, SSH, or shell workflows.
 - Non-worktree runs may run concurrently. Only one worktree-backed run may be active.
+- A worktree-backed start verifies that Pi's current Git checkout matches the repository represented by `HERDR_WORKSPACE_ID`; a mismatch fails before worker resources are created.
 - `use-worktree` controls isolation only. A non-worktree profile with write-capable tools can modify the shared parent checkout.
-- Do not request automatic commits, integration, force cleanup, branch deletion, ownership transfer, or configuration changes.
+- The extension never commits or integrates work. A file-changing worker must create one task-only commit and leave its generated branch clean; the parent alone reviews, integrates, and validates it. Never request force cleanup, branch deletion, ownership transfer, or configuration changes.
 - The extension owns every artifact and recovery locator. Never ask a child to create or update them, and never edit extension-owned locator, artifact, or journal files.
 - Never use raw pane, filesystem, or Git cleanup for extension-owned residue. Use the tools below.
 
@@ -58,8 +59,8 @@ Unknown fields are rejected. `wait` defaults to `false`; `timeoutMs` is valid on
 ## Workflow
 
 1. Start the smallest useful task with `subagent_start`. Record its run ID and artifact path and, for a worktree-backed run, the exact checkout and generated branch.
-2. Prefer background mode. The final assistant result is extracted from the persistent child session and delivered automatically as one provenanced `<subagent_result>` message that triggers a parent turn. Do not poll for terminal output: startup readiness is bounded, then one exact-pane status stream is monitored. Status is only a candidate; acceptance uses a 30-second quiet/reconciliation period rather than exact `agent_settled` timing.
-3. Use `wait:true` only when this parent turn must block. Success returns the result directly without duplicate injection. A timeout leaves background monitoring active.
+2. Choose background or blocking execution from dependencies and the join point, not task eligibility. Independent work may run in the background. For dependent work, use `wait:true`, then parent-review, integrate, and validate before starting the next worker. Do not poll for terminal output: startup readiness is bounded, then one exact-pane status stream is monitored. Status is only a candidate; acceptance uses a 30-second quiet/reconciliation period rather than exact `agent_settled` timing.
+3. `wait:true` without `timeoutMs` waits up to 300,000 ms, the maximum. Pass an explicit shorter `1..300000` timeout when appropriate. Success returns the result directly without duplicate injection. A timeout releases only the waiter; background monitoring remains active and may deliver the result once later.
 4. During a result-triggered turn, inspect the evidence. If needed, call `subagent_send` before the parent settles. A follow-up is accepted only after the prior result was delivered or returned and uses a fresh child-session cursor.
 5. Use `subagent_status({ id })` for lifecycle, generation, delivery, artifact, child-session, worktree, and retained-resource facts. Use `subagent_status({})` to list current-owner runs.
 6. Use ordinary `subagent_stop({ id })` for early cleanup or an archival/finalization retry. It recovers a raced complete result first. Only when a proven-stopped generation has no final result and transcript loss is intended, use `discardIncompleteResult: true`. Repeated ordinary stops never imply consent. Otherwise, the first eligible post-result parent settlement cleans automatically.
@@ -103,7 +104,9 @@ Clean stream disconnects and transport failures reconnect with bounded backoff. 
 - Startup performs bounded non-discarding reconciliation only for exact released/dead-owner locator residue. Expensive legacy scanning is `subagent_recover({})`-only.
 - Live-owner, malformed, and identity-mismatched residue is reported and untouched. Never reuse a prior-instance run ID or adopt residue for follow-ups, delivery, status, or stop.
 
-Non-worktree cleanup closes the exact pane and owned tab, then removes child-session storage only after result archival or durable explicit-abort evidence. Worktree-backed cleanup closes the pane, removes only a clean worktree with `force:false`, and always retains the generated branch. Dirty or uncheckable worktrees remain untouched; preserve the work, make it safe if appropriate, then retry ordinary `subagent_stop` or `subagent_recover`.
+Non-worktree cleanup closes the exact pane and owned tab, then removes child-session storage only after result archival or durable explicit-abort evidence. A changed-file worker must report its generated branch, task commit SHA, changed files, exact checks, skips, risks, and clean status. A no-change worker reports that state without creating a commit. The parent inspects and integrates the reported commit; the child and extension never merge, rebase, or cherry-pick it.
+
+Worktree-backed cleanup closes the pane, removes only a clean worktree with `force:false`, and always retains the generated branch. Dirty or uncheckable worktrees remain untouched; preserve the work, make it safe if appropriate, then retry ordinary `subagent_stop` or `subagent_recover`.
 
 A worktree-backed start/result identifies the checkout, branch, parent owner, artifact, and cleanup warning. Simultaneous stop calls share the options of the attempt that began; a later explicit discard may retry a retained incomplete generation. Never use raw Git-only worktree removal, force cleanup, or branch deletion. Retained generated branches alone do not require an actionable widget row.
 

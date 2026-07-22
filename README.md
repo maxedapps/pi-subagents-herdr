@@ -7,7 +7,7 @@ This Pi package lets a parent agent delegate bounded work to additional Pi sessi
 ## What it provides
 
 - Visible subagents in dedicated Herdr panes
-- Background execution by default, with optional bounded waits
+- Background execution by default, with optional blocking waits of up to five minutes
 - Bundled `scout`, `researcher`, and `worker` Markdown profiles
 - User-defined profiles and whole-file overrides
 - Automatic structured results and follow-ups in the same child session
@@ -67,7 +67,7 @@ These are bundled profile names, not fixed runtime roles. Custom profiles are se
 Start a scout for this investigation and wait for its result.
 ```
 
-A wait timeout does not stop the child; it continues in the background and may deliver later.
+With `wait: true`, omitting `timeoutMs` waits up to 300,000 ms, the maximum; pass a shorter `1..300000` value when appropriate. Result reconciliation uses an independent 30,000 ms quiet period. A wait timeout does not stop the child; it continues in the background and may deliver once later.
 
 ## Profiles
 
@@ -131,6 +131,7 @@ Profiles load once when the active parent extension activates. After adding, cha
 - `use-worktree` controls checkout isolation only, not permissions or role inference.
 - `use-worktree: false` runs in the shared parent checkout. Write-capable tools can modify it directly.
 - `use-worktree: true` creates an isolated Herdr worktree and generated branch.
+- Before creating a worktree, the extension verifies that Pi's current Git checkout matches the repository represented by `HERDR_WORKSPACE_ID`; a mismatch fails without creating worker resources.
 - At most one worktree-backed run may be active. Profile name and tool list do not affect this limit.
 
 ## Available tools
@@ -145,7 +146,7 @@ Pi normally selects these tools from your request.
 | `subagent_stop` | Stop a current-owner run, retry retained cleanup, or explicitly abort an incomplete generation |
 | `subagent_recover` | List global/legacy journal-backed residue or retry exact prior-owner cleanup |
 
-Starts and follow-ups run in the background unless `wait: true` is requested. Blocking waits accept a timeout of up to five minutes. Run IDs belong to the current parent session and extension instance; they cannot be reused after session replacement or reload.
+Starts and follow-ups run in the background unless `wait: true` is requested. Blocking waits default to the 300,000 ms maximum when `timeoutMs` is omitted; explicit shorter timeouts are supported. Run IDs belong to the current parent session and extension instance; they cannot be reused after session replacement or reload.
 
 ## Results, artifacts, and follow-ups
 
@@ -173,7 +174,7 @@ A complete raced result is still recovered first. Repeated ordinary stops never 
 
 Profiles with `use-worktree: true` receive an isolated Herdr worktree. Profiles with `use-worktree: false` use the shared parent checkout, where write-capable tools can edit directly.
 
-The extension does not merge, cherry-pick, or otherwise integrate changes. Review reported work and integrate it yourself when appropriate.
+A file-changing bundled worker validates its assignment, creates one task-only commit on the generated branch, leaves the worktree clean, and reports the branch, commit SHA, files, checks, skips, and risks. A no-change assignment reports that result without creating a commit. The extension does not commit, merge, cherry-pick, or otherwise integrate changes. The parent reviews and integrates the reported commit, validates it, and only then starts any dependent worker.
 
 During cleanup:
 

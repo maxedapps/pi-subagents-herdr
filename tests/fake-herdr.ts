@@ -9,6 +9,7 @@ import type {
   HerdrClient,
   JsonRecord,
   WorkspaceInfo,
+  WorktreeSourceInfo,
 } from "../src/herdr.ts";
 
 export interface Call {
@@ -152,6 +153,11 @@ export class FakeHerdr implements HerdrClient {
       isLinkedWorktree: true,
     },
   };
+  worktreeSource: WorktreeSourceInfo = {
+    repoKey: "repo-key",
+    repoRoot: process.cwd(),
+    sourceCheckoutPath: process.cwd(),
+  };
 
   async createTab(input: JsonRecord, signal?: AbortSignal): Promise<CreatedTab> {
     this.calls.push({ method: "tab.create", input, signal });
@@ -228,6 +234,11 @@ export class FakeHerdr implements HerdrClient {
   async closeTab(tabId: string, signal?: AbortSignal): Promise<void> {
     this.calls.push({ method: "tab.close", input: tabId, signal });
     if (this.failCloseTab) throw new Error("tab close failed");
+  }
+
+  async getWorktreeSource(input: JsonRecord, signal?: AbortSignal): Promise<WorktreeSourceInfo> {
+    this.calls.push({ method: "worktree.list", input, signal });
+    return { ...this.worktreeSource };
   }
 
   async createWorktree(input: JsonRecord, signal?: AbortSignal): Promise<CreatedWorktree> {

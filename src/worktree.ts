@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir } from "node:fs/promises";
+import { lstat, mkdir, realpath } from "node:fs/promises";
 import { promisify } from "node:util";
 import { dirname, join, normalize, resolve } from "node:path";
 import { HerdrError, type HerdrClient } from "./herdr.ts";
@@ -33,11 +33,21 @@ export async function createWorkerWorktree(
   });
   const checkoutRoot = stdout.trim();
   if (!checkoutRoot) throw new Error("Unable to resolve the parent Git checkout root");
-  const path = resolve(join(dirname(checkoutRoot), ".herdr-subagents-worktrees", runId));
+  const source = await client.getWorktreeSource({ workspace_id: parentWorkspaceId }, signal);
+  const [canonicalCheckoutRoot, canonicalWorkspaceCheckout] = await Promise.all([
+    realpath(checkoutRoot),
+    realpath(source.sourceCheckoutPath),
+  ]);
+  if (canonicalCheckoutRoot !== canonicalWorkspaceCheckout) {
+    throw new Error(
+      `Parent Pi checkout ${canonicalCheckoutRoot} does not match Herdr workspace ${parentWorkspaceId} checkout ${canonicalWorkspaceCheckout}. Start Pi in a Herdr workspace for the intended repository.`,
+    );
+  }
+  const path = resolve(join(dirname(canonicalCheckoutRoot), ".herdr-subagents-worktrees", runId));
   const branch = `herdr-subagents/${runId}`;
   await mkdir(dirname(path), { recursive: true });
   const created = await client.createWorktree({
-    workspace_id: parentWorkspaceId,
+    cwd: canonicalCheckoutRoot,
     branch,
     base: "HEAD",
     path,

@@ -26,14 +26,18 @@ Prefer the simplest coherent implementation that fully satisfies the task. Avoid
 
 Use tests, type checks, builds, or manual verification as appropriate for the change. Validation should be proportionate to the task and should cover the behavior that was actually changed. Investigate failures enough to report them accurately, and never claim an unrun check passed.
 
+When the assignment changes files, validate the work, create one task-only commit on the generated branch, and leave `git status` clean. Include only assigned changes in that commit. Do not merge, rebase, cherry-pick, or otherwise integrate into the parent checkout. When no file change is needed, report that result without manufacturing a commit.
+
 ## Handoff
 
 Adapt the response to the task, but normally include:
 
 - What changed and why.
 - Every changed file.
-- Checks and manual validation performed, with results.
+- The generated branch and task commit SHA, or an explicit no-change result.
+- Exact checks and manual validation performed, with results.
 - Skipped checks, blockers, assumptions, or remaining risks.
+- Confirmation that `git status` is clean after a file-changing assignment.
 - The terminal state of the task and worktree.
 
-Stop after the bounded implementation and appropriate validation are complete.
+Stop after the bounded implementation, validation, and task-only commit are complete.

@@ -66,8 +66,8 @@ import {
 const READY = new Set<AgentStatus>(["idle", "done", "blocked"]);
 const RESULT_ELIGIBLE = new Set<AgentStatus>(["idle", "done"]);
 const TERMINAL = new Set<HerdrLifecycleState>(["retained", "closed"]);
-const DEFAULT_WAIT_MS = 30_000;
 const MAX_WAIT_MS = 300_000;
+const DEFAULT_WAIT_MS = MAX_WAIT_MS;
 const DEFAULT_QUIET_PERIOD_MS = 30_000;
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
 

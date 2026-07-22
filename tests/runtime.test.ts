@@ -1024,16 +1024,22 @@ test("path session readiness accepts only the normalized deterministic Pi sessio
   }
 });
 
-test("blocking start returns the complete structured result without automatic delivery", async () => {
+test("default blocking wait survives a full quiet window and returns without automatic delivery", async () => {
+  const timer = controlledDelay();
   await fixture(async (client, runtime, deliveries) => {
     client.statuses = ["idle", "idle"];
     client.onSendInput = async () => { await appendResult(client, ["all ", "text"]); };
-    const result = await runtime.start("researcher", "research", "/repo", { wait: true, timeoutMs: 100 });
+    const pending = runtime.start("researcher", "research", "/repo", { wait: true });
+    await eventually(() => timer.waits.some(({ ms, settled }) => ms === 40_000 && !settled));
+    timer.release(40_000);
+    const result = await pending;
     assert.equal(result.latestResult?.text, "all text");
     assert.equal(result.resultContent?.includes("all text"), true);
     assert.equal(result.resultContent?.includes("run_id=\"run-reader\""), true);
     assert.equal(result.generation?.delivery, "delivered");
     assert.equal(deliveries.length, 0);
+  }, ["run-reader"], {
+    runtimeOptions: { quietPeriodMs: 40_000, monitorDelay: timer.sleep },
   });
 });
 
@@ -1294,7 +1300,7 @@ test("pre-run worker agent-start failure removes the clean worktree but reports 
     assert.match(failure, /retained branch=herdr-subagents\/run-worker-pre-run/);
     assert.equal(failure.includes("worktree="), false);
     assert.deepEqual(client.calls.map(({ method }) => method), [
-      "worktree.create", "agent.start", "worktree.remove",
+      "worktree.list", "worktree.create", "agent.start", "worktree.remove",
     ]);
     assert.deepEqual(client.calls.at(-1)?.input, { workspaceId: "w-worker", force: false });
     assert.deepEqual(runtime.list(), []);
