@@ -80,10 +80,26 @@ test("headers and cleanup sections contain only concise supplied facts", () => {
     "- Workspace: workspace-2",
     "",
   ].join("\n"));
-  assert.throws(
-    () => renderArtifactHeader({ runId: "run-03", profile: "researcher", worker: { path: "/not-relevant" } }),
-    /require the worker profile/,
-  );
+  assert.equal(renderArtifactHeader({
+    runId: "run-03",
+    profile: "custom-worker",
+    worker: { path: "/repo/custom", branch: "custom-branch", workspaceId: "custom-workspace" },
+  }), [
+    "# Herdr subagent run-03",
+    "- Profile: custom-worker",
+    "- Worktree: /repo/custom",
+    "- Branch: custom-branch",
+    "- Workspace: custom-workspace",
+    "",
+  ].join("\n"));
+  assert.equal(renderArtifactHeader({ runId: "run-04", profile: "custom-reader" }), [
+    "# Herdr subagent run-04",
+    "- Profile: custom-reader",
+    "",
+  ].join("\n"));
+  for (const profile of ["", "a/b", "a b", "a\n- Worktree: /escape", "A", "a".repeat(65)]) {
+    assert.throws(() => renderArtifactHeader({ runId: "run-invalid", profile }), /Invalid artifact profile/);
+  }
   assert.equal(renderCleanupSection({
     state: "action required",
     reason: "worktree is dirty",

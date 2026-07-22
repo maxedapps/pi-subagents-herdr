@@ -8,9 +8,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { resolveArtifactLocation } from "../src/artifact.ts";
 import { HerdrError } from "../src/herdr.ts";
+import type { ProfileCatalog } from "../src/profiles.ts";
 import { SubagentRuntime, type ResultDelivery, type RuntimeOptions } from "../src/runtime.ts";
 import { HERDR_STATE_CUSTOM_TYPE, type HerdrStateRecord } from "../src/session.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
+import { TEST_PROFILES } from "./profile-fixtures.ts";
 
 function assistant(text: string): AssistantMessage {
   return {
@@ -98,10 +100,11 @@ function runtimeFor(
     appendState?: NonNullable<RuntimeOptions["appendState"]>;
     gitStatus?: NonNullable<RuntimeOptions["gitStatus"]>;
     ids?: string[];
+    profileCatalog?: ProfileCatalog;
   } = {},
 ): SubagentRuntime {
   const ids = [...(options.ids ?? ["run-lifecycle"])];
-  return new SubagentRuntime(client, { workspaceId: "w-parent", agentDir: parent.agentDir }, {
+  return new SubagentRuntime(client, { workspaceId: "w-parent", agentDir: parent.agentDir }, options.profileCatalog ?? TEST_PROFILES, {
     idFactory: () => ids.shift() ?? "run-lifecycle-extra",
     instanceIdFactory: () => options.instanceId ?? "instance-current",
     parentProcessId: options.processId ?? 200,
@@ -210,7 +213,7 @@ test("durable ownership journals compact active-branch transitions and rejects e
     assert.equal(returnedSettlement?.run.lifecycle, "closed");
 
     const ephemeralClient = new FakeHerdr();
-    const ephemeral = new SubagentRuntime(ephemeralClient, { workspaceId: "w-parent" }, {
+    const ephemeral = new SubagentRuntime(ephemeralClient, { workspaceId: "w-parent" }, TEST_PROFILES, {
       instanceIdFactory: () => "instance-ephemeral",
       appendState: () => {},
     });
@@ -350,6 +353,73 @@ test("cleanup-only reconciliation requires dead ownership, durable stop proof, a
       ...overrides,
     });
   }
+
+  await context.test("custom worktree cleanup follows persisted topology after profile removal or override", async () => {
+    for (const currentDefinition of ["removed", "shared-checkout"] as const) {
+      const parent = await createParent();
+      try {
+        const path = join(parent.root, ".herdr-subagents-worktrees", "run-prior");
+        await mkdir(path, { recursive: true });
+        parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, stoppedWorker(parent, path, {
+          profile: "custom-isolated",
+        }));
+        const client = new FakeHerdr();
+        client.workspace = { workspaceId: "w-worker", worktree: { checkoutPath: path, isLinkedWorktree: true } };
+        const profileCatalog = currentDefinition === "removed"
+          ? TEST_PROFILES
+          : Object.freeze({
+            ...TEST_PROFILES,
+            "custom-isolated": Object.freeze({
+              name: "custom-isolated",
+              description: "Now uses the shared checkout",
+              useWorktree: false,
+              systemPrompt: "Changed profile",
+              filePath: "/profiles/custom-isolated.md",
+            }),
+          });
+        const runtime = runtimeFor(parent, client, {
+          isProcessAlive: () => false,
+          profileCatalog,
+        });
+        const diagnostics = await bind(runtime, parent);
+        assert.equal(diagnostics[0]?.outcome, "cleaned", currentDefinition);
+        assert.deepEqual(client.calls.map(({ method }) => method), ["workspace.get", "worktree.remove"], currentDefinition);
+        assert.equal(client.calls.some(({ method }) => method === "pane.close" || method === "tab.close"), false);
+      } finally {
+        await rm(parent.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  await context.test("shared-checkout history is not reclassified by a worktree override", async () => {
+    const parent = await createParent();
+    try {
+      const record = priorRecord(parent, { profile: "custom-shared" });
+      parent.manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, record);
+      await mkdir(record.childSessionDir, { recursive: true });
+      const client = new FakeHerdr();
+      exactPriorAgent(client);
+      const runtime = runtimeFor(parent, client, {
+        isProcessAlive: () => false,
+        profileCatalog: Object.freeze({
+          ...TEST_PROFILES,
+          "custom-shared": Object.freeze({
+            name: "custom-shared",
+            description: "Now requests a worktree",
+            useWorktree: true,
+            systemPrompt: "Changed profile",
+            filePath: "/profiles/custom-shared.md",
+          }),
+        }),
+      });
+      const diagnostics = await bind(runtime, parent);
+      assert.equal(diagnostics[0]?.outcome, "cleaned");
+      assert.deepEqual(client.calls.map(({ method }) => method), ["agent.get", "pane.close", "tab.close"]);
+      assert.equal(client.calls.some(({ method }) => method === "worktree.remove"), false);
+    } finally {
+      await rm(parent.root, { recursive: true, force: true });
+    }
+  });
 
   await context.test("present clean exact residue", async () => {
     const parent = await createParent();

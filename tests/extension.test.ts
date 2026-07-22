@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Value } from "typebox/value";
@@ -19,13 +20,16 @@ import extension, {
 import type { BulkStopSummary } from "../src/runtime.ts";
 import { resolveArtifactDirectory } from "../src/artifact.ts";
 import { SocketHerdrClient } from "../src/herdr.ts";
-import { buildPiLaunch, PROFILES } from "../src/profiles.ts";
+import { buildPiLaunch } from "../src/profiles.ts";
 import { SubagentRuntime, type Run } from "../src/runtime.ts";
 import { HERDR_STATE_CUSTOM_TYPE, type HerdrStateRecord } from "../src/session.ts";
-import { idSchema, recoverSchema, sendSchema, startSchema, statusSchema, stopSchema } from "../src/tools.ts";
+import { createStartSchema, idSchema, recoverSchema, sendSchema, statusSchema, stopSchema } from "../src/tools.ts";
+import { TEST_PROFILES } from "./profile-fixtures.ts";
+
+const startSchema = createStartSchema(TEST_PROFILES);
 
 interface Registered {
-  tools: Array<{ name: string; parameters?: unknown }>;
+  tools: Array<{ name: string; description?: string; parameters?: unknown }>;
   events: Array<{ name: string; handler: (...args: any[]) => unknown }>;
   commands: string[];
   messages: unknown[];
@@ -214,32 +218,36 @@ function deliveryMessage(run: Run) {
 function mockPi(): { pi: ExtensionAPI; registered: Registered } {
   const registered: Registered = { tools: [], events: [], commands: [], messages: [] };
   const pi = {
-    registerTool(tool: { name: string; parameters?: unknown }) { registered.tools.push(tool); },
+    registerTool(tool: { name: string; description?: string; parameters?: unknown }) { registered.tools.push(tool); },
     on(name: string, handler: (...args: any[]) => unknown) { registered.events.push({ name, handler }); },
     registerCommand(name: string) { registered.commands.push(name); },
     sendMessage(message: unknown, options: unknown) { registered.messages.push({ message, options }); },
     appendEntry() {},
+    getThinkingLevel() { return "medium" as const; },
   };
   return { pi: pi as unknown as ExtensionAPI, registered };
 }
 
 function withExtensionEnvironment(
-  environment: { child?: string; socket?: string; workspace?: string },
+  environment: { child?: string; socket?: string; workspace?: string; agentDir?: string },
   run: () => void,
 ): void {
   const before = {
     child: process.env.PI_HERDR_SUBAGENT,
     socket: process.env.HERDR_SOCKET_PATH,
     workspace: process.env.HERDR_WORKSPACE_ID,
+    agentDir: process.env.PI_CODING_AGENT_DIR,
   };
   if (environment.child === undefined) delete process.env.PI_HERDR_SUBAGENT; else process.env.PI_HERDR_SUBAGENT = environment.child;
   if (environment.socket === undefined) delete process.env.HERDR_SOCKET_PATH; else process.env.HERDR_SOCKET_PATH = environment.socket;
   if (environment.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = environment.workspace;
+  process.env.PI_CODING_AGENT_DIR = environment.agentDir ?? "/path-that-does-not-exist/pi-subagents-herdr-extension-tests";
   try { run(); }
   finally {
     if (before.child === undefined) delete process.env.PI_HERDR_SUBAGENT; else process.env.PI_HERDR_SUBAGENT = before.child;
     if (before.socket === undefined) delete process.env.HERDR_SOCKET_PATH; else process.env.HERDR_SOCKET_PATH = before.socket;
     if (before.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = before.workspace;
+    if (before.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = before.agentDir;
   }
 }
 
@@ -503,6 +511,59 @@ test("parent registers exactly five tools, one skill hook, and result confirmati
   assert.match(resources.skillPaths[0] ?? "", /skills\/use-herdr-subagents\/SKILL\.md$/);
   assert.equal(existsSync(resources.skillPaths[0] ?? ""), true);
 }));
+
+test("active extension loads user profiles once into its schema and guidance", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "extension-profiles-"));
+  const profileDir = join(agentDir, "herdr-subagents", "agents");
+  await mkdir(profileDir, { recursive: true });
+  await writeFile(join(profileDir, "custom.md"), [
+    "---",
+    "name: custom-profile",
+    "description: Custom extension profile",
+    "use-worktree: false",
+    "---",
+    "Custom prompt",
+  ].join("\n"));
+  try {
+    let registered!: Registered;
+    withExtensionEnvironment({ socket: "/tmp/test-herdr.sock", workspace: "w-test", agentDir }, () => {
+      const mocked = mockPi();
+      registered = mocked.registered;
+      extension(mocked.pi);
+    });
+    const start = registered.tools.find(({ name }) => name === "subagent_start")!;
+    assert.equal(Value.Check(start.parameters as any, { profile: "custom-profile", task: "x" }), true);
+    assert.equal(Value.Check(start.parameters as any, { profile: "unknown", task: "x" }), false);
+    assert.match(start.description ?? "", /custom-profile \(Custom extension profile\)/);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("subagent_start snapshots the current parent model and thinking level", async () => {
+  const fixture = extensionWithRuntimeCapture();
+  const ctx = {
+    ...mockContext("start-parent", false),
+    model: { provider: "parent-provider", id: "parent-model" },
+  };
+  try {
+    await event(fixture.registered, "session_start")({ reason: "startup" }, ctx);
+    const runtime = fixture.runtime();
+    let captured: unknown[] | undefined;
+    (runtime as any).start = async (...args: unknown[]) => {
+      captured = args;
+      return mockRun({ id: "run-start" });
+    };
+    const tool = fixture.registered.tools.find(({ name }) => name === "subagent_start") as any;
+    await tool.execute("tool-call", { profile: "scout", task: "inspect" }, undefined, undefined, ctx);
+    assert.deepEqual((captured?.[3] as any).parentLaunch, {
+      model: "parent-provider/parent-model",
+      thinking: "medium",
+    });
+  } finally {
+    fixture.restore();
+  }
+});
 
 test("subagent_stop forwards explicit discard without sending an automatic action", async () => {
   const fixture = extensionWithRuntimeCapture();
@@ -910,20 +971,36 @@ test("child guard registers nothing even without the parent Herdr environment", 
   assert.deepEqual(registered, { tools: [], events: [], commands: [], messages: [] });
 }));
 
-test("fixed profiles expose only approved controls", () => {
-  assert.deepEqual(Object.keys(PROFILES), ["scout", "researcher", "worker"]);
-  assert.deepEqual(PROFILES.scout.tools, ["read", "grep", "find", "ls"]);
-  assert.deepEqual(PROFILES.researcher.tools, ["read", "grep", "find", "ls", "web_search", "fetch_content", "get_search_content"]);
-  assert.deepEqual(PROFILES.worker.tools, ["read", "grep", "find", "ls", "bash", "edit", "write"]);
-  assert.deepEqual([PROFILES.scout.thinking, PROFILES.researcher.thinking, PROFILES.worker.thinking], ["low", "medium", "high"]);
+test("bundled profiles expose the approved controls through the loaded catalog", () => {
+  assert.deepEqual(Object.keys(TEST_PROFILES), ["researcher", "scout", "worker"]);
+  assert.deepEqual(TEST_PROFILES.scout?.tools, ["read", "grep", "find", "ls"]);
+  assert.deepEqual(TEST_PROFILES.researcher?.tools, ["read", "grep", "find", "ls", "web_search", "fetch_content", "get_search_content"]);
+  assert.deepEqual(TEST_PROFILES.worker?.tools, ["read", "grep", "find", "ls", "bash", "edit", "write"]);
+  assert.deepEqual([TEST_PROFILES.scout?.thinking, TEST_PROFILES.researcher?.thinking, TEST_PROFILES.worker?.thinking], ["medium", "high", "high"]);
 });
 
-test("every profile receives the exact extension-owned read-only artifact instruction", () => {
-  for (const profile of Object.keys(PROFILES) as Array<keyof typeof PROFILES>) {
-    const artifactPath = `/agent/herdr-subagent-artifacts/parent/run-${profile}.md`;
-    const launch = buildPiLaunch(profile, `run-${profile}`, "/sessions", `child-${profile}`, artifactPath);
+test("dynamic start schemas accept every loaded profile and reject unknown names", () => {
+  const custom = Object.freeze({
+    ...TEST_PROFILES,
+    "custom-profile": Object.freeze({
+      name: "custom-profile",
+      description: "Custom profile",
+      useWorktree: false,
+      systemPrompt: "Custom prompt",
+      filePath: "/custom.md",
+    }),
+  });
+  const schema = createStartSchema(custom);
+  assert.equal(Value.Check(schema, { profile: "custom-profile", task: "x" }), true);
+  assert.equal(Value.Check(schema, { profile: "missing", task: "x" }), false);
+});
+
+test("every bundled profile receives the exact extension-owned read-only artifact instruction", () => {
+  for (const profile of Object.values(TEST_PROFILES)) {
+    const artifactPath = `/agent/herdr-subagent-artifacts/parent/run-${profile.name}.md`;
+    const launch = buildPiLaunch(profile, { thinking: "low" }, `run-${profile.name}`, "/sessions", `child-${profile.name}`, artifactPath);
     const prompt = launch.argv[launch.argv.indexOf("--append-system-prompt") + 1]!;
-    assert.equal(prompt.startsWith(PROFILES[profile].systemPrompt), true);
+    assert.equal(prompt.startsWith(profile.systemPrompt), true);
     assert.match(prompt, new RegExp(`Archive: ${artifactPath}`));
     assert.match(prompt, /extension writes this file automatically/i);
     assert.match(prompt, /Never edit it/);

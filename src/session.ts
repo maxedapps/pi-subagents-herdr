@@ -2,7 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { getAgentDir, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { isAgentStatus, type AgentStatus } from "./herdr.ts";
-import type { ProfileName } from "./profiles.ts";
+import { isProfileName, type ProfileName } from "./profiles.ts";
 import type { WorkerCleanup, WorktreeFacts } from "./worktree.ts";
 
 export const HERDR_STATE_CUSTOM_TYPE = "herdr-subagent-state";
@@ -114,7 +114,7 @@ export function isHerdrStateRecord(value: unknown): value is HerdrStateRecord {
     && typeof record.paneId === "string"
     && typeof record.tabId === "string"
     && typeof record.workspaceId === "string"
-    && (record.profile === "scout" || record.profile === "researcher" || record.profile === "worker")
+    && isProfileName(record.profile)
     && (record.status === undefined || isAgentStatus(record.status));
 }
 

@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { appendArtifactSection } from "../src/artifact.ts";
 import { HerdrError, HerdrSubscriptionTransportError } from "../src/herdr.ts";
-import { PROFILES } from "../src/profiles.ts";
+import type { Profile, ProfileCatalog } from "../src/profiles.ts";
 import { enumerateRecoveryLocators, readRecoveryLocator } from "../src/registry.ts";
 import {
   persistAbortedGeneration,
@@ -19,8 +19,25 @@ import {
 } from "../src/runtime.ts";
 import type { ChildSessionObservation, HerdrStateRecord } from "../src/session.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
+import { TEST_PROFILES } from "./profile-fixtures.ts";
 
 const parentSessionId = "parent-session";
+
+function profiles(...additional: Profile[]): ProfileCatalog {
+  const catalog = Object.assign(Object.create(null), TEST_PROFILES) as Record<string, Profile>;
+  for (const profile of additional) catalog[profile.name] = Object.freeze(profile);
+  return Object.freeze(catalog);
+}
+
+function customProfile(name: string, useWorktree: boolean): Profile {
+  return {
+    name,
+    description: `${name} test profile`,
+    useWorktree,
+    systemPrompt: `${name} prompt`,
+    filePath: `/profiles/${name}.md`,
+  };
+}
 
 function assistant(texts: string[]): AssistantMessage {
   return {
@@ -149,6 +166,7 @@ async function fixture(
     gitStatus?: NonNullable<RuntimeOptions["gitStatus"]>;
     onRunsChanged?: (runtime: SubagentRuntime) => void;
     runtimeOptions?: Pick<RuntimeOptions, "quietPeriodMs" | "monitorDelay" | "observeChildSession">;
+    profileCatalog?: ProfileCatalog;
   } = {},
 ): Promise<void> {
   const agentDir = await mkdtemp(join(tmpdir(), "runtime-agent-"));
@@ -156,7 +174,7 @@ async function fixture(
   const deliveries: ResultDelivery[] = [];
   const actions: ActionDelivery[] = [];
   let runtime!: SubagentRuntime;
-  runtime = new SubagentRuntime(client, { workspaceId: "w-parent", agentDir }, {
+  runtime = new SubagentRuntime(client, { workspaceId: "w-parent", agentDir }, options.profileCatalog ?? TEST_PROFILES, {
     idFactory: () => ids.shift() ?? "run-extra",
     instanceIdFactory: () => "instance-current",
     readinessTimeoutMs: 30,
@@ -197,8 +215,8 @@ test("background start launches a deterministic persistent child and steers one 
     const input = client.calls.find(({ method }) => method === "agent.start")?.input as Record<string, unknown>;
     assert.deepEqual(input.argv, [
       "pi", "--session-dir", `${input.argv instanceof Array ? input.argv[2] : ""}`, "--session-id", "herdr-run-reader",
-      "--name", "scout-n-reader", "--thinking", "low", "--tools", "read,grep,find,ls",
-      "--append-system-prompt", `${PROFILES.scout.systemPrompt}\n\nArchive: ${started.artifactPath}. The extension writes this file automatically. Never edit it. After compaction or uncertainty, read it before relying on earlier parent instructions or your prior results.`,
+      "--name", "scout-n-reader", "--thinking", "medium", "--tools", "read,grep,find,ls",
+      "--append-system-prompt", `${TEST_PROFILES.scout!.systemPrompt}\n\nArchive: ${started.artifactPath}. The extension writes this file automatically. Never edit it. After compaction or uncertainty, read it before relying on earlier parent instructions or your prior results.`,
     ]);
     assert.equal(input.cwd, "/repo");
     await eventually(() => deliveries.length === 1);
@@ -221,6 +239,38 @@ test("background start launches a deterministic persistent child and steers one 
     assert.equal(runtime.confirmDelivery({ role: "custom", customType: delivered.customType, details: delivered.details }), true);
     assert.equal(runtime.status("run-reader").generation?.delivery, "delivered");
   });
+});
+
+test("unknown profiles fail before allocating Herdr or run resources", async () => {
+  await fixture(async (client, runtime) => {
+    await assert.rejects(runtime.start("missing-profile", "task", "/repo"), /Unknown subagent profile/);
+    assert.deepEqual(client.calls, []);
+    assert.deepEqual(runtime.list(), []);
+  });
+});
+
+test("custom shared-checkout profiles inherit parent launch defaults and omit the tools allowlist", async () => {
+  const custom = customProfile("custom-editor", false);
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["complete"]); };
+    const started = await runtime.start("custom-editor", "edit shared checkout", "/repo", {
+      wait: true,
+      timeoutMs: 100,
+      parentLaunch: { model: "parent/model", thinking: "xhigh" },
+    });
+    const input = client.calls.find(({ method }) => method === "agent.start")?.input as Record<string, unknown>;
+    const argv = input.argv as string[];
+    assert.deepEqual(argv.slice(argv.indexOf("--model"), argv.indexOf("--append-system-prompt")), [
+      "--model", "parent/model", "--thinking", "xhigh",
+    ]);
+    assert.equal(argv.includes("--tools"), false);
+    assert.equal(input.cwd, "/repo");
+    assert.equal(started.worktree, undefined);
+    assert.equal(client.calls.filter(({ method }) => method === "tab.create").length, 1);
+    assert.equal(client.calls.some(({ method }) => method === "worktree.create"), false);
+    await runtime.stop(started.id);
+  }, ["run-custom"], { profileCatalog: profiles(custom) });
 });
 
 test("artifact writes precede execution and readiness, survive child cleanup, and stay concise", async () => {
@@ -1507,7 +1557,7 @@ test("locator create failure surfaces diagnostics and uses startup cleanup", asy
   const agentDir = await mkdtemp(join(tmpdir(), "runtime-locator-fail-"));
   const client = new FakeHerdr();
   client.statuses = ["idle"];
-  const runtime = new SubagentRuntime(client, { workspaceId: "w-parent", agentDir }, {
+  const runtime = new SubagentRuntime(client, { workspaceId: "w-parent", agentDir }, TEST_PROFILES, {
     idFactory: () => "run-locator-fail",
     instanceIdFactory: () => "instance-current",
     readinessTimeoutMs: 30,
@@ -1538,13 +1588,13 @@ test("locator create failure surfaces diagnostics and uses startup cleanup", asy
   }
 });
 
-test("every blocking worker result repeats checkout, branch, owner, and safe cleanup warnings", async () => {
+test("every blocking worktree-backed result repeats checkout, branch, owner, and safe cleanup warnings", async () => {
   await fixture(async (client, runtime) => {
     client.statuses = ["idle", "idle"];
     client.onSendInput = async () => { await appendResult(client, ["worker result"]); };
     const result = await runtime.start("worker", "change one file", process.cwd(), { wait: true, timeoutMs: 100 });
     assert.equal(result.resultContent?.includes("worker result"), true);
-    assert.equal(result.resultContent?.includes(`Worker checkout: ${result.worktree?.path}`), true);
+    assert.equal(result.resultContent?.includes(`Isolated checkout: ${result.worktree?.path}`), true);
     assert.equal(result.resultContent?.includes(`Generated branch: ${result.worktree?.branch}`), true);
     assert.equal(result.resultContent?.includes(`Parent owner: ${parentSessionId}`), true);
     assert.equal(result.resultContent?.includes("branch is always retained"), true);

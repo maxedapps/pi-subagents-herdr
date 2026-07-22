@@ -36,6 +36,7 @@
     ]
   },
   "files": [
+    "agents/",
     "extensions/",
     "src/",
     "skills/",

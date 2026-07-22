@@ -20,7 +20,12 @@ import {
   type AgentStatusSubscription,
   type HerdrClient,
 } from "./herdr.ts";
-import { buildPiLaunch, type ProfileName } from "./profiles.ts";
+import {
+  buildPiLaunch,
+  type ParentLaunchSnapshot,
+  type ProfileCatalog,
+  type ProfileName,
+} from "./profiles.ts";
 import {
   captureChildCursor,
   createChildSessionLocation,
@@ -220,6 +225,7 @@ export interface GenerationRequest extends Partial<ParentRequest> {
   wait?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
+  parentLaunch?: ParentLaunchSnapshot;
 }
 
 export interface StopRequest extends Partial<ParentRequest> {
@@ -333,10 +339,10 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-function workerWarning(run: Pick<Run, "worktree" | "parentSessionId">): string | undefined {
+function worktreeWarning(run: Pick<Run, "worktree" | "parentSessionId">): string | undefined {
   if (!run.worktree) return undefined;
   return [
-    `Worker checkout: ${run.worktree.path}`,
+    `Isolated checkout: ${run.worktree.path}`,
     `Generated branch: ${run.worktree.branch}`,
     `Parent owner: ${run.parentSessionId}`,
     "Safe cleanup warning: the branch is always retained; a dirty or uncheckable worktree is also retained for manual handling.",
@@ -345,7 +351,7 @@ function workerWarning(run: Pick<Run, "worktree" | "parentSessionId">): string |
 
 export function formatSubagentResult(run: Run, result: ChildResult): string {
   const generation = run.generation?.number ?? 0;
-  const warning = workerWarning(run);
+  const warning = worktreeWarning(run);
   return [
     `<subagent_result run_id="${run.id}" profile="${run.profile}" generation="${generation}" child_entry_id="${result.childEntryId}" lifecycle="${run.lifecycle}">`,
     result.text,
@@ -457,13 +463,14 @@ export class SubagentRuntime {
   readonly #now: () => number;
   readonly #registryOperations?: RecoveryLocatorOperations;
   #parent?: BoundParent;
-  #workerStarting = false;
+  #worktreeStarting = false;
   #deliverySinceSettlement = false;
   #diagnostics: LifecycleDiagnostic[] = [];
 
   constructor(
     readonly client: HerdrClient,
     readonly environment: RuntimeEnvironment,
+    readonly profiles: ProfileCatalog,
     options: RuntimeOptions = {},
   ) {
     if (!environment.workspaceId) throw new Error("HERDR_WORKSPACE_ID is required");
@@ -767,14 +774,16 @@ export class SubagentRuntime {
     cwd: string,
     request: GenerationRequest = {},
   ): Promise<Run> {
+    const resolvedProfile = Object.hasOwn(this.profiles, profile) ? this.profiles[profile] : undefined;
+    if (!resolvedProfile) throw new Error(`Unknown subagent profile: ${profile}`);
     if (!task.trim()) throw new Error("task must not be empty");
     const timeoutMs = validateWait(request);
     const parent = this.#context(request, true);
-    const worker = profile === "worker";
-    if (worker && (this.#workerStarting || [...this.runs.values()].some((run) => run.profile === "worker" && run.lifecycle !== "closed" && run.lifecycle !== "retained"))) {
-      throw new Error("Only one worker may be active at a time");
+    const worktreeBacked = resolvedProfile.useWorktree;
+    if (worktreeBacked && (this.#worktreeStarting || [...this.runs.values()].some((run) => run.worktree && run.lifecycle !== "closed" && run.lifecycle !== "retained"))) {
+      throw new Error("Only one worktree-backed subagent may be active at a time");
     }
-    if (worker) this.#workerStarting = true;
+    if (worktreeBacked) this.#worktreeStarting = true;
 
     const id = this.#idFactory();
     const artifactIdentity: ArtifactIdentity = {
@@ -793,7 +802,7 @@ export class SubagentRuntime {
 
     try {
       let workspaceId: string;
-      if (worker) {
+      if (worktreeBacked) {
         const topology = await createWorkerWorktree(
           this.client,
           this.environment.workspaceId,
@@ -821,7 +830,14 @@ export class SubagentRuntime {
       const childCwd = worktree?.path ?? cwd;
       const location = createChildSessionLocation(parent.parentSessionId, id, childCwd, this.environment.agentDir);
       childSessionDir = location.childSessionDir;
-      const launch = buildPiLaunch(profile, id, location.childSessionDir, location.childSessionId, artifactPath);
+      const launch = buildPiLaunch(
+        resolvedProfile,
+        request.parentLaunch ?? {},
+        id,
+        location.childSessionDir,
+        location.childSessionId,
+        artifactPath,
+      );
       agent = await this.client.startAgent({
         name: launch.name,
         argv: launch.argv,
@@ -852,7 +868,7 @@ export class SubagentRuntime {
         updatedAt: now,
         ...(worktree ? { worktree } : {}),
       };
-      run.warning = workerWarning(run);
+      run.warning = worktreeWarning(run);
       this.runs.set(id, run);
       this.#record(run, "starting");
       try {
@@ -924,7 +940,7 @@ export class SubagentRuntime {
       }
       throw new Error(`${errorMessage(error)}${retained.length ? `; retained ${retained.join(", ")}` : ""}`, { cause: error });
     } finally {
-      if (worker) this.#workerStarting = false;
+      if (worktreeBacked) this.#worktreeStarting = false;
     }
 
     if (request.wait) await this.#waitForGeneration(run!, timeoutMs, request.signal);

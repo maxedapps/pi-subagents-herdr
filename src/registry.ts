@@ -1,7 +1,7 @@
 import { chmod, lstat, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ProfileName } from "./profiles.ts";
+import { isProfileName, type ProfileName } from "./profiles.ts";
 
 export const RECOVERY_DIRECTORY = "herdr-subagent-recovery";
 export const RECOVERY_LOCATOR_SCHEMA_VERSION = 1 as const;
@@ -82,10 +82,6 @@ function assertContained(root: string, candidate: string): void {
   }
 }
 
-function isProfile(value: unknown): value is ProfileName {
-  return value === "scout" || value === "researcher" || value === "worker";
-}
-
 export function isRecoveryLocatorRecord(value: unknown): value is RecoveryLocatorRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -99,7 +95,7 @@ export function isRecoveryLocatorRecord(value: unknown): value is RecoveryLocato
     && typeof record.parentProcessId === "number"
     && Number.isSafeInteger(record.parentProcessId)
     && record.parentProcessId > 0
-    && isProfile(record.profile)
+    && isProfileName(record.profile)
     && typeof record.artifactPath === "string"
     && record.artifactPath.length > 0
     && typeof record.createdAt === "number"

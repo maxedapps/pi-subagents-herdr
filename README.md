@@ -2,19 +2,18 @@
 
 Visible, persistent Pi subagents for [Herdr](https://herdr.dev).
 
-This Pi package lets the parent agent delegate focused work to additional Pi sessions. Each subagent appears in its own Herdr pane, uses a fixed safety profile, and returns a structured result to the parent automatically. Read-only agents can investigate in parallel, while a worker makes changes only in an isolated Herdr worktree.
+This Pi package lets a parent agent delegate bounded work to additional Pi sessions. Each child appears in its own Herdr pane, uses a Markdown profile loaded when the extension activates, and returns a structured result automatically. Profiles choose launch controls and checkout isolation; a non-worktree profile with write-capable tools can modify the shared parent checkout.
 
 ## What it provides
 
-- Visible subagents running in dedicated Herdr panes
-- Background execution by default
-- Read-only `scout` and `researcher` profiles
-- One isolated implementation `worker`
-- Automatic structured result delivery
-- Follow-up messages in the same child session
-- A compact current-session status widget
-- Durable Markdown artifacts for recovery after compaction
-- Conservative cleanup that never discards uncommitted worker changes
+- Visible subagents in dedicated Herdr panes
+- Background execution by default, with optional bounded waits
+- Bundled `scout`, `researcher`, and `worker` Markdown profiles
+- User-defined profiles and whole-file overrides
+- Automatic structured results and follow-ups in the same child session
+- At most one active worktree-backed run; concurrent non-worktree runs
+- Durable artifacts and journal-backed cross-session recovery
+- Conservative cleanup that never discards uncommitted worktree changes
 
 ## Requirements
 
@@ -23,27 +22,23 @@ This Pi package lets the parent agent delegate focused work to additional Pi ses
 - [Herdr](https://herdr.dev)
 - A persisted parent Pi session
 
-Pi must be launched through Herdr so that `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID` are available. Do not start the parent with `--no-session`; durable ownership requires a persisted session.
+Pi must be launched through Herdr so `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID` are available. Do not start the parent with `--no-session`; durable ownership requires a persisted session.
 
 Outside Herdr, the package deactivates safely. Pi still starts, no subagent tools or skill are registered, and UI-capable modes show a short informational notice.
 
 ## Installation
 
-Install the package globally for your Pi user:
-
 ```bash
 pi install npm:@maxedapps/pi-subagents-herdr
 ```
 
-To try it for one Pi run without installing it permanently:
+For one Pi run without a permanent installation:
 
 ```bash
 pi -e npm:@maxedapps/pi-subagents-herdr
 ```
 
-Run that Pi process through Herdr to enable the package.
-
-Update or remove it with:
+Run Pi through Herdr to enable the package. Update or remove it with:
 
 ```bash
 pi update --extension npm:@maxedapps/pi-subagents-herdr
@@ -52,15 +47,11 @@ pi remove npm:@maxedapps/pi-subagents-herdr
 
 ## Quick start
 
-Start Pi through Herdr and ask it to delegate a bounded task:
+Ask Pi to delegate a bounded task:
 
 ```text
 Use a scout subagent to inspect how authentication is implemented and report the important files and risks.
 ```
-
-Pi starts the child in a visible Herdr pane and continues monitoring it in the background. The `Subagents` widget shows the run while it is active. When the child finishes, its structured result is delivered automatically to the parent conversation.
-
-Other examples:
 
 ```text
 Use a researcher subagent to compare the current official documentation for these two APIs.
@@ -70,151 +61,170 @@ Use a researcher subagent to compare the current official documentation for thes
 Use a worker subagent to implement the validated input-handling fix and run the relevant tests.
 ```
 
-You can also ask Pi to wait for the result when the current turn must block:
+These are bundled profile names, not fixed runtime roles. Custom profiles are selected the same way. To block the current turn for a result, request a wait:
 
 ```text
 Start a scout for this investigation and wait for its result.
 ```
 
-A wait timeout does not stop the child. The run continues in the background and can still deliver its result later.
+A wait timeout does not stop the child; it continues in the background and may deliver later.
 
 ## Profiles
 
-| Profile | Best for | Available capabilities | Writes |
-|---|---|---|---|
-| `scout` | Repository inspection and codebase questions | Read, grep, find, list | No |
-| `researcher` | Repository inspection plus web research | Read-only repository and web tools | No |
-| `worker` | One bounded implementation task | Read, shell, edit, write | Isolated worktree only |
+### Bundled profiles
 
-Multiple reader profiles may run concurrently. At most one worker may be active at a time.
+| Name | Bundled configuration |
+|---|---|
+| `scout` | Repository inspection; `read`, `grep`, `find`, `ls`; `thinking: medium`; shared checkout |
+| `researcher` | Repository and web research; explicit repository/web allowlist; `thinking: high`; shared checkout |
+| `worker` | Bounded implementation; explicit file/shell allowlist; `thinking: high`; isolated worktree |
 
-Profiles are intentionally fixed. Their models, thinking levels, tools, child working directories, and cleanup policy are not configurable.
+### Markdown format
+
+Profiles are flat Markdown files with YAML frontmatter and a non-empty body:
+
+```md
+---
+name: my-profile
+description: Short model-facing description
+use-worktree: false
+tools:
+  - read
+  - grep
+model: provider/model
+thinking: medium
+---
+The Markdown body is the child system prompt.
+```
+
+Required fields and content:
+
+- `name`: 1–64 characters of lowercase kebab-case
+- `description`: non-empty, at most 256 characters
+- `use-worktree`: a YAML boolean
+- Body: the non-empty child system prompt
+
+Optional fields:
+
+- `tools`: a non-empty array of unique identifiers (letters, numbers, `_`, or `-`, starting with a letter)
+- `model`: a non-empty model string such as `provider/model`
+- `thinking`: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`
+
+Unknown keys, wrong types, malformed YAML, empty prompts, and same-layer duplicate names fail activation with the offending path. Discovery is deterministic and flat: regular `*.md` files are sorted; `README.md`, directories, non-Markdown files, and symlinks are skipped.
+
+Bundled files load first. User profiles load from:
+
+```text
+${getAgentDir()}/herdr-subagents/agents/
+```
+
+`getAgentDir()` is Pi's agent directory (normally `~/.pi/agent`, or `PI_CODING_AGENT_DIR`). A user file with the same `name` replaces the bundled profile as a whole; frontmatter and body are not merged.
+
+Profiles load once when the active parent extension activates. After adding, changing, or removing a file, reload or restart Pi. There is no live watcher.
+
+### Launch defaults and isolation
+
+- Explicit profile `model`, `thinking`, and `tools` values win.
+- Omitted `model` and `thinking` inherit the parent's current values at each `subagent_start`.
+- Omitted `tools` gives the child Pi's normal full default tool set; it does **not** inherit the parent's active-tool subset.
+- Explicit `tools` is a Pi allowlist.
+- `use-worktree` controls checkout isolation only, not permissions or role inference.
+- `use-worktree: false` runs in the shared parent checkout. Write-capable tools can modify it directly.
+- `use-worktree: true` creates an isolated Herdr worktree and generated branch.
+- At most one worktree-backed run may be active. Profile name and tool list do not affect this limit.
 
 ## Available tools
 
-Pi normally selects these tools for you based on your request.
+Pi normally selects these tools from your request.
 
 | Tool | Purpose |
 |---|---|
-| `subagent_start` | Start one `scout`, `researcher`, or `worker` run |
+| `subagent_start` | Start one profile loaded at extension activation |
 | `subagent_status` | Inspect current-session runs and retained resources |
 | `subagent_send` | Send one follow-up after the previous result was delivered |
 | `subagent_stop` | Stop a current-owner run, retry retained cleanup, or explicitly abort an incomplete generation |
-| `subagent_recover` | List global/legacy journal-backed residue, or retry exact prior-owner cleanup |
+| `subagent_recover` | List global/legacy journal-backed residue or retry exact prior-owner cleanup |
 
-Starts and follow-ups run in the background unless `wait: true` is requested. Blocking waits accept a timeout of up to five minutes.
+Starts and follow-ups run in the background unless `wait: true` is requested. Blocking waits accept a timeout of up to five minutes. Run IDs belong to the current parent session and extension instance; they cannot be reused after session replacement or reload.
 
-Run IDs belong to the current parent session and extension instance. They cannot be reused from another session or after a reload.
+## Results, artifacts, and follow-ups
 
-## Results and follow-ups
+Results come from the child's persisted Pi session, not terminal output. Background results are delivered once and trigger a parent turn. With `wait: true`, the result is returned directly without duplicate injection.
 
-Completed results come from the child’s persisted Pi session, not from terminal output. Background results are delivered once to the parent and trigger a parent turn. With `wait: true`, the result is returned directly instead and is not injected a second time.
+A follow-up reuses the child session, but must be sent after the previous result arrives and before automatic cleanup becomes eligible. If cleanup already ran, start a new subagent.
 
-A follow-up reuses the same child session, but it must be sent after the previous result arrives and before automatic cleanup becomes eligible. If the run has already been cleaned up, start a new subagent instead.
-
-Use `subagent_status` when you need the full run ID, generation, result, artifact path, child session, worktree, branch, error, or retained-resource details.
-
-Ordinary `subagent_stop({ id: "<run-id>" })` remains fail-safe: after proving the child stopped, it recovers and returns any raced complete result, but retains a generation that has no archived final result. If that incomplete transcript is no longer needed, explicitly call:
-
-```text
-subagent_stop({ id: "<run-id>", discardIncompleteResult: true })
-```
-
-This option is irreversible for a genuinely incomplete transcript. It still recovers a complete result first and never authorizes dirty-worktree removal. Repeating ordinary stops does not imply discard consent.
-
-## Cross-session recovery
-
-Every started run also gets a private recovery locator:
-
-```text
-<agentDir>/herdr-subagent-recovery/<parentSessionId>/<runId>.json
-```
-
-Locators only help find the authoritative original parent journal after session replacement. They never authorize cleanup by themselves.
-
-To inspect dangling residue from another session or process:
-
-```text
-subagent_recover({})
-```
-
-To retry exact cleanup for one prior-owner run:
-
-```text
-subagent_recover({ parentSessionId: "<parent-session-id>", id: "<run-id>" })
-```
-
-Add `discardIncompleteResult: true` only when irreversible incomplete-transcript loss is intended. Live unreleased owners, dirty worktrees, malformed records, and identity mismatches are reported and left untouched. Do not edit locator/artifact/journal files or use raw pane/Git cleanup.
-
-## Status widget
-
-While the current session owns visible runs, Pi shows a compact `Subagents` widget above the editor. It displays:
-
-- Profile
-- Short run ID
-- Generation number
-- Current phase
-- Separate active and retained counts
-
-A red `retained` phase means cleanup needs manual attention. Use `subagent_status` for the exact reason and paths.
-
-## Recovery artifacts
-
-Every run has one extension-managed Markdown artifact:
+Every run has one extension-managed artifact:
 
 ```text
 <agentDir>/herdr-subagent-artifacts/<parentSessionId>/<runId>.md
 ```
 
-The artifact records the exact parent requests, full textual child responses, and concise worktree and cleanup facts. Follow-ups are stored as later generations in the same file.
+It records exact parent requests, full textual child responses, and concise worktree/cleanup facts. After conversation compaction, Pi receives a transient recovery catalog with available artifact paths. Read referenced artifacts before relying on compacted-away delegation details. Never create or edit extension-owned artifacts.
 
-Artifacts survive child-session and worktree cleanup. An explicitly aborted generation is recorded in the artifact and treated as terminal by recovery catalogs. After conversation compaction, Pi receives a recovery catalog containing the available artifact paths. Read the referenced artifact before relying on delegation details that may have been compacted away.
+Ordinary `subagent_stop({ id: "<run-id>" })` is fail-safe: it recovers any raced complete result, but retains a generation with no archived final result. Irreversible discard requires:
 
-Do not create or edit these files manually; they are owned by the extension.
+```text
+subagent_stop({ id: "<run-id>", discardIncompleteResult: true })
+```
 
-## Worker worktrees and cleanup
+A complete raced result is still recovered first. Repeated ordinary stops never imply discard consent, and transcript discard never authorizes dirty-worktree removal.
 
-Workers never edit the parent checkout directly. Each worker receives an isolated Herdr worktree and generated branch.
+## Worktree isolation and cleanup
 
-The extension does not merge, cherry-pick, or otherwise integrate worker changes. Review the reported worktree and branch, then integrate the work yourself when appropriate.
+Profiles with `use-worktree: true` receive an isolated Herdr worktree. Profiles with `use-worktree: false` use the shared parent checkout, where write-capable tools can edit directly.
+
+The extension does not merge, cherry-pick, or otherwise integrate changes. Review reported work and integrate it yourself when appropriate.
 
 During cleanup:
 
-- Reader panes, tabs, and child-session storage are removed when safe.
-- A clean worker worktree is removed without force.
-- Generated worker branches are retained.
+- Non-worktree panes, tabs, and child-session storage are removed when safe.
+- A clean extension-owned worktree is removed without force.
+- Generated worktree branches are retained.
 - Dirty or uncheckable worktrees are retained untouched.
-- Child-session storage is kept until the result is safely archived or an explicit incomplete-result discard is durably recorded, and the child is proven stopped.
+- Child-session storage remains until the result is archived or explicit abort evidence is durable, and the child is proven stopped.
 
-Retained guidance reflects the actual blocker:
+For a dirty or uncheckable worktree, preserve the work, make the checkout safe if appropriate, then retry ordinary `subagent_stop`. For an incomplete session only, use `discardIncompleteResult: true` only when transcript loss is intended. For artifact, journal, or session-removal failures, address the named failure and retry ordinary stop.
 
-- For a dirty or uncheckable worktree, preserve the work, make the checkout safe if appropriate, then retry ordinary `subagent_stop`.
-- For an incomplete session only, use `discardIncompleteResult: true` only when irreversible transcript loss is intended.
-- For artifact, journal, or session-removal failures, address the named failure and retry ordinary `subagent_stop`.
+Do not use raw pane, filesystem, or Git-only cleanup for extension-owned resources. The extension deliberately avoids force removal and branch deletion.
 
-Generated worker branches remain retained even after the worktree and child session close. Do not interpret a retained branch by itself as an actionable widget row.
+## Cross-session recovery
 
-Do not use raw Git-only worktree removal for extension-owned worktrees. The extension deliberately avoids force removal and branch deletion so that uncertain or uncommitted work is not lost.
+Each started run gets a private locator:
+
+```text
+<agentDir>/herdr-subagent-recovery/<parentSessionId>/<runId>.json
+```
+
+Locators find the authoritative original parent journal; they never authorize cleanup by themselves.
+
+```text
+subagent_recover({})
+subagent_recover({ parentSessionId: "<parent-session-id>", id: "<run-id>" })
+```
+
+Add `discardIncompleteResult: true` only with explicit intent to lose an incomplete transcript. Live unreleased owners, dirty worktrees, malformed records, and identity mismatches are reported and left untouched.
+
+Historical cleanup is classified from persisted worktree/topology facts, never from the current profile catalog. Removing or overriding a profile cannot reclassify owned resources. Do not edit locator, artifact, or journal files, and do not use raw pane/Git cleanup.
 
 ## Session behavior
 
-Open runs are owned by the current persisted parent session. While a run is open, Pi blocks `/tree` navigation so a result cannot be delivered onto another branch.
+Open runs belong to the current persisted parent session. While one is open, Pi blocks `/tree` navigation so results cannot land on another branch.
 
-Esc/abort of the parent turn stops current-owner children. That abort is treated as consent to discard unfinished child transcripts after any raced final result is recovered. Dirty worker worktrees and generated branches remain preserved.
+Esc/abort stops current-owner children and consents to discarding unfinished child transcripts after raced-result recovery. Dirty extension-owned worktrees and generated branches remain preserved.
 
-`/new`, `/resume`, and `/fork` are cancellable. If non-closed runs still exist, the UI asks for confirmation before stopping children and allowing replacement. Headless/print/RPC modes cancel replacement and require explicit tool cleanup first. Successful preflight releases or deletes recovery locators before the switch proceeds so residue stays discoverable if teardown is skipped.
+`/new`, `/resume`, and `/fork` are cancellable and require confirmation while non-closed runs exist. Headless modes cancel replacement and require explicit cleanup first. Quit and reload have no confirmation hook; they perform bounded non-discarding cleanup and may leave indexed incomplete residue for later `subagent_recover`.
 
-Quit and reload have no cancellable confirmation hook. They still perform non-discarding bounded cleanup and may leave an indexed incomplete session that later needs explicit `subagent_recover(..., discardIncompleteResult: true)`. Reloading does not transfer live run ownership.
+Startup performs bounded non-discarding reconciliation only for exact released/dead-owner residue. Unverifiable resources are reported and retained. Child agents cannot create further Herdr subagents, preventing recursion.
 
-On startup, the extension performs bounded non-discarding reconciliation only for exact released/dead-owner locator residue and reports unresolved counts through notifications/widget state without injecting a model turn. Resources that cannot be verified safely are reported and retained instead of being modified speculatively.
+## Status widget
 
-Child agents cannot create further Herdr subagents, preventing recursive delegation.
+The `Subagents` widget shows each current-session run's profile, short ID, generation, phase, and active/retained state. Use `subagent_status` for exact paths, results, errors, and retained-resource details.
 
 ## Security
 
-Pi extensions execute with the current user’s full system permissions. Install this package only from a source you trust and use it only in trusted repositories and Herdr workspaces.
+Pi extensions execute with the current user's full system permissions. Install this package only from a trusted source and use it only in trusted repositories and Herdr workspaces.
 
-The reader profiles cannot write files or run shell commands. The worker can run commands and edit files, but only in its isolated worktree. Always review worker output before integrating it.
+Capabilities come from each profile's tool configuration. Omitted `tools` enables Pi's normal full defaults. `use-worktree` controls isolation, not permissions. Review user profiles before use, and remember that non-worktree write-capable profiles can modify the shared checkout.
 
 ## Support
 

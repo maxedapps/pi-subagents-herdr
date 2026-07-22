@@ -58,9 +58,10 @@ test("locator locations are deterministic, contained, and reject invalid identif
 
 test("create/read/update/delete round-trips with private modes and atomic overwrite", async () => {
   await fixture(async (agentDir) => {
-    const created = await createRecoveryLocator(agentDir, baseInput());
+    const created = await createRecoveryLocator(agentDir, baseInput({ profile: "custom-editor" }));
     assert.equal(created.schemaVersion, RECOVERY_LOCATOR_SCHEMA_VERSION);
     assert.equal(created.ownerState, "active");
+    assert.equal(created.profile, "custom-editor");
 
     const location = resolveRecoveryLocatorLocation({
       agentDir,
@@ -259,11 +260,14 @@ test("symlink roots and files are rejected", async () => {
   });
 });
 
-test("missing parent file values and invalid owner fields are rejected at write time", async () => {
+test("invalid durable fields and unsafe profile names are rejected at write time", async () => {
   await fixture(async (agentDir) => {
     assert.throws(() => createRecoveryLocator(agentDir, baseInput({ parentSessionFile: "" })), /Invalid recovery locator record/);
     assert.throws(() => createRecoveryLocator(agentDir, baseInput({ parentProcessId: 0 })), /Invalid recovery locator record/);
     assert.throws(() => createRecoveryLocator(agentDir, baseInput({ parentProcessId: 1.5 })), /Invalid recovery locator record/);
+    for (const profile of ["", "A", "a/b", "a\\b", "a b", "a\nheader", "a\0b", "a".repeat(65)]) {
+      assert.throws(() => createRecoveryLocator(agentDir, baseInput({ profile })), /Invalid recovery locator record/);
+    }
   });
 });
 

@@ -9,6 +9,7 @@ import {
   captureChildCursor,
   HERDR_STATE_CUSTOM_TYPE,
   inventoryHerdrJournal,
+  isHerdrStateRecord,
   observeChildSession,
   openChildSession,
   readChildResult,
@@ -152,10 +153,20 @@ test("journal replay accepts old records and validates optional artifact milesto
       profile: "scout" as const,
       generation: { number: 1, baselineEntryId: null, delivery: "pending" as const },
     };
-    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, base);
+    for (const profile of ["scout", "researcher", "worker", "custom-editor"]) {
+      assert.equal(isHerdrStateRecord({ ...base, profile }), true, profile);
+    }
+    for (const profile of [
+      "", "A", "a/b", "a\\b", "a b", "a\n- Worktree: /escape", "a\rheader", "a\0b", "a".repeat(65),
+    ]) {
+      assert.equal(isHerdrStateRecord({ ...base, profile }), false, JSON.stringify(profile));
+    }
+
+    manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, { ...base, profile: "custom-editor" });
     let replayed = reconstructHerdrJournal(manager.getBranch(), manager.getSessionId(), parentSessionFile);
     assert.equal(replayed.invalidEntries, 0);
     assert.equal(replayed.runs.get("run-old")?.latest.artifactPath, undefined);
+    assert.equal(replayed.runs.get("run-old")?.latest.profile, "custom-editor");
 
     manager.appendCustomEntry(HERDR_STATE_CUSTOM_TYPE, {
       ...base,

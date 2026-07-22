@@ -7,6 +7,19 @@ import { HerdrError, type WorkspaceInfo } from "../src/herdr.ts";
 import { SubagentRuntime } from "../src/runtime.ts";
 import { cleanupWorkerWorktree, type WorktreeFacts } from "../src/worktree.ts";
 import { FakeHerdr } from "./fake-herdr.ts";
+import { TEST_PROFILES } from "./profile-fixtures.ts";
+
+const WORKTREE_PROFILES = Object.freeze({
+  ...TEST_PROFILES,
+  "isolated-review": Object.freeze({
+    name: "isolated-review",
+    description: "Custom worktree-backed profile",
+    useWorktree: true,
+    tools: Object.freeze(["read"]),
+    systemPrompt: "Review in an isolated checkout",
+    filePath: "/profiles/isolated-review.md",
+  }),
+});
 
 const facts: WorktreeFacts = {
   workspaceId: "w-worker",
@@ -14,11 +27,11 @@ const facts: WorktreeFacts = {
   branch: "herdr-subagents/run-worker",
 };
 
-test("nested cwd resolves one sibling worktree and concurrent worker start is refused", async () => {
+test("arbitrary worktree profiles use isolation and share one active-start limit", async () => {
   const client = new FakeHerdr();
   client.startStatus = "idle";
   client.statuses = ["idle"];
-  const subject = new SubagentRuntime(client, { workspaceId: "w-parent" }, {
+  const subject = new SubagentRuntime(client, { workspaceId: "w-parent" }, WORKTREE_PROFILES, {
     idFactory: () => "run-worker",
     instanceIdFactory: () => "instance-worker",
     pollIntervalMs: 1,
@@ -34,14 +47,14 @@ test("nested cwd resolves one sibling worktree and concurrent worker start is re
   const parentCwd = join(checkoutRoot, "src");
   const workerPath = join(dirname(checkoutRoot), ".herdr-subagents-worktrees", "run-worker");
   const outcomes = await Promise.allSettled([
-    subject.start("worker", "change one file", parentCwd),
+    subject.start("isolated-review", "review one file", parentCwd),
     subject.start("worker", "second", parentCwd),
   ]);
   assert.deepEqual(outcomes.map(({ status }) => status).sort(), ["fulfilled", "rejected"]);
   const started = outcomes.find((outcome): outcome is PromiseFulfilledResult<Awaited<ReturnType<SubagentRuntime["start"]>>> => outcome.status === "fulfilled")?.value;
   assert.equal(started?.worktree?.path, workerPath);
   const rejected = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
-  assert.match(String(rejected?.reason), /Only one worker/);
+  assert.match(String(rejected?.reason), /Only one worktree-backed subagent/);
   const launch = client.calls.find(({ method }) => method === "agent.start")?.input as Record<string, unknown>;
   assert.equal(launch.cwd, workerPath);
   assert.equal(client.calls.filter(({ method }) => method === "worktree.create").length, 1);

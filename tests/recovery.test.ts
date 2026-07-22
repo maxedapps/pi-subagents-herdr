@@ -79,6 +79,7 @@ test("recovery catalog merges current, durable, missing, historical, and artifac
   }));
   const historicalLatest = entry("h2", record("run-historical", {
     at: 2,
+    profile: "custom-editor",
     state: "result_delivered",
     status: "done",
     generation: { number: 3, baselineEntryId: "base", delivery: "delivered" },
@@ -104,7 +105,7 @@ test("recovery catalog merges current, durable, missing, historical, and artifac
   assert.deepEqual(result.rows, [
     {
       runId: "run-historical",
-      profile: "scout",
+      profile: "custom-editor",
       source: "durable",
       lifecycle: "result_delivered",
       status: "done",
@@ -150,7 +151,7 @@ test("recovery catalog merges current, durable, missing, historical, and artifac
 
   assert.equal(formatRecoveryCatalog(result.rows), [
     "Parent-session subagent recovery catalog after compaction:",
-    "- run-historical [scout] — latest durable result_delivered/done/g3 delivered; historical branch; artifact: /artifacts/run-historical.md (incomplete)",
+    "- run-historical [custom-editor] — latest durable result_delivered/done/g3 delivered; historical branch; artifact: /artifacts/run-historical.md (incomplete)",
     "- run-current [scout] — current live/idle/g1 queued; active branch; artifact: /artifacts/run-current.md (available)",
     "- run-missing [scout] — latest durable closed/idle/g1 aborted; active branch; artifact: /artifacts/run-missing.md (available)",
     "- run-artifact — status/branch/completeness unknown (artifact only); artifact: /artifacts/run-artifact.md (unknown)",

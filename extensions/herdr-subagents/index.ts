@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { enumerateRunArtifacts } from "../../src/artifact.ts";
 import { SocketHerdrClient } from "../../src/herdr.ts";
 import { buildRecoveryCatalog, formatRecoveryCatalog } from "../../src/recovery.ts";
+import { loadProfileCatalog } from "../../src/profiles.ts";
 import {
   SubagentRuntime,
   type BulkStopSummary,
@@ -235,6 +236,7 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
     return;
   }
 
+  const profiles = loadProfileCatalog();
   const parentInstanceId = randomUUID();
   let refreshWidget: () => void = noRefresh;
   let refreshOwner: object | undefined;
@@ -248,6 +250,7 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
       workspaceId,
       agentDir: getAgentDir(),
     },
+    profiles,
     {
       instanceIdFactory: () => parentInstanceId,
       parentProcessId: process.pid,
@@ -265,7 +268,7 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
       },
     },
   );
-  registerSubagentTools(pi, runtime);
+  registerSubagentTools(pi, runtime, profiles);
 
   pi.on("resources_discover", () => ({ skillPaths: [skillPath] }));
   pi.on("session_start", async (event, ctx) => {

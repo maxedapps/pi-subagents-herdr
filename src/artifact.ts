@@ -1,6 +1,7 @@
 import { chmod, lstat, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { isProfileName, type ProfileName } from "./profiles.ts";
 
 const ARTIFACT_DIRECTORY = "herdr-subagent-artifacts";
 const PRIVATE_DIRECTORY_MODE = 0o700;
@@ -23,7 +24,7 @@ export interface RunArtifact {
   path: string;
 }
 
-export type ArtifactProfile = "scout" | "researcher" | "worker";
+export type ArtifactProfile = ProfileName;
 
 export interface WorkerArtifactFacts {
   path?: string;
@@ -133,9 +134,7 @@ export async function enumerateRunArtifacts(agentDir: string, parentSessionId: s
 
 export function renderArtifactHeader(header: ArtifactHeader): string {
   validateIdentifier("run ID", header.runId);
-  if (header.profile !== "worker" && header.worker !== undefined) {
-    throw new Error("Worker artifact facts require the worker profile");
-  }
+  if (!isProfileName(header.profile)) throw new Error("Invalid artifact profile");
 
   const lines = [`# Herdr subagent ${header.runId}`, `- Profile: ${header.profile}`];
   if (header.worker?.path !== undefined) lines.push(`- Worktree: ${header.worker.path}`);

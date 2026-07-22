@@ -1,25 +1,27 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { ProfileName } from "./profiles.ts";
+import type { ProfileCatalog, ProfileName, ThinkingLevel } from "./profiles.ts";
 import type { GenerationRequest, SubagentRuntime } from "./runtime.ts";
 
 const strict = { additionalProperties: false } as const;
-const profiles = StringEnum(["scout", "researcher", "worker"] as const);
 
-export const startSchema = Type.Union([
-  Type.Object({
-    profile: profiles,
-    task: Type.String({ minLength: 1 }),
-    wait: Type.Literal(true),
-    timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 300_000 })),
-  }, strict),
-  Type.Object({
-    profile: profiles,
-    task: Type.String({ minLength: 1 }),
-    wait: Type.Optional(Type.Literal(false)),
-  }, strict),
-]);
+export function createStartSchema(catalog: ProfileCatalog) {
+  const profiles = StringEnum(Object.keys(catalog));
+  return Type.Union([
+    Type.Object({
+      profile: profiles,
+      task: Type.String({ minLength: 1 }),
+      wait: Type.Literal(true),
+      timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 300_000 })),
+    }, strict),
+    Type.Object({
+      profile: profiles,
+      task: Type.String({ minLength: 1 }),
+      wait: Type.Optional(Type.Literal(false)),
+    }, strict),
+  ]);
+}
 
 export const statusSchema = Type.Object({
   id: Type.Optional(Type.String({ minLength: 1 })),
@@ -84,18 +86,36 @@ function generationRequest(
   };
 }
 
-export function registerSubagentTools(pi: ExtensionAPI, runtime: SubagentRuntime): void {
+function parentLaunch(pi: ExtensionAPI, ctx: ExtensionContext): { model?: string; thinking: ThinkingLevel } {
+  return {
+    ...(ctx.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}),
+    thinking: pi.getThinkingLevel(),
+  };
+}
+
+export function registerSubagentTools(
+  pi: ExtensionAPI,
+  runtime: SubagentRuntime,
+  catalog: ProfileCatalog,
+): void {
+  const startSchema = createStartSchema(catalog);
+  const guidance = Object.values(catalog)
+    .map((profile) => `${profile.name} (${profile.description})`)
+    .join("; ");
   pi.registerTool({
     name: "subagent_start",
     label: "Start subagent",
-    description: "Start one visible fixed-profile Pi subagent. Background is the default; wait:true returns its structured result and automatic artifact path directly.",
+    description: `Start one visible Markdown-profile Pi subagent. Loaded profiles: ${guidance}. Background is the default; wait:true returns its structured result and automatic artifact path directly.`,
     parameters: startSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       return result(await runtime.start(
         params.profile as ProfileName,
         params.task,
         ctx.cwd,
-        generationRequest(runtime, params, ctx.sessionManager, signal),
+        {
+          ...generationRequest(runtime, params, ctx.sessionManager, signal),
+          parentLaunch: parentLaunch(pi, ctx),
+        },
       ));
     },
   });
