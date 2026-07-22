@@ -413,6 +413,24 @@ test("client surfaces API, malformed response, timeout, and abort failures", asy
       });
     });
   });
+  await context.test("closeTab treats tab_not_found as success", async () => {
+    await withServer((request) => ({ id: request.id, error: { code: "tab_not_found", message: "tab gone" } }), async (client) => {
+      await client.closeTab("w1:t-missing");
+    });
+  });
+  await context.test("closePane treats pane_not_found as success", async () => {
+    await withServer((request) => ({ id: request.id, error: { code: "pane_not_found", message: "pane gone" } }), async (client) => {
+      await client.closePane("w1:p-missing");
+    });
+  });
+  await context.test("closeTab still surfaces non-not-found failures", async () => {
+    await withServer((request) => ({ id: request.id, error: { code: "permission_denied", message: "nope" } }), async (client) => {
+      await assert.rejects(client.closeTab("w1:t2"), (error) => {
+        assert.equal(error instanceof HerdrError && error.code, "permission_denied");
+        return true;
+      });
+    });
+  });
   await context.test("malformed JSON", async () => {
     await withServer(() => "not-json", async (client) => assert.rejects(client.getAgent("x"), /malformed JSON/));
   });

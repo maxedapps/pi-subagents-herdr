@@ -11,6 +11,7 @@ import type {
   WorkspaceInfo,
   WorktreeSourceInfo,
 } from "../src/herdr.ts";
+import { HerdrError } from "../src/herdr.ts";
 
 export interface Call {
   method: string;
@@ -137,8 +138,8 @@ export class FakeHerdr implements HerdrClient {
   paneIds: string[] = [];
   agentSessionForStart?: (input: JsonRecord, sessionId: string) => AgentSessionReference;
   failStartAgent = false;
-  failClosePane = false;
-  failCloseTab = false;
+  failClosePane: boolean | Error = false;
+  failCloseTab: boolean | Error = false;
   failRemoveWorktree = false;
   failGetWorkspace?: Error;
   failCloseWorkspace = false;
@@ -228,12 +229,16 @@ export class FakeHerdr implements HerdrClient {
 
   async closePane(paneId: string, signal?: AbortSignal): Promise<void> {
     this.calls.push({ method: "pane.close", input: paneId, signal });
-    if (this.failClosePane) throw new Error("pane close failed");
+    if (this.failClosePane) {
+      throw this.failClosePane === true ? new Error("pane close failed") : this.failClosePane;
+    }
   }
 
   async closeTab(tabId: string, signal?: AbortSignal): Promise<void> {
     this.calls.push({ method: "tab.close", input: tabId, signal });
-    if (this.failCloseTab) throw new Error("tab close failed");
+    if (this.failCloseTab) {
+      throw this.failCloseTab === true ? new Error("tab close failed") : this.failCloseTab;
+    }
   }
 
   async getWorktreeSource(input: JsonRecord, signal?: AbortSignal): Promise<WorktreeSourceInfo> {

@@ -14,6 +14,7 @@ import {
 import {
   HerdrError,
   HerdrSubscriptionTransportError,
+  isHerdrNotFound,
   type AgentInfo,
   type AgentStatus,
   type AgentStatusEvent,
@@ -1951,8 +1952,13 @@ export class SubagentRuntime {
     let childStopped = false;
     let retainedPane: string | undefined;
     if (agent) {
-      try { await this.client.closePane(agent.paneId, signal); childStopped = true; }
-      catch { retainedPane = `pane=${agent.paneId}`; }
+      try {
+        await this.client.closePane(agent.paneId, signal);
+        childStopped = true;
+      } catch (error) {
+        if (isHerdrNotFound(error, "pane_not_found")) childStopped = true;
+        else retainedPane = `pane=${agent.paneId}`;
+      }
     }
     if (worktree) {
       const cleanup = await cleanupWorkerWorktree(this.client, worktree, signal, this.#gitStatus);
@@ -1964,8 +1970,18 @@ export class SubagentRuntime {
         retained.push(`worktree=${cleanup.path}`);
       }
     } else if (tabId) {
-      try { await this.client.closeTab(tabId, signal); childStopped = true; retainedPane = undefined; }
-      catch { retained.push(`tab=${tabId}`); }
+      try {
+        await this.client.closeTab(tabId, signal);
+        childStopped = true;
+        retainedPane = undefined;
+      } catch (error) {
+        if (isHerdrNotFound(error, "tab_not_found")) {
+          childStopped = true;
+          retainedPane = undefined;
+        } else {
+          retained.push(`tab=${tabId}`);
+        }
+      }
     } else if (rootPaneId) {
       retained.push(`rootPane=${rootPaneId}`);
     }
@@ -2006,7 +2022,12 @@ export class SubagentRuntime {
       try {
         await this.client.closePane(run.paneId, signal);
         if (!this.#persistChildStopped(run)) mayFinalize = false;
-      } catch { /* an enclosing tab/worktree cleanup may still prove the child stopped */ }
+      } catch (error) {
+        // Missing pane is already stopped; other failures may still be proven by tab/worktree cleanup.
+        if (isHerdrNotFound(error, "pane_not_found")) {
+          if (!this.#persistChildStopped(run)) mayFinalize = false;
+        }
+      }
     }
     await reconcileGeneration();
 
@@ -2035,10 +2056,17 @@ export class SubagentRuntime {
           partial = true;
           retained.push("journal=herdr-subagent-state");
         }
-      } catch {
-        partial = true;
-        if (!run.childStopped) retained.push(`pane=${run.paneId}`);
-        retained.push(`tab=${run.tabId}`);
+      } catch (error) {
+        if (isHerdrNotFound(error, "tab_not_found")) {
+          if (!run.childStopped && !this.#persistChildStopped(run)) {
+            partial = true;
+            retained.push("journal=herdr-subagent-state");
+          }
+        } else {
+          partial = true;
+          if (!run.childStopped) retained.push(`pane=${run.paneId}`);
+          retained.push(`tab=${run.tabId}`);
+        }
       }
     }
     await reconcileGeneration();

@@ -804,6 +804,30 @@ test("settlement waits for delivery confirmation, blocks tree while open, and re
   }
 });
 
+test("reader cleanup treats already-missing tabs as finalized", async () => {
+  const parent = await createParent();
+  try {
+    const client = new FakeHerdr();
+    const deliveries: ResultDelivery[] = [];
+    const runtime = runtimeFor(parent, client, { deliveries });
+    await bind(runtime, parent);
+    const started = await runtime.start("scout", "task", parent.root);
+    await appendChildResult(client, "answer");
+    client.statusSubscriptions[0]!.emit("idle");
+    await eventually(() => deliveries.length === 1);
+    assert.equal(runtime.confirmDelivery({ role: "custom", ...deliveries[0]! }), true);
+
+    client.failCloseTab = new HerdrError("tab gone", { code: "tab_not_found" });
+    const stopped = await runtime.stop(started.id);
+    assert.equal(stopped.run.lifecycle, "closed");
+    assert.deepEqual(stopped.retained, []);
+    assert.equal(records(parent.manager).at(-1)?.state, "closed");
+    assert.equal(existsSync(started.childSessionDir), false);
+  } finally {
+    await rm(parent.root, { recursive: true, force: true });
+  }
+});
+
 test("bulk settlement cleans every run when one stopping journal write fails", async () => {
   const parent = await createParent();
   try {

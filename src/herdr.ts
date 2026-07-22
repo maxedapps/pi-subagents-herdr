@@ -91,6 +91,11 @@ export class HerdrError extends Error {
   }
 }
 
+/** True when Herdr reports the target resource is already gone. */
+export function isHerdrNotFound(error: unknown, code: string): boolean {
+  return error instanceof HerdrError && error.code === code;
+}
+
 export class HerdrTimeoutError extends HerdrError {
   constructor(phase: "connect" | "response", timeoutMs: number) {
     super(`Herdr ${phase} timed out after ${timeoutMs}ms`);
@@ -374,11 +379,23 @@ export class SocketHerdrClient implements HerdrClient {
   }
 
   async closePane(paneId: string, signal?: AbortSignal): Promise<void> {
-    await this.#request("pane.close", { pane_id: paneId }, "ok", signal);
+    try {
+      await this.#request("pane.close", { pane_id: paneId }, "ok", signal);
+    } catch (error) {
+      // Idempotent close: a missing pane is already cleaned up.
+      if (isHerdrNotFound(error, "pane_not_found")) return;
+      throw error;
+    }
   }
 
   async closeTab(tabId: string, signal?: AbortSignal): Promise<void> {
-    await this.#request("tab.close", { tab_id: tabId }, "ok", signal);
+    try {
+      await this.#request("tab.close", { tab_id: tabId }, "ok", signal);
+    } catch (error) {
+      // Idempotent close: a missing tab is already cleaned up.
+      if (isHerdrNotFound(error, "tab_not_found")) return;
+      throw error;
+    }
   }
 
   async getWorktreeSource(input: JsonRecord, signal?: AbortSignal): Promise<WorktreeSourceInfo> {
