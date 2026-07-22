@@ -89,7 +89,7 @@ function validGeneration(value: unknown): boolean {
     && (generation.artifactResultPersisted === undefined || generation.artifactResultPersisted === true);
 }
 
-function isRecord(value: unknown): value is HerdrStateRecord {
+export function isHerdrStateRecord(value: unknown): value is HerdrStateRecord {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
   return JOURNAL_STATES.has(record.state as HerdrLifecycleState)
@@ -133,7 +133,7 @@ export function inventoryHerdrJournal(
   let invalidEntries = 0;
   for (const entry of entries) {
     if (entry.type !== "custom" || entry.customType !== HERDR_STATE_CUSTOM_TYPE) continue;
-    if (!isRecord(entry.data)) {
+    if (!isHerdrStateRecord(entry.data)) {
       invalidEntries++;
       continue;
     }
@@ -153,7 +153,7 @@ export function reconstructHerdrJournal(
   let invalidEntries = 0;
   for (const entry of branch) {
     if (entry.type !== "custom" || entry.customType !== HERDR_STATE_CUSTOM_TYPE) continue;
-    if (!isRecord(entry.data)) {
+    if (!isHerdrStateRecord(entry.data)) {
       invalidEntries++;
       continue;
     }

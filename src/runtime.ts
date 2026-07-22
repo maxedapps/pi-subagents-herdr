@@ -37,6 +37,19 @@ import {
   type ReplayedHerdrRun,
 } from "./session.ts";
 import {
+  buildGlobalRecoveryInventory,
+  latestActiveJournalRun,
+  openValidatedParentJournal,
+  type GlobalRecoveryInventory,
+} from "./recovery.ts";
+import {
+  createRecoveryLocator,
+  deleteRecoveryLocator,
+  readRecoveryLocator,
+  updateRecoveryLocatorOwnerState,
+  type RecoveryLocatorOperations,
+} from "./registry.ts";
+import {
   cleanupWorkerWorktree,
   createWorkerWorktree,
   readGitStatus,
@@ -131,6 +144,9 @@ interface RunRecord extends Run {
   archiveRecovered?: boolean;
   abortArtifactAwaitingJournal?: boolean;
   cleanupArtifactAwaitingJournal?: boolean;
+  /** Optional per-run journal sink so cross-session recovery never rebinds the runtime owner. */
+  journalOwner?: BoundParent;
+  journalAppend?: NonNullable<RuntimeOptions["appendState"]>;
 }
 
 export interface ParentSessionBinding {
@@ -197,6 +213,7 @@ export interface RuntimeOptions {
   onRunsChanged?: () => void;
   isProcessAlive?: (pid: number) => boolean;
   now?: () => number;
+  registryOperations?: RecoveryLocatorOperations;
 }
 
 export interface GenerationRequest extends Partial<ParentRequest> {
@@ -220,6 +237,34 @@ export interface StopResult {
   run: Run;
   retained: readonly string[];
   workerCleanup?: WorkerCleanup;
+}
+
+export interface BulkStopSummary {
+  results: readonly StopResult[];
+  allChildrenStopped: boolean;
+  allClosed: boolean;
+  unprovenLive: readonly string[];
+  dirtyWorktrees: readonly string[];
+  preservedSessions: readonly string[];
+  preservedArtifacts: readonly string[];
+  retainedBranches: readonly string[];
+}
+
+export interface BulkStopRequest extends Partial<ParentRequest> {
+  reason: string;
+  discardIncompleteResult?: boolean;
+}
+
+export interface RecoverListRequest {
+  includeLegacy?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface RecoverRunRequest {
+  parentSessionId: string;
+  id: string;
+  discardIncompleteResult?: true;
+  signal?: AbortSignal;
 }
 
 interface CleanupRunOptions {
@@ -310,6 +355,34 @@ export function formatSubagentResult(run: Run, result: ChildResult): string {
   ].join("\n");
 }
 
+function summarizeBulkStop(results: readonly StopResult[]): BulkStopSummary {
+  const unprovenLive: string[] = [];
+  const dirtyWorktrees: string[] = [];
+  const preservedSessions: string[] = [];
+  const preservedArtifacts: string[] = [];
+  const retainedBranches: string[] = [];
+  for (const result of results) {
+    const run = result.run;
+    if (run.childStopped !== true && run.lifecycle !== "closed") unprovenLive.push(run.id);
+    for (const fact of result.retained) {
+      if (fact.startsWith("worktree=")) dirtyWorktrees.push(fact.slice("worktree=".length));
+      else if (fact.startsWith("sessionDir=")) preservedSessions.push(fact.slice("sessionDir=".length));
+      else if (fact.startsWith("artifact=")) preservedArtifacts.push(fact.slice("artifact=".length));
+      else if (fact.startsWith("branch=")) retainedBranches.push(fact.slice("branch=".length));
+    }
+  }
+  return {
+    results,
+    allChildrenStopped: results.every((result) => result.run.childStopped === true || result.run.lifecycle === "closed"),
+    allClosed: results.every((result) => result.run.lifecycle === "closed"),
+    unprovenLive,
+    dirtyWorktrees,
+    preservedSessions,
+    preservedArtifacts,
+    retainedBranches,
+  };
+}
+
 function cloneRun(run: RunRecord): Run {
   const {
     location: _location,
@@ -382,6 +455,7 @@ export class SubagentRuntime {
   readonly #onRunsChanged?: () => void;
   readonly #isProcessAlive: (pid: number) => boolean;
   readonly #now: () => number;
+  readonly #registryOperations?: RecoveryLocatorOperations;
   #parent?: BoundParent;
   #workerStarting = false;
   #deliverySinceSettlement = false;
@@ -412,6 +486,7 @@ export class SubagentRuntime {
     this.#onRunsChanged = options.onRunsChanged;
     this.#isProcessAlive = options.isProcessAlive ?? processIsAlive;
     this.#now = options.now ?? Date.now;
+    this.#registryOperations = options.registryOperations;
   }
 
   async bindParent(
@@ -678,6 +753,14 @@ export class SubagentRuntime {
       && run.lifecycle !== "retained");
   }
 
+  hasNonClosedRuns(request?: Partial<ParentRequest>): boolean {
+    const owner = this.#context(request);
+    return [...this.runs.values()].some((run) =>
+      run.parentSessionId === owner.parentSessionId
+      && run.parentInstanceId === owner.parentInstanceId
+      && run.lifecycle !== "closed");
+  }
+
   async start(
     profile: ProfileName,
     task: string,
@@ -772,6 +855,11 @@ export class SubagentRuntime {
       run.warning = workerWarning(run);
       this.runs.set(id, run);
       this.#record(run, "starting");
+      try {
+        await this.#createRecoveryLocator(run);
+      } catch (error) {
+        throw new Error(`Recovery locator creation failed: ${errorMessage(error)}`, { cause: error });
+      }
       this.#notifyRunsChanged();
 
       const deadline = this.#now() + this.#readinessTimeoutMs;
@@ -889,12 +977,215 @@ export class SubagentRuntime {
 
   async stop(id: string, request: StopRequest = {}): Promise<StopResult> {
     const run = this.#run(id, request);
+    return this.#stopOwnedRun(run, {
+      reason: `Run stopped: ${run.id}`,
+      discardIncompleteResult: request.discardIncompleteResult === true,
+      requireStoppingJournal: true,
+    });
+  }
+
+  async stopCurrentOwner(request: BulkStopRequest): Promise<BulkStopSummary> {
+    const owner = this.#context(request);
+    const open = [...this.runs.values()].filter((run) =>
+      run.parentSessionId === owner.parentSessionId
+      && run.parentInstanceId === owner.parentInstanceId
+      && run.lifecycle !== "closed");
+    const results = await this.#cleanupMany(open, request.reason, request.discardIncompleteResult === true);
+    return summarizeBulkStop(results);
+  }
+
+  async listRecoverable(request: RecoverListRequest = {}): Promise<GlobalRecoveryInventory> {
+    return buildGlobalRecoveryInventory({
+      agentDir: this.#agentDir,
+      isProcessAlive: this.#isProcessAlive,
+      includeLegacy: request.includeLegacy === true,
+      signal: request.signal,
+      currentParentSessionId: this.#parent?.parentSessionId,
+      currentInstanceId: this.instanceId,
+    });
+  }
+
+  async recover(request: RecoverRunRequest): Promise<StopResult> {
+    const locator = await readRecoveryLocator(this.#agentDir, {
+      parentSessionId: request.parentSessionId,
+      runId: request.id,
+    });
+    if (!locator) throw new Error(`Recovery locator not found for ${request.parentSessionId}/${request.id}`);
+
+    const opened = await openValidatedParentJournal(locator.parentSessionFile, locator.parentSessionId);
+    if ("error" in opened) throw new Error(`Recovery journal could not be opened: ${opened.error}`);
+
+    const latest = latestActiveJournalRun(
+      opened.branch,
+      opened.parentSessionId,
+      opened.parentSessionFile,
+      request.id,
+    );
+    if (latest.error || !latest.replay) throw new Error(latest.error ?? "Recovery journal replay missing");
+
+    const record = latest.replay.latest;
+    if (
+      record.parentSessionId !== locator.parentSessionId
+      || record.parentSessionFile !== locator.parentSessionFile
+      || record.parentInstanceId !== locator.parentInstanceId
+      || record.parentProcessId !== locator.parentProcessId
+    ) {
+      throw new Error("Recovery locator ownership facts do not match the authoritative journal record");
+    }
+    if (record.state === "closed") {
+      try { await this.#deleteRecoveryLocator({ id: request.id, parentSessionId: request.parentSessionId }); } catch { /* already gone */ }
+      throw new Error(`Run ${request.id} is already closed in the original journal`);
+    }
+
+    const ownerLive = this.#isProcessAlive(record.parentProcessId);
+    if (locator.ownerState !== "released" && ownerLive) {
+      throw new Error(`Run ${request.id} still has a live unreleased owner process ${record.parentProcessId}`);
+    }
+
+    const run = this.#recoveryRun(latest.replay);
+    if (this.runs.has(run.id)) {
+      throw new Error(`Run id ${run.id} collides with a current-runtime run and cannot be recovered in-place`);
+    }
+    run.journalOwner = {
+      parentSessionId: record.parentSessionId,
+      parentSessionFile: record.parentSessionFile,
+      parentEntryId: opened.manager.getLeafId(),
+      parentInstanceId: record.parentInstanceId,
+      parentProcessId: record.parentProcessId,
+    };
+    run.journalAppend = (customType, next) => {
+      opened.manager.appendCustomEntry(customType, next);
+    };
+
+    const signal = request.signal
+      ? AbortSignal.any([request.signal, AbortSignal.timeout(this.#cleanupTimeoutMs)])
+      : AbortSignal.timeout(this.#cleanupTimeoutMs);
+    try {
+      this.#markStopping(run, `Cross-session recovery for ${run.id}`);
+    } catch (error) {
+      throw new Error(`Recovery stopping journal failed: ${errorMessage(error)}`, { cause: error });
+    }
+    const result = await this.#cleanupRun(run, signal, {
+      discardIncompleteResult: request.discardIncompleteResult === true,
+      reconcileIncompleteResult: true,
+    });
+    if (result.run.lifecycle === "closed") {
+      try { await this.#deleteRecoveryLocator(run); } catch { /* retain locator on delete failure */ }
+    } else {
+      try {
+        await updateRecoveryLocatorOwnerState(this.#agentDir, {
+          parentSessionId: run.parentSessionId,
+          runId: run.id,
+        }, "released", this.#registryOperations);
+      } catch { /* locator may already be released */ }
+    }
+    // Recovery must never adopt the foreign run into the current runtime map.
+    this.runs.delete(request.id);
+    return result;
+  }
+
+  async reconcileGlobalLocators(signal?: AbortSignal): Promise<readonly LifecycleDiagnostic[]> {
+    const inventory = await this.listRecoverable({ signal });
+    const diagnostics: LifecycleDiagnostic[] = [];
+    for (const candidate of inventory.candidates) {
+      if (signal?.aborted) break;
+      if (candidate.classification === "closed_stale_locator" && candidate.actionable) {
+        try {
+          await this.#deleteRecoveryLocator({ id: candidate.runId, parentSessionId: candidate.parentSessionId });
+          diagnostics.push({
+            runId: candidate.runId,
+            outcome: "cleaned",
+            message: `Pruned closed stale recovery locator for ${candidate.parentSessionId}/${candidate.runId}`,
+          });
+        } catch (error) {
+          diagnostics.push({
+            runId: candidate.runId,
+            outcome: "retained",
+            message: `Closed stale locator ${candidate.parentSessionId}/${candidate.runId} could not be pruned: ${errorMessage(error)}`,
+          });
+        }
+        continue;
+      }
+      if (!candidate.actionable) {
+        diagnostics.push({
+          runId: candidate.runId,
+          outcome: candidate.classification === "live_unreleased_owner" || candidate.classification === "current_live_owner"
+            ? "live_owner"
+            : candidate.classification === "identity_mismatched" || candidate.classification === "malformed"
+              ? "identity_mismatch"
+              : "retained",
+          message: `Global residue ${candidate.parentSessionId}/${candidate.runId}: ${candidate.reason ?? candidate.classification}`,
+          ...(candidate.retained ? { retained: [...candidate.retained] } : {}),
+        });
+        continue;
+      }
+      if (
+        candidate.classification !== "released_or_dead_recoverable"
+        && candidate.classification !== "retained_data_only"
+      ) continue;
+      try {
+        const stopped = await this.recover({
+          parentSessionId: candidate.parentSessionId,
+          id: candidate.runId,
+          signal,
+        });
+        diagnostics.push({
+          runId: candidate.runId,
+          outcome: stopped.run.lifecycle === "closed" ? "cleaned" : "retained",
+          message: `Global recovery ${candidate.parentSessionId}/${candidate.runId} ${stopped.run.lifecycle}`,
+          ...(stopped.retained.length ? { retained: [...stopped.retained] } : {}),
+        });
+      } catch (error) {
+        diagnostics.push({
+          runId: candidate.runId,
+          outcome: "retained",
+          message: `Global recovery ${candidate.parentSessionId}/${candidate.runId} failed: ${errorMessage(error)}`,
+        });
+      }
+    }
+    this.#diagnostics.push(...diagnostics);
+    return diagnostics;
+  }
+
+  async releaseCurrentOwnerLocators(request: Partial<ParentRequest> = {}): Promise<{
+    released: readonly string[];
+    failed: readonly string[];
+  }> {
+    const owner = this.#context(request);
+    const owned = [...this.runs.values()].filter((run) =>
+      run.parentSessionId === owner.parentSessionId
+      && run.parentInstanceId === owner.parentInstanceId
+      && run.lifecycle !== "closed");
+    const released: string[] = [];
+    const failed: string[] = [];
+    for (const run of owned) {
+      try {
+        await updateRecoveryLocatorOwnerState(this.#agentDir, {
+          parentSessionId: run.parentSessionId,
+          runId: run.id,
+        }, "released", this.#registryOperations);
+        released.push(run.id);
+      } catch (error) {
+        failed.push(`${run.id}: ${errorMessage(error)}`);
+      }
+    }
+    return { released, failed };
+  }
+
+  async #stopOwnedRun(
+    run: RunRecord,
+    options: {
+      reason: string;
+      discardIncompleteResult: boolean;
+      requireStoppingJournal: boolean;
+    },
+  ): Promise<StopResult> {
     if (run.cleanup) return run.cleanup;
     if (run.lifecycle === "closed") {
       return { run: cloneRun(run), retained: [...(run.retained ?? [])] };
     }
     const signal = AbortSignal.timeout(this.#cleanupTimeoutMs);
-    const attempt = this.#stopAttempt(run, signal, request.discardIncompleteResult === true);
+    const attempt = this.#stopAttempt(run, signal, options);
     run.cleanup = attempt;
     void attempt.then(
       () => { if (run.lifecycle === "retained" && run.cleanup === attempt) run.cleanup = undefined; },
@@ -903,25 +1194,43 @@ export class SubagentRuntime {
     return attempt;
   }
 
-  async #stopAttempt(run: RunRecord, signal: AbortSignal, discardIncompleteResult: boolean): Promise<StopResult> {
+  async #stopAttempt(
+    run: RunRecord,
+    signal: AbortSignal,
+    options: {
+      reason: string;
+      discardIncompleteResult: boolean;
+      requireStoppingJournal: boolean;
+    },
+  ): Promise<StopResult> {
     if (run.archivePending && !await this.#recoverPendingArtifact(run)) {
       return { run: cloneRun(run), retained: [...(run.retained ?? [])] };
     }
     run.error = undefined;
     run.retained = undefined;
     try {
-      this.#markStopping(run, `Run stopped: ${run.id}`);
+      this.#markStopping(run, options.reason);
     } catch (error) {
-      run.lifecycle = "retained";
-      run.error = `Stopping journal failed: ${errorMessage(error)}`;
-      const retained: string[] = [];
-      if (!retained.includes("journal=herdr-subagent-state")) retained.push("journal=herdr-subagent-state");
-      run.retained = retained;
-      run.updatedAt = this.#now();
+      if (options.requireStoppingJournal) {
+        run.lifecycle = "retained";
+        run.error = `Stopping journal failed: ${errorMessage(error)}`;
+        const retained = ["journal=herdr-subagent-state"];
+        run.retained = retained;
+        run.updatedAt = this.#now();
+        this.#notifyRunsChanged();
+        return { run: cloneRun(run), retained };
+      }
+      if (run.lifecycle !== "stopping" && run.lifecycle !== "closed") {
+        run.lifecycle = "stopping";
+        run.updatedAt = this.#now();
+      }
+      run.monitorController?.abort(new Error(options.reason));
       this.#notifyRunsChanged();
-      return { run: cloneRun(run), retained };
     }
-    return this.#cleanupRun(run, signal, { discardIncompleteResult, reconcileIncompleteResult: true });
+    return this.#cleanupRun(run, signal, {
+      discardIncompleteResult: options.discardIncompleteResult,
+      reconcileIncompleteResult: true,
+    });
   }
 
   async settle(request: Partial<ParentRequest> = {}): Promise<readonly StopResult[]> {
@@ -941,12 +1250,15 @@ export class SubagentRuntime {
   async shutdown(reason: ShutdownReason): Promise<readonly StopResult[]> {
     const parent = this.#parent;
     if (!parent) return [];
-    const open = [...this.runs.values()].filter((run) =>
-      run.parentSessionId === parent.parentSessionId
-      && run.parentInstanceId === parent.parentInstanceId
-      && run.lifecycle !== "closed"
-      && run.lifecycle !== "retained");
-    return this.#cleanupMany(open, `Parent session shutdown: ${reason}`);
+    const summary = await this.stopCurrentOwner({
+      parentSessionId: parent.parentSessionId,
+      parentSessionFile: parent.parentSessionFile,
+      parentEntryId: parent.parentEntryId,
+      parentInstanceId: parent.parentInstanceId,
+      reason: `Parent session shutdown: ${reason}`,
+    });
+    await this.#releaseOwnedLocators(parent);
+    return summary.results;
   }
 
   confirmDelivery(message: unknown): boolean {
@@ -1018,9 +1330,42 @@ export class SubagentRuntime {
     };
   }
 
-  #record(run: RunRecord, state: HerdrLifecycleState, workerCleanup?: WorkerCleanup): void {
+  async #createRecoveryLocator(run: RunRecord): Promise<void> {
     const parent = this.#parent;
-    if (!parent?.parentSessionFile || !this.#appendState) throw new Error("Durable parent session journal is unavailable");
+    if (!parent?.parentSessionFile) throw new Error("Durable parent session journal is unavailable");
+    await createRecoveryLocator(this.#agentDir, {
+      runId: run.id,
+      parentSessionId: run.parentSessionId,
+      parentSessionFile: parent.parentSessionFile,
+      parentInstanceId: parent.parentInstanceId,
+      parentProcessId: parent.parentProcessId,
+      profile: run.profile,
+      artifactPath: run.artifactPath,
+      createdAt: run.createdAt,
+      ownerState: "active",
+    }, this.#registryOperations);
+  }
+
+  async #deleteRecoveryLocator(run: Pick<Run, "id" | "parentSessionId">): Promise<void> {
+    await deleteRecoveryLocator(this.#agentDir, {
+      parentSessionId: run.parentSessionId,
+      runId: run.id,
+    }, this.#registryOperations);
+  }
+
+  async #releaseOwnedLocators(parent: BoundParent): Promise<void> {
+    await this.releaseCurrentOwnerLocators({
+      parentSessionId: parent.parentSessionId,
+      parentSessionFile: parent.parentSessionFile,
+      parentEntryId: parent.parentEntryId,
+      parentInstanceId: parent.parentInstanceId,
+    });
+  }
+
+  #record(run: RunRecord, state: HerdrLifecycleState, workerCleanup?: WorkerCleanup): void {
+    const parent = run.journalOwner ?? this.#parent;
+    const appendState = run.journalAppend ?? this.#appendState;
+    if (!parent?.parentSessionFile || !appendState) throw new Error("Durable parent session journal is unavailable");
     const record: HerdrStateRecord = {
       state,
       at: this.#now(),
@@ -1050,7 +1395,7 @@ export class SubagentRuntime {
       ...(workerCleanup ? { workerCleanup } : {}),
       ...(run.error ? { error: run.error } : {}),
     };
-    this.#appendState(HERDR_STATE_CUSTOM_TYPE, record);
+    appendState(HERDR_STATE_CUSTOM_TYPE, record);
   }
 
   async #appendArtifact(run: Pick<Run, "id" | "parentSessionId" | "artifactPath">, section: string): Promise<void> {
@@ -1561,35 +1906,19 @@ export class SubagentRuntime {
     this.#notifyRunsChanged();
   }
 
-  async #cleanupMany(runs: RunRecord[], reason: string): Promise<readonly StopResult[]> {
+  async #cleanupMany(
+    runs: RunRecord[],
+    reason: string,
+    discardIncompleteResult = false,
+  ): Promise<readonly StopResult[]> {
     for (const run of runs) run.monitorController?.abort(new Error(reason));
-
-    const signal = AbortSignal.timeout(this.#cleanupTimeoutMs);
     const results: StopResult[] = [];
     for (const run of runs) {
-      if (!run.cleanup) {
-        const previousLifecycle = run.lifecycle;
-        const previousUpdatedAt = run.updatedAt;
-        const changedToStopping = run.lifecycle !== "stopping" && run.lifecycle !== "closed" && run.lifecycle !== "retained";
-        if (changedToStopping) {
-          run.lifecycle = "stopping";
-          run.updatedAt = this.#now();
-        }
-        try {
-          this.#record(run, "stopping");
-          this.#notifyRunsChanged();
-        } catch {
-          if (changedToStopping) {
-            run.lifecycle = previousLifecycle;
-            run.updatedAt = previousUpdatedAt;
-          }
-        }
-        run.cleanup = this.#cleanupRun(run, signal);
-      }
-      const attempt = run.cleanup;
-      const result = await attempt;
-      results.push(result);
-      if (result.run.lifecycle === "retained" && run.cleanup === attempt) run.cleanup = undefined;
+      results.push(await this.#stopOwnedRun(run, {
+        reason,
+        discardIncompleteResult,
+        requireStoppingJournal: false,
+      }));
     }
     return results;
   }
@@ -1801,6 +2130,24 @@ export class SubagentRuntime {
         } catch { /* the prior complete artifact remains valid */ }
       }
     }
+    if (run.lifecycle === "closed") {
+      try {
+        await this.#deleteRecoveryLocator(run);
+      } catch (error) {
+        run.lifecycle = "retained";
+        run.error = `Recovery locator removal failed: ${errorMessage(error)}`;
+        if (!retained.includes(`locator=${run.id}`)) retained.push(`locator=${run.id}`);
+        run.retained = retained;
+        try {
+          this.#record(run, "retained", workerCleanup);
+        } catch (journalError) {
+          run.error = `${run.error}; cleanup journal failed: ${errorMessage(journalError)}`;
+          if (!retained.includes("journal=herdr-subagent-state")) retained.push("journal=herdr-subagent-state");
+          run.retained = retained;
+        }
+      }
+    }
+
     const result: StopResult = {
       run: cloneRun(run),
       retained: [...retained],
@@ -1964,6 +2311,12 @@ export class SubagentRuntime {
       return "worker workspace identity does not exactly match the journal";
     }
     return undefined;
+  }
+
+  #recoveryRun(replay: ReplayedHerdrRun): RunRecord {
+    const run = this.#replayedRun(replay);
+    run.parentInstanceId = replay.latest.parentInstanceId;
+    return run;
   }
 
   #replayedRun(replay: ReplayedHerdrRun): RunRecord {

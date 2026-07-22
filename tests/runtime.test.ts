@@ -9,6 +9,7 @@ import test from "node:test";
 import { appendArtifactSection } from "../src/artifact.ts";
 import { HerdrError, HerdrSubscriptionTransportError } from "../src/herdr.ts";
 import { PROFILES } from "../src/profiles.ts";
+import { enumerateRecoveryLocators, readRecoveryLocator } from "../src/registry.ts";
 import {
   persistAbortedGeneration,
   SubagentRuntime,
@@ -1363,6 +1364,178 @@ test("independent reader starts coexist", async () => {
     await eventually(() => runtime.status("run-one").status === "blocked");
     assert.equal(runtime.status("run-two").status, "idle");
   }, ["run-one", "run-two"]);
+});
+
+test("starting records create active locators that delete on close and release on shutdown retain", async () => {
+  await fixture(async (client, runtime, _deliveries, agentDir) => {
+    client.statuses = ["idle", "idle"];
+    client.onSendInput = async () => { await appendResult(client, ["done"]); };
+    const started = await runtime.start("scout", "inspect", "/repo", { wait: true, timeoutMs: 100 });
+    const active = await readRecoveryLocator(agentDir, {
+      parentSessionId,
+      runId: started.id,
+    });
+    assert.equal(active?.ownerState, "active");
+    assert.equal(active?.parentSessionFile, "/tmp/parent-session.jsonl");
+    assert.equal(active?.artifactPath, started.artifactPath);
+
+    const closed = await runtime.stop(started.id);
+    assert.equal(closed.run.lifecycle, "closed");
+    assert.equal(await readRecoveryLocator(agentDir, {
+      parentSessionId,
+      runId: started.id,
+    }), undefined);
+  });
+
+  await fixture(async (client, runtime, _deliveries, agentDir) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("scout", "pending", "/repo");
+    const summary = await runtime.stopCurrentOwner({
+      reason: "test bulk retain",
+    });
+    assert.equal(summary.results[0]?.run.lifecycle, "retained");
+    assert.equal(summary.allClosed, false);
+    assert.deepEqual(summary.preservedSessions, [started.childSessionDir]);
+    assert.equal((await readRecoveryLocator(agentDir, {
+      parentSessionId,
+      runId: started.id,
+    }))?.ownerState, "active");
+
+    await runtime.shutdown("quit");
+    assert.equal((await readRecoveryLocator(agentDir, {
+      parentSessionId,
+      runId: started.id,
+    }))?.ownerState, "released");
+  });
+});
+
+test("bulk stop includes retained runs, isolates foreign owners, and discards incomplete generations", async () => {
+  await fixture(async (client, runtime, _deliveries, agentDir) => {
+    client.statuses = ["idle", "idle", "idle"];
+    const reader = await runtime.start("scout", "one", "/repo");
+    await appendIncompleteSession(client);
+    const worker = await runtime.start("worker", "two", process.cwd());
+    const ordinary = await runtime.stop(reader.id);
+    assert.equal(ordinary.run.lifecycle, "retained");
+    assert.equal(ordinary.run.generation?.outcome, undefined);
+
+    const foreign = runtime.runs.get(worker.id)!;
+    foreign.parentInstanceId = "instance-foreign";
+
+    const summary = await runtime.stopCurrentOwner({
+      reason: "bulk abort",
+      discardIncompleteResult: true,
+    });
+    assert.equal(summary.results.length, 1);
+    assert.equal(summary.results[0]?.run.id, reader.id);
+    assert.equal(summary.results[0]?.run.lifecycle, "closed");
+    assert.equal(summary.results[0]?.run.generation?.outcome, "aborted");
+    assert.equal(summary.allClosed, true);
+    assert.equal(runtime.runs.get(worker.id)?.parentInstanceId, "instance-foreign");
+    assert.notEqual(runtime.runs.get(worker.id)?.lifecycle, "closed");
+    assert.equal(await readRecoveryLocator(agentDir, {
+      parentSessionId,
+      runId: reader.id,
+    }), undefined);
+    assert.equal((await readRecoveryLocator(agentDir, {
+      parentSessionId,
+      runId: worker.id,
+    }))?.ownerState, "active");
+
+    foreign.parentInstanceId = "instance-current";
+    const workerStop = await runtime.stop(worker.id, { discardIncompleteResult: true });
+    assert.equal(workerStop.run.lifecycle, "closed");
+    await rm(worker.worktree!.path, { recursive: true, force: true });
+  }, ["run-reader", "run-worker-bulk"]);
+});
+
+test("overlapping bulk and explicit stop share one in-flight discard policy", async () => {
+  await fixture(async (client, runtime) => {
+    client.statuses = ["idle"];
+    const started = await runtime.start("scout", "overlap", "/repo");
+    await appendIncompleteSession(client);
+
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    let closeStarted = false;
+    const originalClosePane = client.closePane.bind(client);
+    client.closePane = async (paneId, signal) => {
+      closeStarted = true;
+      await closeGate;
+      return originalClosePane(paneId, signal);
+    };
+
+    const bulk = runtime.stopCurrentOwner({ reason: "bulk", discardIncompleteResult: true });
+    await eventually(() => closeStarted);
+    const explicit = runtime.stop(started.id); // non-discard shares the in-flight discard attempt
+    releaseClose();
+    const [bulkSummary, explicitResult] = await Promise.all([bulk, explicit]);
+    assert.equal(bulkSummary.results[0]?.run.lifecycle, "closed");
+    assert.equal(explicitResult.run.lifecycle, "closed");
+    assert.equal(explicitResult.run.generation?.outcome, "aborted");
+    assert.equal(client.calls.filter(({ method }) => method === "pane.close").length, 1);
+  });
+});
+
+test("bulk stop gives each live run a distinct cleanup deadline", async () => {
+  await fixture(async (client, runtime) => {
+    client.paneIds = ["w-parent:p-one", "w-parent:p-two"];
+    client.statuses = ["idle", "idle"];
+    await runtime.start("scout", "one", "/repo");
+    client.statuses = ["idle", "idle"];
+    await runtime.start("researcher", "two", "/repo");
+
+    const summary = await runtime.stopCurrentOwner({
+      reason: "fresh deadlines",
+      discardIncompleteResult: true,
+    });
+    assert.deepEqual(summary.results.map(({ run }) => [run.id, run.lifecycle]), [
+      ["run-one", "closed"],
+      ["run-two", "closed"],
+    ]);
+    const cleanup = client.calls.filter(({ method }) => method === "pane.close" || method === "tab.close");
+    assert.deepEqual(cleanup.map(({ method }) => method), [
+      "pane.close", "tab.close", "pane.close", "tab.close",
+    ]);
+    assert.equal(cleanup[0]?.signal, cleanup[1]?.signal);
+    assert.equal(cleanup[2]?.signal, cleanup[3]?.signal);
+    assert.notEqual(cleanup[0]?.signal, cleanup[2]?.signal);
+  }, ["run-one", "run-two"]);
+});
+
+test("locator create failure surfaces diagnostics and uses startup cleanup", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "runtime-locator-fail-"));
+  const client = new FakeHerdr();
+  client.statuses = ["idle"];
+  const runtime = new SubagentRuntime(client, { workspaceId: "w-parent", agentDir }, {
+    idFactory: () => "run-locator-fail",
+    instanceIdFactory: () => "instance-current",
+    readinessTimeoutMs: 30,
+    pollIntervalMs: 1,
+    quietPeriodMs: 1,
+    cleanupTimeoutMs: 30,
+    gitStatus: async () => "",
+    appendState: () => {},
+    registryOperations: {
+      async writeFile() { throw new Error("disk full"); },
+      async rename() { throw new Error("unused"); },
+      async unlink() { throw new Error("unused"); },
+    },
+  });
+  await runtime.bindParent({
+    parentSessionId,
+    parentSessionFile: "/tmp/parent-session.jsonl",
+    parentEntryId: "parent-leaf",
+  }, [], "startup");
+  try {
+    await assert.rejects(runtime.start("scout", "task", "/repo"), /Recovery locator creation failed: disk full/);
+    assert.equal(client.calls.some(({ method }) => method === "agent.input"), false);
+    assert.equal(client.calls.some(({ method }) => method === "pane.close"), true);
+    assert.deepEqual(await enumerateRecoveryLocators(agentDir), []);
+    assert.deepEqual(runtime.list(), []);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
 });
 
 test("every blocking worker result repeats checkout, branch, owner, and safe cleanup warnings", async () => {

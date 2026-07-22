@@ -44,12 +44,12 @@ interface ParentFixture {
   parentEntryId: string;
 }
 
-async function createParent(): Promise<ParentFixture> {
+async function createParent(sessionId = "parent-session"): Promise<ParentFixture> {
   const root = await mkdtemp(join(tmpdir(), "herdr-parent-"));
   const sessionDir = join(root, "parent-sessions");
   const agentDir = join(root, "agent");
   await mkdir(sessionDir, { recursive: true });
-  const manager = SessionManager.create(root, sessionDir, { id: "parent-session" });
+  const manager = SessionManager.create(root, sessionDir, { id: sessionId });
   manager.appendMessage({ role: "user", content: "parent", timestamp: Date.now() });
   const parentEntryId = manager.appendMessage(assistant("ready"));
   return {
@@ -721,8 +721,14 @@ test("settlement waits for delivery confirmation, blocks tree while open, and re
     assert.equal(records(parent.manager).at(-1)?.state, "retained");
     assert.deepEqual(changes, [["stopping"], ["retained"]]);
     const destructiveCalls = client.calls.filter(({ method }) => method === "pane.close" || method === "tab.close").length;
-    assert.deepEqual(await runtime.shutdown("quit"), []);
-    assert.equal(client.calls.filter(({ method }) => method === "pane.close" || method === "tab.close").length, destructiveCalls);
+    const [shutdownResult] = await runtime.shutdown("quit");
+    assert.equal(shutdownResult?.run.lifecycle, "retained");
+    assert.equal(shutdownResult?.retained.includes(`tab=${started.tabId}`), true);
+    // Shutdown retries retained runs with a fresh deadline instead of skipping them.
+    assert.equal(
+      client.calls.filter(({ method }) => method === "pane.close" || method === "tab.close").length > destructiveCalls,
+      true,
+    );
   } finally {
     await rm(parent.root, { recursive: true, force: true });
   }
@@ -777,6 +783,7 @@ test("bulk settlement cleans every run when one stopping journal write fails", a
       ["run-two", "closed"],
     ]);
     assert.deepEqual(changes, [
+      ["run-one:stopping", "run-two:live"],
       ["run-two:live"],
       ["run-two:stopping"],
       [],
@@ -787,7 +794,9 @@ test("bulk settlement cleans every run when one stopping journal write fails", a
     assert.deepEqual(cleanup.map(({ method }) => method), [
       "pane.close", "tab.close", "pane.close", "tab.close",
     ]);
-    assert.equal(cleanup.every(({ signal }) => signal === cleanup[0]?.signal), true);
+    assert.equal(cleanup[0]?.signal, cleanup[1]?.signal);
+    assert.equal(cleanup[2]?.signal, cleanup[3]?.signal);
+    assert.notEqual(cleanup[0]?.signal, cleanup[2]?.signal);
     assert.deepEqual(records(parent.manager)
       .filter(({ state }) => state === "stopping" || state === "closed")
       .map(({ runId, state }) => `${runId}:${state}`), [
@@ -834,5 +843,84 @@ test("every shutdown reason aborts monitors before one fresh bounded reader clea
     } finally {
       await rm(parent.root, { recursive: true, force: true });
     }
+  }
+});
+
+test("cross-session recovery writes only the original journal and refuses live unreleased owners", async () => {
+  const oldParent = await createParent("parent-session");
+  const newParent = await createParent("replacement-session");
+  // Share one agentDir so locators are globally visible to the replacement session.
+  const sharedAgentDir = oldParent.agentDir;
+  newParent.agentDir = sharedAgentDir;
+  try {
+    const client = new FakeHerdr();
+    client.statuses = ["idle"];
+    const danglingRuntime = runtimeFor(oldParent, client, {
+      instanceId: "instance-dangling",
+      processId: 4242,
+      ids: ["run-dangling"],
+      isProcessAlive: () => false,
+    });
+    await bind(danglingRuntime, oldParent);
+    const dangling = await danglingRuntime.start("scout", "left behind", oldParent.root);
+    await mkdir(dangling.childSessionDir, { recursive: true });
+    const retained = await danglingRuntime.stop(dangling.id);
+    assert.equal(retained.run.lifecycle, "retained");
+    await danglingRuntime.releaseCurrentOwnerLocators();
+    const beforeNew = records(oldParent.manager).length;
+
+    const freshClient = new FakeHerdr();
+    const newRuntime = runtimeFor(newParent, freshClient, {
+      instanceId: "instance-new",
+      processId: 9999,
+      // 4242 is the dangling dead owner; 7777 is the later live owner under test.
+      isProcessAlive: (pid) => pid === 7777,
+    });
+    await bind(newRuntime, newParent);
+    const listed = await newRuntime.listRecoverable();
+    assert.equal(listed.candidates.some((candidate) =>
+      candidate.runId === dangling.id
+      && candidate.parentSessionId === "parent-session"
+      && candidate.actionable),
+    true);
+
+    const recovered = await newRuntime.recover({
+      parentSessionId: "parent-session",
+      id: dangling.id,
+      discardIncompleteResult: true,
+    });
+    assert.equal(recovered.run.lifecycle, "closed");
+    assert.equal(newRuntime.list().some((run) => run.id === dangling.id), false);
+    assert.equal(records(newParent.manager).length, 0);
+    const reopenedOld = SessionManager.open(oldParent.parentSessionFile);
+    const oldAfter = records(reopenedOld);
+    assert.equal(oldAfter.length > beforeNew, true);
+    assert.equal(oldAfter.at(-1)?.state, "closed");
+    assert.equal(oldAfter.at(-1)?.parentInstanceId, "instance-dangling");
+    assert.equal(oldAfter.at(-1)?.parentProcessId, 4242);
+    assert.equal(oldAfter.at(-1)?.parentSessionFile, oldParent.parentSessionFile);
+
+    // Live unreleased owner must not mutate.
+    client.statuses = ["idle"];
+    const liveRuntime = runtimeFor(oldParent, client, {
+      instanceId: "instance-live",
+      processId: 7777,
+      ids: ["run-live"],
+      isProcessAlive: (pid) => pid === 7777,
+    });
+    await bind(liveRuntime, oldParent);
+    const live = await liveRuntime.start("scout", "still owned", oldParent.root);
+    const liveList = await newRuntime.listRecoverable();
+    const liveCandidate = liveList.candidates.find((candidate) => candidate.runId === live.id);
+    assert.equal(liveCandidate?.classification, "live_unreleased_owner");
+    assert.equal(liveCandidate?.actionable, false);
+    await assert.rejects(newRuntime.recover({
+      parentSessionId: "parent-session",
+      id: live.id,
+    }), /live unreleased owner/);
+    await liveRuntime.stop(live.id, { discardIncompleteResult: true });
+  } finally {
+    await rm(oldParent.root, { recursive: true, force: true });
+    await rm(newParent.root, { recursive: true, force: true });
   }
 });

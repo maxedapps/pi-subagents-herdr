@@ -99,7 +99,8 @@ Pi normally selects these tools for you based on your request.
 | `subagent_start` | Start one `scout`, `researcher`, or `worker` run |
 | `subagent_status` | Inspect current-session runs and retained resources |
 | `subagent_send` | Send one follow-up after the previous result was delivered |
-| `subagent_stop` | Stop a run, retry retained cleanup, or explicitly abort an incomplete generation |
+| `subagent_stop` | Stop a current-owner run, retry retained cleanup, or explicitly abort an incomplete generation |
+| `subagent_recover` | List global/legacy journal-backed residue, or retry exact prior-owner cleanup |
 
 Starts and follow-ups run in the background unless `wait: true` is requested. Blocking waits accept a timeout of up to five minutes.
 
@@ -120,6 +121,30 @@ subagent_stop({ id: "<run-id>", discardIncompleteResult: true })
 ```
 
 This option is irreversible for a genuinely incomplete transcript. It still recovers a complete result first and never authorizes dirty-worktree removal. Repeating ordinary stops does not imply discard consent.
+
+## Cross-session recovery
+
+Every started run also gets a private recovery locator:
+
+```text
+<agentDir>/herdr-subagent-recovery/<parentSessionId>/<runId>.json
+```
+
+Locators only help find the authoritative original parent journal after session replacement. They never authorize cleanup by themselves.
+
+To inspect dangling residue from another session or process:
+
+```text
+subagent_recover({})
+```
+
+To retry exact cleanup for one prior-owner run:
+
+```text
+subagent_recover({ parentSessionId: "<parent-session-id>", id: "<run-id>" })
+```
+
+Add `discardIncompleteResult: true` only when irreversible incomplete-transcript loss is intended. Live unreleased owners, dirty worktrees, malformed records, and identity mismatches are reported and left untouched. Do not edit locator/artifact/journal files or use raw pane/Git cleanup.
 
 ## Status widget
 
@@ -175,7 +200,13 @@ Do not use raw Git-only worktree removal for extension-owned worktrees. The exte
 
 Open runs are owned by the current persisted parent session. While a run is open, Pi blocks `/tree` navigation so a result cannot be delivered onto another branch.
 
-Quitting, reloading, creating or resuming a session, and forking all trigger bounded cleanup. Reloading does not transfer live run ownership. Resources that cannot be verified safely are reported and retained instead of being modified speculatively.
+Esc/abort of the parent turn stops current-owner children. That abort is treated as consent to discard unfinished child transcripts after any raced final result is recovered. Dirty worker worktrees and generated branches remain preserved.
+
+`/new`, `/resume`, and `/fork` are cancellable. If non-closed runs still exist, the UI asks for confirmation before stopping children and allowing replacement. Headless/print/RPC modes cancel replacement and require explicit tool cleanup first. Successful preflight releases or deletes recovery locators before the switch proceeds so residue stays discoverable if teardown is skipped.
+
+Quit and reload have no cancellable confirmation hook. They still perform non-discarding bounded cleanup and may leave an indexed incomplete session that later needs explicit `subagent_recover(..., discardIncompleteResult: true)`. Reloading does not transfer live run ownership.
+
+On startup, the extension performs bounded non-discarding reconciliation only for exact released/dead-owner locator residue and reports unresolved counts through notifications/widget state without injecting a model turn. Resources that cannot be verified safely are reported and retained instead of being modified speculatively.
 
 Child agents cannot create further Herdr subagents, preventing recursive delegation.
 

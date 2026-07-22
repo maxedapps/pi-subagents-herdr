@@ -5,7 +5,12 @@ import { fileURLToPath } from "node:url";
 import { enumerateRunArtifacts } from "../../src/artifact.ts";
 import { SocketHerdrClient } from "../../src/herdr.ts";
 import { buildRecoveryCatalog, formatRecoveryCatalog } from "../../src/recovery.ts";
-import { SubagentRuntime, type Run, type StopResult } from "../../src/runtime.ts";
+import {
+  SubagentRuntime,
+  type BulkStopSummary,
+  type Run,
+  type StopResult,
+} from "../../src/runtime.ts";
 import { registerSubagentTools } from "../../src/tools.ts";
 
 const skillPath = fileURLToPath(new URL("../../skills/use-herdr-subagents/SKILL.md", import.meta.url));
@@ -147,6 +152,53 @@ function fit(text: string, width: number, padding = " "): string {
   return fitted + padding.repeat(Math.max(0, width - visibleWidth(fitted)));
 }
 
+type EndMessage = { role?: string; stopReason?: string };
+
+export function lastAssistantMessage(messages: readonly EndMessage[]): EndMessage | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role === "assistant") return message;
+  }
+  return undefined;
+}
+
+export function isAbortedAssistantStop(messages: readonly EndMessage[]): boolean {
+  const assistant = lastAssistantMessage(messages);
+  return assistant?.role === "assistant" && assistant.stopReason === "aborted";
+}
+
+export function formatSessionReplacementConfirm(runs: readonly Run[]): { title: string; message: string } {
+  const profiles = [...new Set(runs.map((run) => run.profile))].join(", ");
+  return {
+    title: "Stop Herdr subagents?",
+    message: [
+      `This session still owns ${runs.length} non-closed Herdr subagent run(s) (${profiles || "unknown"}).`,
+      "Confirmation stops those children, recovers any raced final result, and durably discards unfinished child transcripts.",
+      "Dirty worker worktrees and generated branches are preserved.",
+      "Refuse or press Escape to keep the current session bound and leave children running.",
+    ].join("\n"),
+  };
+}
+
+export function formatRetainedRecoveryNotice(summary: BulkStopSummary): string | undefined {
+  const retained = summary.results.filter((result) => result.run.lifecycle === "retained");
+  if (!retained.length && !summary.unprovenLive.length) return undefined;
+  const lines = [
+    "Herdr subagent cleanup left recoverable residue.",
+    ...retained.map((result) => {
+      const facts = result.retained.length ? result.retained.join(", ") : "retained resources";
+      return `- ${result.run.id} [${result.run.profile}]: ${facts}; artifact ${result.run.artifactPath}`;
+    }),
+    ...summary.unprovenLive.map((id) => `- ${id}: child stop was not durably proven`),
+    "Use subagent_status for current-owner runs and subagent_recover after session replacement.",
+  ];
+  return lines.join("\n");
+}
+
+export function sessionReplacementBlocked(summary: BulkStopSummary): boolean {
+  return !summary.allChildrenStopped || summary.unprovenLive.length > 0;
+}
+
 function tuiWidget(presentation: WidgetPresentation) {
   return (_tui: TUI, theme: Theme): Component => ({
     render(width: number): string[] {
@@ -227,6 +279,9 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
       parentSessionFile: ctx.sessionManager.getSessionFile(),
       parentEntryId: ctx.sessionManager.getLeafId(),
     }, ctx.sessionManager.getBranch(), event.reason);
+    const globalDiagnostics = event.reason === "reload"
+      ? []
+      : await runtime.reconcileGlobalLocators();
     if (ctx.sessionManager.getBranch().some((entry) => entry.type === "compaction")) {
       catalogPending = true;
       catalogVersion++;
@@ -251,6 +306,9 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
       };
       refreshWidget();
       for (const diagnostic of diagnostics) ui.notify(diagnostic.message, diagnostic.outcome === "closed" || diagnostic.outcome === "cleaned" ? "info" : "warning");
+      for (const diagnostic of globalDiagnostics) {
+        ui.notify(diagnostic.message, diagnostic.outcome === "closed" || diagnostic.outcome === "cleaned" ? "info" : "warning");
+      }
     }
   });
   pi.on("session_compact", (_event, ctx) => {
@@ -303,6 +361,24 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
     });
     runtime.confirmDelivery(event.message);
   });
+  pi.on("agent_end", async (event, ctx) => {
+    if (!isAbortedAssistantStop(event.messages)) return;
+    const request = runtime.requestFor({
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      parentSessionFile: ctx.sessionManager.getSessionFile(),
+      parentEntryId: ctx.sessionManager.getLeafId(),
+    });
+    if (!runtime.hasNonClosedRuns(request)) return;
+    const summary = await runtime.stopCurrentOwner({
+      ...request,
+      reason: "Parent agent aborted",
+      discardIncompleteResult: true,
+    });
+    refreshWidget();
+    if (!ctx.hasUI) return;
+    const notice = formatRetainedRecoveryNotice(summary);
+    if (notice) ctx.ui.notify(notice, "warning");
+  });
   pi.on("agent_settled", async (_event, ctx) => {
     const results = await runtime.settle(runtime.requestFor({
       parentSessionId: ctx.sessionManager.getSessionId(),
@@ -322,6 +398,70 @@ export default function herdrSubagents(pi: ExtensionAPI): void {
     });
     if (runtime.hasOpenRuns(request)) return { cancel: true };
   });
+
+  async function confirmSessionReplacement(ctx: {
+    hasUI: boolean;
+    ui?: {
+      confirm?(title: string, message: string): Promise<boolean>;
+      notify?(message: string, type?: "info" | "warning" | "error"): void;
+    };
+    sessionManager: {
+      getSessionId(): string;
+      getSessionFile(): string | undefined;
+      getLeafId(): string | null;
+    };
+  }): Promise<{ cancel?: boolean } | void> {
+    const request = runtime.requestFor({
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      parentSessionFile: ctx.sessionManager.getSessionFile(),
+      parentEntryId: ctx.sessionManager.getLeafId(),
+    });
+    if (!runtime.hasNonClosedRuns(request)) return;
+
+    const runs = runtime.list(request).filter((run) => run.lifecycle !== "closed");
+    if (!ctx.hasUI || !ctx.ui?.confirm) {
+      if (ctx.hasUI) {
+        ctx.ui?.notify?.(
+          "Herdr subagents block headless session replacement while non-closed runs exist. Stop them with subagent_stop first.",
+          "warning",
+        );
+      }
+      return { cancel: true };
+    }
+
+    const prompt = formatSessionReplacementConfirm(runs);
+    const confirmed = await ctx.ui.confirm(prompt.title, prompt.message);
+    if (!confirmed) return { cancel: true };
+
+    const summary = await runtime.stopCurrentOwner({
+      ...request,
+      reason: "Parent session replacement",
+      discardIncompleteResult: true,
+    });
+    refreshWidget();
+
+    if (sessionReplacementBlocked(summary)) {
+      const notice = formatRetainedRecoveryNotice(summary)
+        ?? "Herdr subagent cleanup could not prove every child stopped; session replacement cancelled.";
+      ctx.ui.notify?.(notice, "warning");
+      return { cancel: true };
+    }
+
+    const release = await runtime.releaseCurrentOwnerLocators(request);
+    if (release.failed.length) {
+      ctx.ui.notify?.(
+        `Herdr recovery locator release failed; session replacement cancelled.\n${release.failed.join("\n")}`,
+        "warning",
+      );
+      return { cancel: true };
+    }
+
+    const notice = formatRetainedRecoveryNotice(summary);
+    if (notice) ctx.ui.notify?.(notice, "info");
+  }
+
+  pi.on("session_before_switch", async (_event, ctx) => confirmSessionReplacement(ctx));
+  pi.on("session_before_fork", async (_event, ctx) => confirmSessionReplacement(ctx));
   pi.on("session_shutdown", async (event, ctx) => {
     const sessionManager = ctx.sessionManager;
     const currentRefresh = refreshWidget;

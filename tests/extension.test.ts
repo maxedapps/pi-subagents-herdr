@@ -6,13 +6,23 @@ import test from "node:test";
 import { Value } from "typebox/value";
 import { getAgentDir, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import extension, { formatSubagentWidget, presentSubagentWidget, retainedCleanupAction } from "../extensions/herdr-subagents/index.ts";
+import extension, {
+  formatRetainedRecoveryNotice,
+  formatSessionReplacementConfirm,
+  formatSubagentWidget,
+  isAbortedAssistantStop,
+  lastAssistantMessage,
+  presentSubagentWidget,
+  retainedCleanupAction,
+  sessionReplacementBlocked,
+} from "../extensions/herdr-subagents/index.ts";
+import type { BulkStopSummary } from "../src/runtime.ts";
 import { resolveArtifactDirectory } from "../src/artifact.ts";
 import { SocketHerdrClient } from "../src/herdr.ts";
 import { buildPiLaunch, PROFILES } from "../src/profiles.ts";
 import { SubagentRuntime, type Run } from "../src/runtime.ts";
 import { HERDR_STATE_CUSTOM_TYPE, type HerdrStateRecord } from "../src/session.ts";
-import { idSchema, sendSchema, startSchema, statusSchema, stopSchema } from "../src/tools.ts";
+import { idSchema, recoverSchema, sendSchema, startSchema, statusSchema, stopSchema } from "../src/tools.ts";
 
 interface Registered {
   tools: Array<{ name: string; parameters?: unknown }>;
@@ -82,18 +92,31 @@ function mockRun(overrides: Partial<Run> = {}): Run {
   };
 }
 
-function mockUI(): { ui: any; calls: WidgetCall[]; notifications: NotificationCall[] } {
+function mockUI(options: {
+  confirmResult?: boolean;
+} = {}): {
+  ui: any;
+  calls: WidgetCall[];
+  notifications: NotificationCall[];
+  confirms: Array<{ title: string; message: string }>;
+} {
   const calls: WidgetCall[] = [];
   const notifications: NotificationCall[] = [];
+  const confirms: Array<{ title: string; message: string }> = [];
   return {
     calls,
     notifications,
+    confirms,
     ui: {
       notify(message: string, type?: NotificationCall["type"]) {
         notifications.push({ message, type });
       },
       setWidget(key: string, content: string[] | WidgetFactory | undefined, options?: unknown) {
         calls.push({ key, content, options });
+      },
+      async confirm(title: string, message: string) {
+        confirms.push({ title, message });
+        return options.confirmResult !== false;
       },
     },
   };
@@ -455,14 +478,24 @@ test("TUI overflow is muted text without a status dot", async () => {
   }
 });
 
-test("parent registers exactly four tools, one skill hook, and result confirmation", () => withParentEnvironment(() => {
+test("parent registers exactly five tools, one skill hook, and result confirmation", () => withParentEnvironment(() => {
   const { pi, registered } = mockPi();
   extension(pi);
   assert.deepEqual(registered.tools.map(({ name }) => name), [
-    "subagent_start", "subagent_status", "subagent_send", "subagent_stop",
+    "subagent_start", "subagent_status", "subagent_send", "subagent_stop", "subagent_recover",
   ]);
   assert.deepEqual(registered.events.map(({ name }) => name), [
-    "resources_discover", "session_start", "session_compact", "context", "message_end", "agent_settled", "session_before_tree", "session_shutdown",
+    "resources_discover",
+    "session_start",
+    "session_compact",
+    "context",
+    "message_end",
+    "agent_end",
+    "agent_settled",
+    "session_before_tree",
+    "session_before_switch",
+    "session_before_fork",
+    "session_shutdown",
   ]);
   assert.deepEqual(registered.commands, []);
   const resources = registered.events.find(({ name }) => name === "resources_discover")?.handler({}, {}) as { skillPaths: string[] };
@@ -922,4 +955,242 @@ test("strict schemas accept only background/default or bounded blocking start/se
   assert.equal(Value.Check(stopSchema, { id: "run", discardIncompleteResult: false }), false);
   assert.equal(Value.Check(stopSchema, { id: "run", unknown: true }), false);
   assert.equal(Value.Check(idSchema, { id: "run", discardIncompleteResult: true }), false);
+
+  assert.equal(Value.Check(recoverSchema, {}), true);
+  assert.equal(Value.Check(recoverSchema, { parentSessionId: "parent", id: "run" }), true);
+  assert.equal(Value.Check(recoverSchema, {
+    parentSessionId: "parent",
+    id: "run",
+    discardIncompleteResult: true,
+  }), true);
+  assert.equal(Value.Check(recoverSchema, { id: "run" }), false);
+  assert.equal(Value.Check(recoverSchema, { parentSessionId: "parent" }), false);
+  assert.equal(Value.Check(recoverSchema, {
+    parentSessionId: "parent",
+    id: "run",
+    discardIncompleteResult: false,
+  }), false);
+});
+
+function assistantMessage(stopReason: string) {
+  return {
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text: "hi" }],
+    api: "openai-responses",
+    provider: "test",
+    model: "model",
+    usage: {
+      input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason,
+    timestamp: Date.now(),
+  };
+}
+
+test("last assistant selection ignores trailing non-assistant messages", () => {
+  const messages = [
+    { role: "user", content: "go", timestamp: 1 },
+    assistantMessage("aborted"),
+    { role: "custom", customType: "note", content: "tail", display: false, timestamp: 2 },
+  ] as any[];
+  assert.equal(lastAssistantMessage(messages)?.role, "assistant");
+  assert.equal(isAbortedAssistantStop(messages), true);
+  assert.equal(isAbortedAssistantStop([
+    assistantMessage("stop"),
+    { role: "custom", customType: "note", content: "tail", display: false, timestamp: 2 },
+  ] as any[]), false);
+  assert.equal(isAbortedAssistantStop([assistantMessage("error")] as any[]), false);
+  assert.equal(isAbortedAssistantStop([assistantMessage("toolUse")] as any[]), false);
+  assert.equal(isAbortedAssistantStop([]), false);
+});
+
+test("agent_end aborts current-owner children only for assistant stopReason aborted", async () => {
+  const fixture = extensionWithRuntimeCapture();
+  const ui = mockUI();
+  const ctx = mockContext("abort-parent", true, ui.ui);
+  try {
+    await event(fixture.registered, "session_start")({ reason: "startup" }, ctx);
+    const runtime = fixture.runtime();
+    const calls: Array<Record<string, unknown>> = [];
+    (runtime as any).stopCurrentOwner = async (request: any) => {
+      calls.push(request as Record<string, unknown>);
+      return {
+        results: [{ run: mockRun({ id: "run-aborted", lifecycle: "closed" }), retained: [] }],
+        allChildrenStopped: true,
+        allClosed: true,
+        unprovenLive: [],
+        dirtyWorktrees: [],
+        preservedSessions: [],
+        preservedArtifacts: [],
+        retainedBranches: [],
+      } satisfies BulkStopSummary;
+    };
+    (runtime as any).hasNonClosedRuns = () => true;
+
+    await event(fixture.registered, "agent_end")({
+      messages: [assistantMessage("stop")],
+    }, ctx);
+    await event(fixture.registered, "agent_end")({
+      messages: [assistantMessage("error")],
+    }, ctx);
+    await event(fixture.registered, "agent_end")({
+      messages: [assistantMessage("toolUse")],
+    }, ctx);
+    assert.equal(calls.length, 0);
+    assert.equal(fixture.registered.messages.length, 0);
+
+    await event(fixture.registered, "agent_end")({
+      messages: [
+        assistantMessage("aborted"),
+        { role: "custom", customType: "tail", content: "x", display: false, timestamp: 1 },
+      ],
+    }, ctx);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.discardIncompleteResult, true);
+    assert.equal(calls[0]!.reason, "Parent agent aborted");
+    assert.equal(fixture.registered.messages.length, 0);
+
+    (runtime as any).stopCurrentOwner = async () => ({
+      results: [{
+        run: mockRun({ id: "run-retained", lifecycle: "retained", artifactPath: "/tmp/a.md" }),
+        retained: ["sessionDir=/tmp/session"],
+      }],
+      allChildrenStopped: true,
+      allClosed: false,
+      unprovenLive: [],
+      dirtyWorktrees: [],
+      preservedSessions: ["/tmp/session"],
+      preservedArtifacts: [],
+      retainedBranches: [],
+    } satisfies BulkStopSummary);
+    await event(fixture.registered, "agent_end")({ messages: [assistantMessage("aborted")] }, ctx);
+    assert.match(ui.notifications.at(-1)?.message ?? "", /run-retained/);
+    assert.equal(ui.notifications.at(-1)?.type, "warning");
+    assert.equal(fixture.registered.messages.length, 0);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("session replacement confirms cleanup, cancels on refuse/headless, and releases locators before allow", async () => {
+  const fixture = extensionWithRuntimeCapture();
+  try {
+    const emptyUI = mockUI();
+    const emptyCtx = mockContext("switch-parent", true, emptyUI.ui);
+    await event(fixture.registered, "session_start")({ reason: "startup" }, emptyCtx);
+    assert.equal(await event(fixture.registered, "session_before_switch")({ reason: "new" }, emptyCtx), undefined);
+    assert.equal(await event(fixture.registered, "session_before_fork")({ entryId: "e1", position: "at" }, emptyCtx), undefined);
+
+    const runtime = fixture.runtime();
+    const live = mockRun({
+      id: "run-live",
+      parentSessionId: "switch-parent",
+      parentInstanceId: runtime.instanceId,
+      lifecycle: "live",
+      profile: "worker",
+    });
+    runtime.runs.set(live.id, live as any);
+
+    const refusedUI = mockUI({ confirmResult: false });
+    const refusedCtx = mockContext("switch-parent", true, refusedUI.ui);
+    let stopCalls = 0;
+    (runtime as any).stopCurrentOwner = async () => {
+      stopCalls += 1;
+      throw new Error("should not stop after refusal");
+    };
+    assert.deepEqual(await event(fixture.registered, "session_before_switch")({ reason: "new" }, refusedCtx), { cancel: true });
+    assert.equal(stopCalls, 0);
+    assert.equal(refusedUI.confirms.length, 1);
+    assert.match(refusedUI.confirms[0]?.message ?? "", /durably discards unfinished child transcripts/);
+    assert.equal(runtime.runs.has(live.id), true);
+
+    const headlessCtx = mockContext("switch-parent", false);
+    assert.deepEqual(await event(fixture.registered, "session_before_switch")({ reason: "resume" }, headlessCtx), { cancel: true });
+    assert.equal(stopCalls, 0);
+
+    const okUI = mockUI({ confirmResult: true });
+    const okCtx = mockContext("switch-parent", true, okUI.ui);
+    let released = false;
+    (runtime as any).stopCurrentOwner = async (request: Record<string, unknown>) => {
+      stopCalls += 1;
+      assert.equal(request.discardIncompleteResult, true);
+      runtime.runs.delete(live.id);
+      const retained = mockRun({
+        id: "run-dirty",
+        parentSessionId: "switch-parent",
+        parentInstanceId: runtime.instanceId,
+        lifecycle: "retained",
+        profile: "worker",
+        worktree: {
+          path: "/tmp/worktree",
+          branch: "herdr-subagents/run-dirty",
+          workspaceId: "ws",
+        },
+        childStopped: true,
+      });
+      runtime.runs.set(retained.id, retained as any);
+      return {
+        results: [{
+          run: retained,
+          retained: [`branch=${retained.worktree!.branch}`, `worktree=${retained.worktree!.path}`],
+          workerCleanup: { action: "retained", removed: false, branch: retained.worktree!.branch, path: retained.worktree!.path, reason: "worktree is dirty" },
+        }],
+        allChildrenStopped: true,
+        allClosed: false,
+        unprovenLive: [],
+        dirtyWorktrees: [retained.worktree!.path],
+        preservedSessions: [],
+        preservedArtifacts: [],
+        retainedBranches: [retained.worktree!.branch],
+      } satisfies BulkStopSummary;
+    };
+    (runtime as any).releaseCurrentOwnerLocators = async () => {
+      released = true;
+      return { released: ["run-dirty"], failed: [] };
+    };
+    assert.equal(await event(fixture.registered, "session_before_switch")({ reason: "new" }, okCtx), undefined);
+    assert.equal(stopCalls, 1);
+    assert.equal(released, true);
+    assert.match(okUI.notifications.at(-1)?.message ?? "", /run-dirty/);
+
+    runtime.runs.clear();
+    runtime.runs.set(live.id, live as any);
+    (runtime as any).stopCurrentOwner = async () => ({
+      results: [{ run: { ...live, lifecycle: "retained", childStopped: undefined }, retained: [`pane=${live.paneId}`] }],
+      allChildrenStopped: false,
+      allClosed: false,
+      unprovenLive: [live.id],
+      dirtyWorktrees: [],
+      preservedSessions: [],
+      preservedArtifacts: [],
+      retainedBranches: [],
+    } satisfies BulkStopSummary);
+    released = false;
+    assert.deepEqual(await event(fixture.registered, "session_before_fork")({ entryId: "e1", position: "before" }, okCtx), { cancel: true });
+    assert.equal(released, false);
+    assert.equal(sessionReplacementBlocked({
+      results: [],
+      allChildrenStopped: false,
+      allClosed: false,
+      unprovenLive: ["x"],
+      dirtyWorktrees: [],
+      preservedSessions: [],
+      preservedArtifacts: [],
+      retainedBranches: [],
+    }), true);
+    assert.match(formatSessionReplacementConfirm([live]).message, /stops those children/i);
+    assert.match(formatRetainedRecoveryNotice({
+      results: [{ run: mockRun({ id: "run-x", lifecycle: "retained" }), retained: ["tab=t1"] }],
+      allChildrenStopped: true,
+      allClosed: false,
+      unprovenLive: [],
+      dirtyWorktrees: [],
+      preservedSessions: [],
+      preservedArtifacts: [],
+      retainedBranches: [],
+    }) ?? "", /run-x/);
+  } finally {
+    fixture.restore();
+  }
 });

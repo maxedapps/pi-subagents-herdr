@@ -46,6 +46,15 @@ export const stopSchema = Type.Object({
   discardIncompleteResult: Type.Optional(Type.Literal(true)),
 }, strict);
 
+export const recoverSchema = Type.Union([
+  Type.Object({}, strict),
+  Type.Object({
+    parentSessionId: Type.String({ minLength: 1 }),
+    id: Type.String({ minLength: 1 }),
+    discardIncompleteResult: Type.Optional(Type.Literal(true)),
+  }, strict),
+]);
+
 function result(value: unknown) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
@@ -133,6 +142,27 @@ export function registerSubagentTools(pi: ExtensionAPI, runtime: SubagentRuntime
           parentEntryId: ctx.sessionManager.getLeafId(),
         }),
         ...(params.discardIncompleteResult ? { discardIncompleteResult: true as const } : {}),
+      }));
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_recover",
+    label: "Recover subagent residue",
+    description: "List global/legacy journal-backed dangling subagent residue, or retry exact non-current-owner cleanup by parentSessionId+id. discardIncompleteResult:true irreversibly aborts only a proven-stopped incomplete transcript after raced-result recovery. Never uses raw Git/filesystem cleanup.",
+    parameters: recoverSchema,
+    async execute(_toolCallId, params, signal) {
+      if (!("id" in params) || params.id === undefined) {
+        return result(await runtime.listRecoverable({
+          includeLegacy: true,
+          ...(signal ? { signal } : {}),
+        }));
+      }
+      return result(await runtime.recover({
+        parentSessionId: params.parentSessionId,
+        id: params.id,
+        ...(params.discardIncompleteResult ? { discardIncompleteResult: true as const } : {}),
+        ...(signal ? { signal } : {}),
       }));
     },
   });
